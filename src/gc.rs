@@ -1,10 +1,10 @@
 pub mod sync;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::alloc::{alloc, dealloc, Layout};
 
-pub trait Trace {
+pub trait Trace : Finalizer {
     fn is_root(&self) -> bool;
     fn reset_root(&self);
     fn trace(&self);
@@ -14,6 +14,10 @@ pub trait Trace {
 
 pub trait Finalizer {
     fn finalize(&self);
+    fn as_finalize(&self) -> &dyn Finalizer
+        where Self: Sized {
+        self
+    }
 }
 
 macro_rules! primitive_types {
@@ -31,6 +35,11 @@ macro_rules! primitive_types {
                 }
                 fn is_traceable(&self) -> bool {
                     unreachable!("is_traceable should never be called on primitive type !!");
+                }
+            }
+
+            impl Finalizer for $prm {
+                fn finalize(&self) {
                 }
             }
         )*
@@ -84,6 +93,11 @@ impl<T> Trace for GcPtr<T> where T: Sized + Trace {
     }
 }
 
+impl<T> Finalizer for GcPtr<T> where T: Sized + Trace {
+    fn finalize(&self) {
+    }
+}
+
 pub struct GcInternal<T> where T: 'static + Sized + Trace {
     is_root: Cell<bool>,
     ptr: *const GcPtr<T>,
@@ -127,6 +141,11 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
         } else {
             true
         }
+    }
+}
+
+impl<T> Finalizer for GcInternal<T> where T: Sized + Trace {
+    fn finalize(&self) {
     }
 }
 
@@ -231,6 +250,11 @@ impl<T> Trace for Gc<T> where T: Sized + Trace {
     }
 }
 
+impl<T> Finalizer for Gc<T> where T: Sized + Trace {
+    fn finalize(&self) {
+    }
+}
+
 pub struct GcCellInternal<T> where T: 'static + Sized + Trace {
     is_root: Cell<bool>,
     ptr: *const RefCell<GcPtr<T>>,
@@ -274,6 +298,11 @@ impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
         } else {
             true
         }
+    }
+}
+
+impl<T> Finalizer for GcCellInternal<T> where T: Sized + Trace {
+    fn finalize(&self) {
     }
 }
 
@@ -377,10 +406,16 @@ impl<T> Trace for GcCell<T> where T: Sized + Trace {
     }
 }
 
+impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
+    fn finalize(&self) {
+    }
+}
+
 type GcObjMem = *mut u8;
 
 pub struct GarbageCollector {
-    vec: RefCell<HashMap<*const dyn Trace, ((GcObjMem, Layout), (GcObjMem, Layout))>>,
+    vec: RefCell<HashMap<*const dyn Trace, ((GcObjMem, Layout), Option<(GcObjMem, Layout)>)>>,
+    fin: RefCell<HashMap<*const dyn Trace, *const dyn Finalizer>>,
 }
 
 unsafe impl Sync for GarbageCollector {}
@@ -389,7 +424,8 @@ unsafe impl Send for GarbageCollector {}
 impl GarbageCollector {
     fn new() -> GarbageCollector {
         GarbageCollector {
-            vec: RefCell::new(HashMap::new())
+            vec: RefCell::new(HashMap::new()),
+            fin: RefCell::new(HashMap::new()),
         }
     }
 
@@ -405,13 +441,15 @@ impl GarbageCollector {
         (*gc_ptr).t.reset_root();
         (*gc.internal_ptr).is_root.set(true);
         (*gc.internal_ptr).ptr = gc_ptr;
-        self.register_root(gc.internal_ptr, (mem_info_internal_ptr, mem_info_gc_ptr));
+        self.register_root(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
+        self.register_root_fin(gc.internal_ptr, (*gc_ptr).t.as_finalize());
         gc
     }
 
     unsafe fn null_gc<T>(&mut self) -> Gc<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info) = self.get_gc_inter_ptr::<T>();
         (*gc_inter_ptr).ptr = std::ptr::null();
+        self.register_root(gc_inter_ptr, (mem_info, None));
         Gc {
             internal_ptr: gc_inter_ptr,
         }
@@ -428,20 +466,26 @@ impl GarbageCollector {
         (*gc_ptr).borrow_mut().t.reset_root();
         (*gc.internal_ptr).is_root.set(true);
         (*gc.internal_ptr).ptr = gc_ptr;
-        self.register_root(gc.internal_ptr, (mem_info_internal_ptr, mem_info_gc_ptr));
+        self.register_root(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
+        self.register_root_fin(gc.internal_ptr, (*gc_ptr).as_ptr());
         gc
     }
 
     unsafe fn null_gc_cell<T>(&mut self) -> GcCell<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info) = self.get_gc_cell_inter_ptr::<T>();
         (*gc_inter_ptr).ptr = std::ptr::null();
+        self.register_root(gc_inter_ptr, (mem_info, None));
         GcCell {
             internal_ptr: gc_inter_ptr,
         }
     }
 
-    fn register_root(&mut self, root_ptr: *const dyn Trace, mem: ((GcObjMem, Layout), (GcObjMem, Layout))) {
+    fn register_root(&mut self, root_ptr: *const dyn Trace, mem: ((GcObjMem, Layout), Option<(GcObjMem, Layout)>)) {
         self.vec.borrow_mut().insert(root_ptr, mem);
+    }
+
+    fn register_root_fin(&mut self, root_ptr: *const dyn Trace, fin_ptr: *const dyn Finalizer) {
+        self.fin.borrow_mut().insert(root_ptr, fin_ptr);
     }
 
     unsafe fn get_gc_inter_ptr<T>(&mut self) -> (*mut GcInternal<T>, (GcObjMem, Layout)) where T: Sized + Trace {
@@ -465,10 +509,10 @@ impl GarbageCollector {
         (gc_cell_inter_ptr, (mem, layout))
     }
 
-    unsafe fn get_ref_cell_gc_ptr<T>(&mut self) -> (*const RefCell<GcPtr<T>>, (*mut u8, Layout)) where T: Sized + Trace {
+    unsafe fn get_ref_cell_gc_ptr<T>(&mut self) -> (*mut RefCell<GcPtr<T>>, (*mut u8, Layout)) where T: Sized + Trace {
         let layout = Layout::new::<RefCell<GcPtr<T>>>();
         let mem = alloc(layout);
-        let gc_ptr: *const RefCell<GcPtr<T>> = std::ptr::read(mem as *const _);
+        let gc_ptr: *mut RefCell<GcPtr<T>> = mem as *mut _;
         (gc_ptr, (mem, layout))
     }
 
@@ -492,9 +536,14 @@ impl GarbageCollector {
         dbg!("collected_objects: {}", collected_objects.len());
         for col in collected_objects {
             let del = (&*self.vec.borrow())[&col];
+            let fin = (&*self.fin.borrow())[&col];
+            (*fin).finalize();
             dealloc((del.0).0, (del.0).1);
-            dealloc((del.1).0, (del.1).1);
+            if let Some(t) = del.1 {
+                dealloc(t.0, t.1);
+            }
             self.vec.borrow_mut().remove(&col);
+            self.fin.borrow_mut().remove(&col);
         }
     }
 }
