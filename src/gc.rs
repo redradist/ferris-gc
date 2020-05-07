@@ -1,6 +1,6 @@
 pub mod sync;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::alloc::{alloc, dealloc, Layout};
 
@@ -155,7 +155,13 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 }
 
 impl<T> Gc<T> where T: Sized + Trace {
-    pub fn new(t: T) -> Gc<T> {
+    pub fn new<'a>(t: T) -> Gc<T> {
+        // LOCAL_GC_STRATEGY.with(|strategy| unsafe {
+        //     println!("Before strategy.borrow().is_active()");
+        //     // if strategy.is_active() {
+        //     //     (*strategy).start();
+        //     // }
+        // });
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().create_gc(t)
         })
@@ -308,8 +314,15 @@ impl<T> Deref for GcCell<T> where T: 'static + Sized + Trace {
     }
 }
 
-impl<T> GcCell<T> where T: Sized + Trace {
-    pub fn new(t: T) -> GcCell<T> {
+impl<T> GcCell<T> where T: 'static + Sized + Trace {
+    pub fn new<'a>(t: T) -> GcCell<T> {
+        LOCAL_GC_STRATEGY.with(|strategy| unsafe {
+            println!("Before strategy.borrow().is_active()");
+            if strategy.borrow().is_active() {
+                // TODO: Fix it to run collecting the garbage !!
+                // (&*strategy.borrow()).start();
+            }
+        });
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().create_gc_cell(t)
         })
@@ -378,20 +391,17 @@ impl<T> Trace for GcCell<T> where T: Sized + Trace {
 type GcObjMem = *mut u8;
 
 pub struct GarbageCollector {
-    vec: HashMap<*const dyn Trace, ((GcObjMem, Layout), (GcObjMem, Layout))>,
+    vec: RefCell<HashMap<*const dyn Trace, ((GcObjMem, Layout), (GcObjMem, Layout))>>,
 }
+
+unsafe impl Sync for GarbageCollector {}
+unsafe impl Send for GarbageCollector {}
 
 impl GarbageCollector {
     fn new() -> GarbageCollector {
         GarbageCollector {
-            vec: HashMap::new(),
+            vec: RefCell::new(HashMap::new())
         }
-    }
-
-    pub fn strategy(&mut self) {
-        // std::thread::spawn(move || unsafe {
-        //     self.collect();
-        // });
     }
 
     unsafe fn create_gc<T>(&mut self, t: T) -> Gc<T>
@@ -403,9 +413,9 @@ impl GarbageCollector {
         };
         (*gc_ptr).info.has_root.set(false);
         (*gc_ptr).t = t;
-        (*gc.internal_ptr).ptr = gc_ptr;
-        gc.reset_root();
+        (*gc_ptr).t.reset_root();
         (*gc.internal_ptr).is_root.set(true);
+        (*gc.internal_ptr).ptr = gc_ptr;
         self.register_root(gc.internal_ptr, (mem_info_internal_ptr, mem_info_gc_ptr));
         gc
     }
@@ -426,9 +436,9 @@ impl GarbageCollector {
         };
         (*gc_ptr).borrow().info.has_root.set(false);
         (*gc_ptr).borrow_mut().t = t;
-        (*gc.internal_ptr).ptr = gc_ptr;
-        gc.reset_root();
+        (*gc_ptr).borrow_mut().t.reset_root();
         (*gc.internal_ptr).is_root.set(true);
+        (*gc.internal_ptr).ptr = gc_ptr;
         self.register_root(gc.internal_ptr, (mem_info_internal_ptr, mem_info_gc_ptr));
         gc
     }
@@ -442,11 +452,11 @@ impl GarbageCollector {
     }
 
     fn register_root(&mut self, root_ptr: *const dyn Trace, mem: ((GcObjMem, Layout), (GcObjMem, Layout))) {
-        self.vec.insert(root_ptr, mem);
+        self.vec.borrow_mut().insert(root_ptr, mem);
     }
 
     fn unregister_root(&mut self, root_ptr: *const dyn Trace) {
-        self.vec.remove(&root_ptr);
+        self.vec.borrow_mut().remove(&root_ptr);
     }
 
     unsafe fn get_gc_inter_ptr<T>(&mut self) -> (*mut GcInternal<T>, (GcObjMem, Layout)) where T: Sized + Trace {
@@ -477,15 +487,15 @@ impl GarbageCollector {
         (gc_ptr, (mem, layout))
     }
 
-    unsafe fn collect(&mut self) {
+    unsafe fn collect(&self) {
         let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
-        for (gc_info, _) in &self.vec {
+        for (gc_info, _) in &*self.vec.borrow() {
             let tracer = &(**gc_info);
             if tracer.is_root() {
                 tracer.trace();
             }
         }
-        for (gc_info, _) in &self.vec {
+        for (gc_info, _) in &*self.vec.borrow() {
             let tracer = &(**gc_info);
             if !tracer.is_traceable() {
                 collected_objects.push(*gc_info);
@@ -494,83 +504,92 @@ impl GarbageCollector {
             }
         }
         for col in collected_objects {
-            let del = self.vec[&col];
+            let del = (&*self.vec.borrow())[&col];
             dealloc((del.0).0, (del.0).1);
             dealloc((del.1).0, (del.1).1);
-            self.vec.remove(&col);
+            self.vec.borrow_mut().remove(&col);
         }
     }
 }
 
-// trait Strategy {
-//     fn start(&mut self);
-//     fn stop(&mut self);
-// }
-//
-// struct BasicStrategy<F>
-//     where F: Fn(),
-//           F: Send + 'static {
-//     is_active: AtomicBool,
-//     task: Arc<F>,
-//     task_join: Option<JoinHandle<()>>,
-// }
-//
-// impl<F> BasicStrategy<F>
-//     where F: Fn(),
-//           F: Send + 'static {
-//     fn new(f: Arc<F>) -> BasicStrategy<F> {
-//         BasicStrategy {
-//             is_active: AtomicBool::new(true),
-//             task: f,
-//             task_join: None,
-//         }
-//     }
-// }
-//
-// impl<F> Strategy for BasicStrategy<F>
-//     where F: Fn(),
-//           F: Send + 'static {
-//     fn start(&mut self) {
-//         let handler = self.task.clone();
-//         self.is_active.store(true, Ordering::Release);
-//         self.task_join = Some(std::thread::spawn(move || {
-//             (*handler)();
-//         }));
-//     }
-//
-//     fn stop(&mut self) {
-//         self.is_active.store(false, Ordering::Release);
-//         if let Some(task_join) = self.task_join {
-//             task_join.join();
-//         }
-//     }
-// }
-//
-// impl<F> Drop for BasicStrategy<F>
-//     where F: Fn(),
-//           F: Send + 'static {
-//     fn drop(&mut self) {
-//         self.stop();
-//     }
-// }
+pub type LocalStrategyFn = Box<dyn FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
 
-use std::cell::RefCell;
+pub struct LocalStrategy {
+    gc: Cell<&'static GarbageCollector>,
+    is_active: AtomicBool,
+    func: RefCell<LocalStrategyFn>,
+    join_handle: Cell<Option<JoinHandle<()>>>,
+}
+
+impl Drop for LocalStrategy {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl<'a> LocalStrategy {
+    fn new<F>(gc: &'static mut GarbageCollector, f: F) -> LocalStrategy
+        where F: 'static + FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
+        println!("Before LocalStrategy::new()");
+        LocalStrategy {
+            gc: Cell::new(gc),
+            is_active: AtomicBool::new(false),
+            func: RefCell::new(Box::new(f)),
+            join_handle: Cell::new(None)
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.is_active.load(Ordering::Acquire)
+    }
+
+    fn start(&'static self) {
+        println!("Before self.is_active.store");
+        self.is_active.store(true, Ordering::Release);
+        println!("Before self.join_handle");
+        self.join_handle.set((&mut *(self.func.borrow_mut()))(self.gc.get(), &self.is_active));
+    }
+
+    fn stop(&self) {
+        self.is_active.store(false, Ordering::Release);
+        if let Some(join_handle) = self.join_handle.take()  {
+            join_handle.join();
+        }
+    }
+}
+
+fn basic_local_strategy(gc: &'static GarbageCollector, is_work: &'static AtomicBool) -> Option<JoinHandle<()>> {
+    Some(thread::spawn(move || {
+        while is_work.load(Ordering::Acquire) {
+            let ten_secs = time::Duration::from_secs(10);
+            thread::sleep(ten_secs);
+            println!("Before gc.collect()");
+            unsafe {
+                gc.collect();
+            }
+        }
+    }))
+}
+
 use std::ops::Deref;
-use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::RwLock;
+use core::time;
+use std::thread;
 use std::borrow::BorrowMut;
 thread_local! {
-    pub static LOCAL_GC: RefCell<GarbageCollector> = RefCell::new(GarbageCollector::new());
-    // static STRATEGY: Cell<BasicStrategy<Arc<&'static dyn Fn()>>> = {
-    //     LOCAL_GC.with(move |gc| {
-    //         Cell::new(BasicStrategy::new(Arc::new(move || {
-    //
-    //         })))
-    //     })
-    // };
+    static LOCAL_GC: RefCell<GarbageCollector> = RefCell::new(GarbageCollector::new());
+    pub static LOCAL_GC_STRATEGY: RefCell<LocalStrategy> = {
+        LOCAL_GC.with(move |gc| {
+            println!("Before unsafe &mut *gc.as_ptr()");
+            let gc = unsafe { &mut *gc.as_ptr() };
+            RefCell::new(LocalStrategy::new(gc, move |obj, sda| {
+                println!("Before basic_local_strategy");
+                basic_local_strategy(obj, sda)
+            }))
+        })
+    };
 }
 
 #[cfg(test)]
@@ -582,7 +601,7 @@ mod tests {
         let one = Gc::new(1);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.len(), 1);
+            assert_eq!(gc.borrow_mut().vec.borrow().len(), 1);
         });
     }
 
@@ -593,7 +612,7 @@ mod tests {
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.len(), 0);
+            assert_eq!(gc.borrow_mut().vec.borrow().len(), 0);
         });
     }
 
@@ -602,7 +621,7 @@ mod tests {
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| {
-            assert_eq!(gc.borrow_mut().vec.len(), 2);
+            assert_eq!(gc.borrow_mut().vec.borrow().len(), 2);
         });
     }
 
@@ -612,7 +631,7 @@ mod tests {
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.len(), 0);
+            assert_eq!(gc.borrow_mut().vec.borrow().len(), 0);
         });
     }
 
@@ -624,7 +643,7 @@ mod tests {
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.len(), 0);
+            assert_eq!(gc.borrow_mut().vec.borrow().len(), 0);
         });
     }
 }
