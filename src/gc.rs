@@ -574,8 +574,11 @@ impl LocalStrategy {
         }
     }
 
-    pub fn new_from<F>(&self, f: F) -> LocalStrategy
+    pub fn prototype<F>(&self, f: F) -> LocalStrategy
         where F: 'static + FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
+        if self.is_active() {
+            self.stop();
+        }
         LocalStrategy {
             gc: Cell::new(self.gc.get()),
             is_active: AtomicBool::new(false),
