@@ -156,12 +156,12 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 
 impl<T> Gc<T> where T: Sized + Trace {
     pub fn new<'a>(t: T) -> Gc<T> {
-        // LOCAL_GC_STRATEGY.with(|strategy| unsafe {
-        //     println!("Before strategy.borrow().is_active()");
-        //     // if strategy.is_active() {
-        //     //     (*strategy).start();
-        //     // }
-        // });
+        LOCAL_GC_STRATEGY.with(|strategy| unsafe {
+            if !strategy.borrow().is_active() {
+                let strategy = unsafe { &mut *strategy.as_ptr() };
+                strategy.start();
+            }
+        });
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().create_gc(t)
         })
@@ -186,10 +186,7 @@ impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
     }
 
     fn clone_from(&mut self, source: &Self) {
-        let tracer = self.internal_ptr;
-        LOCAL_GC.with(move |gc| {
-            gc.borrow_mut().unregister_root(tracer);
-        });
+        self.is_root.set(false);
         unsafe {
             (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
         }
@@ -198,9 +195,7 @@ impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
 
 impl<T> Drop for Gc<T> where T: Sized + Trace {
     fn drop(&mut self) {
-        LOCAL_GC.with(move |gc| {
-            gc.borrow_mut().unregister_root(self.internal_ptr);
-        });
+        self.is_root.set(false);
     }
 }
 
@@ -298,9 +293,7 @@ pub struct GcCell<T> where T: 'static + Sized + Trace {
 
 impl<T> Drop for GcCell<T> where T: Sized + Trace {
     fn drop(&mut self) {
-        LOCAL_GC.with(move |gc| {
-            gc.borrow_mut().unregister_root(self.internal_ptr);
-        });
+        self.is_root.set(false);
     }
 }
 
@@ -317,10 +310,9 @@ impl<T> Deref for GcCell<T> where T: 'static + Sized + Trace {
 impl<T> GcCell<T> where T: 'static + Sized + Trace {
     pub fn new<'a>(t: T) -> GcCell<T> {
         LOCAL_GC_STRATEGY.with(|strategy| unsafe {
-            println!("Before strategy.borrow().is_active()");
-            if strategy.borrow().is_active() {
-                // TODO: Fix it to run collecting the garbage !!
-                // (&*strategy.borrow()).start();
+            if !strategy.borrow().is_active() {
+                let strategy = unsafe { &mut *strategy.as_ptr() };
+                strategy.start();
             }
         });
         LOCAL_GC.with(move |gc| unsafe {
@@ -345,10 +337,7 @@ impl<T> Clone for GcCell<T> where T: 'static + Sized + Trace {
     }
 
     fn clone_from(&mut self, source: &Self) {
-        let tracer = self.internal_ptr;
-        LOCAL_GC.with(move |gc| {
-            gc.borrow_mut().unregister_root(tracer);
-        });
+        self.is_root.set(false);
         unsafe {
             (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
         }
@@ -412,7 +401,7 @@ impl GarbageCollector {
             internal_ptr: gc_inter_ptr,
         };
         (*gc_ptr).info.has_root.set(false);
-        (*gc_ptr).t = t;
+        std::ptr::write(&mut (*gc_ptr).t, t);
         (*gc_ptr).t.reset_root();
         (*gc.internal_ptr).is_root.set(true);
         (*gc.internal_ptr).ptr = gc_ptr;
@@ -432,10 +421,10 @@ impl GarbageCollector {
         let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.get_gc_cell_inter_ptr::<T>();
         let (gc_ptr, mem_info_gc_ptr) = self.get_ref_cell_gc_ptr::<T>();
         let gc = GcCell {
-            internal_ptr: gc_cell_inter_ptr,
+            internal_ptr: std::ptr::null_mut(),
         };
         (*gc_ptr).borrow().info.has_root.set(false);
-        (*gc_ptr).borrow_mut().t = t;
+        std::ptr::write(&mut (*gc_ptr).borrow_mut().t, t);
         (*gc_ptr).borrow_mut().t.reset_root();
         (*gc.internal_ptr).is_root.set(true);
         (*gc.internal_ptr).ptr = gc_ptr;
@@ -455,28 +444,24 @@ impl GarbageCollector {
         self.vec.borrow_mut().insert(root_ptr, mem);
     }
 
-    fn unregister_root(&mut self, root_ptr: *const dyn Trace) {
-        self.vec.borrow_mut().remove(&root_ptr);
-    }
-
     unsafe fn get_gc_inter_ptr<T>(&mut self) -> (*mut GcInternal<T>, (GcObjMem, Layout)) where T: Sized + Trace {
         let layout = Layout::new::<GcInternal<T>>();
         let mem = alloc(layout);
-        let gc_inter_ptr: *mut GcInternal<T> = std::ptr::read(mem as *mut _);
+        let gc_inter_ptr: *mut GcInternal<T> = mem as *mut _;
         (gc_inter_ptr, (mem, layout))
     }
 
     unsafe fn get_gc_ptr<T>(&mut self) -> (*mut GcPtr<T>, (GcObjMem, Layout)) where T: Sized + Trace {
         let layout = Layout::new::<GcPtr<T>>();
         let mem = alloc(layout);
-        let gc_ptr: *mut GcPtr<T> = std::ptr::read(mem as *mut _);
+        let gc_ptr: *mut GcPtr<T> = mem as *mut _;
         (gc_ptr, (mem, layout))
     }
 
     unsafe fn get_gc_cell_inter_ptr<T>(&mut self) -> (*mut GcCellInternal<T>, (GcObjMem, Layout)) where T: Sized + Trace {
         let layout = Layout::new::<GcInternal<T>>();
         let mem = alloc(layout);
-        let gc_cell_inter_ptr: *mut GcCellInternal<T> = std::ptr::read(mem as *mut _);
+        let gc_cell_inter_ptr: *mut GcCellInternal<T> = mem as *mut _;
         (gc_cell_inter_ptr, (mem, layout))
     }
 
@@ -487,7 +472,8 @@ impl GarbageCollector {
         (gc_ptr, (mem, layout))
     }
 
-    unsafe fn collect(&self) {
+    pub unsafe fn collect(&self) {
+        dbg!("Start collect ...");
         let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
         for (gc_info, _) in &*self.vec.borrow() {
             let tracer = &(**gc_info);
@@ -503,6 +489,7 @@ impl GarbageCollector {
                 tracer.reset();
             }
         }
+        dbg!("collected_objects: {}", collected_objects.len());
         for col in collected_objects {
             let del = (&*self.vec.borrow())[&col];
             dealloc((del.0).0, (del.0).1);
@@ -512,49 +499,67 @@ impl GarbageCollector {
     }
 }
 
+impl Drop for GarbageCollector {
+    fn drop(&mut self) {
+        dbg!("GarbageCollector::drop");
+    }
+}
+
 pub type LocalStrategyFn = Box<dyn FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
 
 pub struct LocalStrategy {
     gc: Cell<&'static GarbageCollector>,
     is_active: AtomicBool,
     func: RefCell<LocalStrategyFn>,
-    join_handle: Cell<Option<JoinHandle<()>>>,
+    join_handle: RefCell<Option<JoinHandle<()>>>,
 }
 
-impl Drop for LocalStrategy {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-impl<'a> LocalStrategy {
+impl LocalStrategy {
     fn new<F>(gc: &'static mut GarbageCollector, f: F) -> LocalStrategy
         where F: 'static + FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
-        println!("Before LocalStrategy::new()");
         LocalStrategy {
             gc: Cell::new(gc),
             is_active: AtomicBool::new(false),
             func: RefCell::new(Box::new(f)),
-            join_handle: Cell::new(None)
+            join_handle: RefCell::new(None)
         }
     }
 
-    fn is_active(&self) -> bool {
+    pub fn new_from<F>(&self, f: F) -> LocalStrategy
+        where F: 'static + FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
+        LocalStrategy {
+            gc: Cell::new(self.gc.get()),
+            is_active: AtomicBool::new(false),
+            func: RefCell::new(Box::new(f)),
+            join_handle: RefCell::new(None)
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
         self.is_active.load(Ordering::Acquire)
     }
 
-    fn start(&'static self) {
-        println!("Before self.is_active.store");
+    pub fn start(&'static self) {
+        dbg!("LocalStrategy::start");
         self.is_active.store(true, Ordering::Release);
-        println!("Before self.join_handle");
-        self.join_handle.set((&mut *(self.func.borrow_mut()))(self.gc.get(), &self.is_active));
+        self.join_handle.replace((&mut *(self.func.borrow_mut()))(self.gc.get(), &self.is_active));
     }
 
-    fn stop(&self) {
+    pub fn stop(&self) {
+        dbg!("LocalStrategy::stop");
+        dbg!("LocalStrategy::stop, is_active: {}", self.is_active.load(Ordering::Acquire));
         self.is_active.store(false, Ordering::Release);
-        if let Some(join_handle) = self.join_handle.take()  {
-            join_handle.join();
+        if let Some(join_handle) = self.join_handle.borrow_mut().take()  {
+            // NOTE(redra): Crash due to destroying LocalStrategy from wrong thread
+            // join_handle.join().expect("LocalStrategy::stop, LocalStrategy Thread being joined has panicked !!");
         }
+    }
+}
+
+impl Drop for LocalStrategy {
+    fn drop(&mut self) {
+        dbg!("LocalStrategy::drop");
+        self.stop();
     }
 }
 
@@ -563,11 +568,11 @@ fn basic_local_strategy(gc: &'static GarbageCollector, is_work: &'static AtomicB
         while is_work.load(Ordering::Acquire) {
             let ten_secs = time::Duration::from_secs(10);
             thread::sleep(ten_secs);
-            println!("Before gc.collect()");
             unsafe {
                 gc.collect();
             }
         }
+        dbg!("Stop thread::spawn");
     }))
 }
 
@@ -582,10 +587,8 @@ thread_local! {
     static LOCAL_GC: RefCell<GarbageCollector> = RefCell::new(GarbageCollector::new());
     pub static LOCAL_GC_STRATEGY: RefCell<LocalStrategy> = {
         LOCAL_GC.with(move |gc| {
-            println!("Before unsafe &mut *gc.as_ptr()");
             let gc = unsafe { &mut *gc.as_ptr() };
             RefCell::new(LocalStrategy::new(gc, move |obj, sda| {
-                println!("Before basic_local_strategy");
                 basic_local_strategy(obj, sda)
             }))
         })
