@@ -57,9 +57,26 @@ struct GcInfo {
     has_root: Cell<bool>,
 }
 
+impl GcInfo {
+    fn new() -> GcInfo {
+        GcInfo {
+            has_root: Cell::new(false),
+        }
+    }
+}
+
 pub struct GcPtr<T> where T: 'static + Sized + Trace {
     info: GcInfo,
     t: T,
+}
+
+impl<T> GcPtr<T> where T: 'static + Sized + Trace {
+    fn new(t: T) -> GcPtr<T> {
+        GcPtr {
+            info: GcInfo::new(),
+            t: t,
+        }
+    }
 }
 
 impl<T> Deref for GcPtr<T> where T: 'static + Sized + Trace {
@@ -67,6 +84,12 @@ impl<T> Deref for GcPtr<T> where T: 'static + Sized + Trace {
 
     fn deref(&self) -> &Self::Target {
         &self.t
+    }
+}
+
+impl<T> DerefMut for GcPtr<T> where T: 'static + Sized + Trace {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.t
     }
 }
 
@@ -102,6 +125,15 @@ impl<T> Finalizer for GcPtr<T> where T: Sized + Trace {
 pub struct GcInternal<T> where T: 'static + Sized + Trace {
     is_root: Cell<bool>,
     ptr: *const GcPtr<T>,
+}
+
+impl<T> GcInternal<T> where T: 'static + Sized + Trace {
+    fn new(ptr: *const GcPtr<T>) -> GcInternal<T> {
+        GcInternal {
+            is_root: Cell::new(true),
+            ptr: ptr,
+        }
+    }
 }
 
 impl<T> Trace for GcInternal<T> where T: Sized + Trace {
@@ -259,6 +291,15 @@ impl<T> Finalizer for Gc<T> where T: Sized + Trace {
 pub struct GcCellInternal<T> where T: 'static + Sized + Trace {
     is_root: Cell<bool>,
     ptr: *const RefCell<GcPtr<T>>,
+}
+
+impl<T> GcCellInternal<T> where T: 'static + Sized + Trace {
+    fn new(ptr: *const RefCell<GcPtr<T>>) -> GcCellInternal<T> {
+        GcCellInternal {
+            is_root: Cell::new(true),
+            ptr: ptr,
+        }
+    }
 }
 
 impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
@@ -432,16 +473,14 @@ impl GarbageCollector {
 
     unsafe fn create_gc<T>(&mut self, t: T) -> Gc<T>
         where T: Sized + Trace {
-        let (gc_inter_ptr, mem_info_internal_ptr) = self.get_gc_inter_ptr::<T>();
         let (gc_ptr, mem_info_gc_ptr) = self.get_gc_ptr::<T>();
+        let (gc_inter_ptr, mem_info_internal_ptr) = self.get_gc_inter_ptr::<T>();
+        std::ptr::write(gc_ptr, GcPtr::new(t));
+        std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
         let gc = Gc {
             internal_ptr: gc_inter_ptr,
         };
-        (*gc_ptr).info.has_root.set(false);
-        std::ptr::write(&mut (*gc_ptr).t, t);
-        (*gc_ptr).t.reset_root();
-        (*gc.internal_ptr).is_root.set(true);
-        (*gc.internal_ptr).ptr = gc_ptr;
+        gc.t.reset_root();
         let mut vec = self.vec.lock().unwrap();
         let mut fin = self.fin.lock().unwrap();
         vec.insert(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
@@ -460,16 +499,14 @@ impl GarbageCollector {
     }
 
     unsafe fn create_gc_cell<T>(&mut self, t: T) -> GcCell<T> where T: Sized + Trace {
-        let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.get_gc_cell_inter_ptr::<T>();
         let (gc_ptr, mem_info_gc_ptr) = self.get_ref_cell_gc_ptr::<T>();
+        let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.get_gc_cell_inter_ptr::<T>();
+        std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
+        std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr));
         let gc = GcCell {
-            internal_ptr: std::ptr::null_mut(),
+            internal_ptr: gc_cell_inter_ptr,
         };
-        (*gc_ptr).borrow().info.has_root.set(false);
-        std::ptr::write(&mut (*gc_ptr).borrow_mut().t, t);
-        (*gc_ptr).borrow_mut().t.reset_root();
-        (*gc.internal_ptr).is_root.set(true);
-        (*gc.internal_ptr).ptr = gc_ptr;
+        gc.borrow().t.reset_root();
         let mut vec = self.vec.lock().unwrap();
         let mut fin = self.fin.lock().unwrap();
         vec.insert(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
@@ -648,7 +685,7 @@ fn basic_local_strategy(gc: &'static GarbageCollector, is_work: &'static AtomicB
     }))
 }
 
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::sync::{RwLock, Mutex};
