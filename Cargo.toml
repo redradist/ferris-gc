@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "gc",
+    "gc_proc_macro",
+]

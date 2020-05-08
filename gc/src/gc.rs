@@ -473,8 +473,8 @@ impl GarbageCollector {
 
     unsafe fn create_gc<T>(&mut self, t: T) -> Gc<T>
         where T: Sized + Trace {
-        let (gc_ptr, mem_info_gc_ptr) = self.get_gc_ptr::<T>();
-        let (gc_inter_ptr, mem_info_internal_ptr) = self.get_gc_inter_ptr::<T>();
+        let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<GcPtr<T>>();
+        let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
         std::ptr::write(gc_ptr, GcPtr::new(t));
         std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
         let gc = Gc {
@@ -489,8 +489,8 @@ impl GarbageCollector {
     }
 
     unsafe fn null_gc<T>(&mut self) -> Gc<T> where T: Sized + Trace {
-        let (gc_inter_ptr, mem_info) = self.get_gc_inter_ptr::<T>();
-        (*gc_inter_ptr).ptr = std::ptr::null();
+        let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcInternal<T>>();
+        std::ptr::write(gc_inter_ptr, GcInternal::new(std::ptr::null()));
         let mut vec = self.vec.lock().unwrap();
         vec.insert(gc_inter_ptr, (mem_info, None));
         Gc {
@@ -499,8 +499,8 @@ impl GarbageCollector {
     }
 
     unsafe fn create_gc_cell<T>(&mut self, t: T) -> GcCell<T> where T: Sized + Trace {
-        let (gc_ptr, mem_info_gc_ptr) = self.get_ref_cell_gc_ptr::<T>();
-        let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.get_gc_cell_inter_ptr::<T>();
+        let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<RefCell<GcPtr<T>>>();
+        let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcCellInternal<T>>();
         std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
         std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr));
         let gc = GcCell {
@@ -515,8 +515,8 @@ impl GarbageCollector {
     }
 
     unsafe fn null_gc_cell<T>(&mut self) -> GcCell<T> where T: Sized + Trace {
-        let (gc_inter_ptr, mem_info) = self.get_gc_cell_inter_ptr::<T>();
-        (*gc_inter_ptr).ptr = std::ptr::null();
+        let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcCellInternal<T>>();
+        std::ptr::write(gc_inter_ptr, GcCellInternal::new(std::ptr::null()));
         let mut vec = self.vec.lock().unwrap();
         vec.insert(gc_inter_ptr, (mem_info, None));
         GcCell {
@@ -524,32 +524,11 @@ impl GarbageCollector {
         }
     }
 
-    unsafe fn get_gc_inter_ptr<T>(&mut self) -> (*mut GcInternal<T>, (GcObjMem, Layout)) where T: Sized + Trace {
-        let layout = Layout::new::<GcInternal<T>>();
+    unsafe fn alloc_mem<T>(&mut self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
+        let layout = Layout::new::<T>();
         let mem = alloc(layout);
-        let gc_inter_ptr: *mut GcInternal<T> = mem as *mut _;
+        let gc_inter_ptr: *mut T = mem as *mut _;
         (gc_inter_ptr, (mem, layout))
-    }
-
-    unsafe fn get_gc_ptr<T>(&mut self) -> (*mut GcPtr<T>, (GcObjMem, Layout)) where T: Sized + Trace {
-        let layout = Layout::new::<GcPtr<T>>();
-        let mem = alloc(layout);
-        let gc_ptr: *mut GcPtr<T> = mem as *mut _;
-        (gc_ptr, (mem, layout))
-    }
-
-    unsafe fn get_gc_cell_inter_ptr<T>(&mut self) -> (*mut GcCellInternal<T>, (GcObjMem, Layout)) where T: Sized + Trace {
-        let layout = Layout::new::<GcCellInternal<T>>();
-        let mem = alloc(layout);
-        let gc_cell_inter_ptr: *mut GcCellInternal<T> = mem as *mut _;
-        (gc_cell_inter_ptr, (mem, layout))
-    }
-
-    unsafe fn get_ref_cell_gc_ptr<T>(&mut self) -> (*mut RefCell<GcPtr<T>>, (*mut u8, Layout)) where T: Sized + Trace {
-        let layout = Layout::new::<RefCell<GcPtr<T>>>();
-        let mem = alloc(layout);
-        let gc_ptr: *mut RefCell<GcPtr<T>> = mem as *mut _;
-        (gc_ptr, (mem, layout))
     }
 
     pub unsafe fn collect(&self) {
