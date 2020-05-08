@@ -48,6 +48,7 @@ macro_rules! primitive_types {
 
 primitive_types!(
     u8, i8, u16, i16, u32, i32, u64, i64, u128, i128,
+    usize, isize,
     f32, f64,
     bool
 );
@@ -175,7 +176,7 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 
 impl<T> Gc<T> where T: Sized + Trace {
     pub fn new<'a>(t: T) -> Gc<T> {
-        LOCAL_GC_STRATEGY.with(|strategy| unsafe {
+        LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 let strategy = unsafe { &mut *strategy.as_ptr() };
                 strategy.start();
@@ -414,8 +415,8 @@ impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
 type GcObjMem = *mut u8;
 
 pub struct GarbageCollector {
-    vec: RefCell<HashMap<*const dyn Trace, ((GcObjMem, Layout), Option<(GcObjMem, Layout)>)>>,
-    fin: RefCell<HashMap<*const dyn Trace, *const dyn Finalizer>>,
+    vec: Mutex<HashMap<*const dyn Trace, ((GcObjMem, Layout), Option<(GcObjMem, Layout)>)>>,
+    fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalizer>>,
 }
 
 unsafe impl Sync for GarbageCollector {}
@@ -424,8 +425,8 @@ unsafe impl Send for GarbageCollector {}
 impl GarbageCollector {
     fn new() -> GarbageCollector {
         GarbageCollector {
-            vec: RefCell::new(HashMap::new()),
-            fin: RefCell::new(HashMap::new()),
+            vec: Mutex::new(HashMap::new()),
+            fin: Mutex::new(HashMap::new()),
         }
     }
 
@@ -441,15 +442,18 @@ impl GarbageCollector {
         (*gc_ptr).t.reset_root();
         (*gc.internal_ptr).is_root.set(true);
         (*gc.internal_ptr).ptr = gc_ptr;
-        self.register_root(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
-        self.register_root_fin(gc.internal_ptr, (*gc_ptr).t.as_finalize());
+        let mut vec = self.vec.lock().unwrap();
+        let mut fin = self.fin.lock().unwrap();
+        vec.insert(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
+        fin.insert(gc.internal_ptr, (*gc_ptr).t.as_finalize());
         gc
     }
 
     unsafe fn null_gc<T>(&mut self) -> Gc<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info) = self.get_gc_inter_ptr::<T>();
         (*gc_inter_ptr).ptr = std::ptr::null();
-        self.register_root(gc_inter_ptr, (mem_info, None));
+        let mut vec = self.vec.lock().unwrap();
+        vec.insert(gc_inter_ptr, (mem_info, None));
         Gc {
             internal_ptr: gc_inter_ptr,
         }
@@ -466,26 +470,21 @@ impl GarbageCollector {
         (*gc_ptr).borrow_mut().t.reset_root();
         (*gc.internal_ptr).is_root.set(true);
         (*gc.internal_ptr).ptr = gc_ptr;
-        self.register_root(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
-        self.register_root_fin(gc.internal_ptr, (*gc_ptr).as_ptr());
+        let mut vec = self.vec.lock().unwrap();
+        let mut fin = self.fin.lock().unwrap();
+        vec.insert(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
+        fin.insert(gc.internal_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
         gc
     }
 
     unsafe fn null_gc_cell<T>(&mut self) -> GcCell<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info) = self.get_gc_cell_inter_ptr::<T>();
         (*gc_inter_ptr).ptr = std::ptr::null();
-        self.register_root(gc_inter_ptr, (mem_info, None));
+        let mut vec = self.vec.lock().unwrap();
+        vec.insert(gc_inter_ptr, (mem_info, None));
         GcCell {
             internal_ptr: gc_inter_ptr,
         }
-    }
-
-    fn register_root(&mut self, root_ptr: *const dyn Trace, mem: ((GcObjMem, Layout), Option<(GcObjMem, Layout)>)) {
-        self.vec.borrow_mut().insert(root_ptr, mem);
-    }
-
-    fn register_root_fin(&mut self, root_ptr: *const dyn Trace, fin_ptr: *const dyn Finalizer) {
-        self.fin.borrow_mut().insert(root_ptr, fin_ptr);
     }
 
     unsafe fn get_gc_inter_ptr<T>(&mut self) -> (*mut GcInternal<T>, (GcObjMem, Layout)) where T: Sized + Trace {
@@ -503,7 +502,7 @@ impl GarbageCollector {
     }
 
     unsafe fn get_gc_cell_inter_ptr<T>(&mut self) -> (*mut GcCellInternal<T>, (GcObjMem, Layout)) where T: Sized + Trace {
-        let layout = Layout::new::<GcInternal<T>>();
+        let layout = Layout::new::<GcCellInternal<T>>();
         let mem = alloc(layout);
         let gc_cell_inter_ptr: *mut GcCellInternal<T> = mem as *mut _;
         (gc_cell_inter_ptr, (mem, layout))
@@ -519,13 +518,14 @@ impl GarbageCollector {
     pub unsafe fn collect(&self) {
         dbg!("Start collect ...");
         let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
-        for (gc_info, _) in &*self.vec.borrow() {
+        let mut vec = self.vec.lock().unwrap();
+        for (gc_info, _) in &*vec {
             let tracer = &(**gc_info);
             if tracer.is_root() {
                 tracer.trace();
             }
         }
-        for (gc_info, _) in &*self.vec.borrow() {
+        for (gc_info, _) in &*vec {
             let tracer = &(**gc_info);
             if !tracer.is_traceable() {
                 collected_objects.push(*gc_info);
@@ -534,16 +534,38 @@ impl GarbageCollector {
             }
         }
         dbg!("collected_objects: {}", collected_objects.len());
+        let mut fin = self.fin.lock().unwrap();
         for col in collected_objects {
-            let del = (&*self.vec.borrow())[&col];
-            let fin = (&*self.fin.borrow())[&col];
-            (*fin).finalize();
+            let del = (&*vec)[&col];
+            let finilizer = (&*fin)[&col];
+            (*finilizer).finalize();
             dealloc((del.0).0, (del.0).1);
             if let Some(t) = del.1 {
                 dealloc(t.0, t.1);
             }
-            self.vec.borrow_mut().remove(&col);
-            self.fin.borrow_mut().remove(&col);
+            vec.remove(&col);
+            fin.remove(&col);
+        }
+    }
+
+    unsafe fn collect_all(&self) {
+        dbg!("Collect all objects ...");
+        let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
+        let mut vec = self.vec.lock().unwrap();
+        for (gc_info, _) in &*vec {
+            collected_objects.push(*gc_info);
+        }
+        let mut fin = self.fin.lock().unwrap();
+        for col in collected_objects {
+            let del = (&*vec)[&col];
+            let finilizer = (&*fin)[&col];
+            (*finilizer).finalize();
+            dealloc((del.0).0, (del.0).1);
+            if let Some(t) = del.1 {
+                dealloc(t.0, t.1);
+            }
+            vec.remove(&col);
+            fin.remove(&col);
         }
     }
 }
@@ -599,11 +621,9 @@ impl LocalStrategy {
 
     pub fn stop(&self) {
         dbg!("LocalStrategy::stop");
-        dbg!("LocalStrategy::stop, is_active: {}", self.is_active.load(Ordering::Acquire));
         self.is_active.store(false, Ordering::Release);
         if let Some(join_handle) = self.join_handle.borrow_mut().take()  {
-            // NOTE(redra): Crash due to destroying LocalStrategy from wrong thread
-            // join_handle.join().expect("LocalStrategy::stop, LocalStrategy Thread being joined has panicked !!");
+            join_handle.join().expect("LocalStrategy::stop, LocalStrategy Thread being joined has panicked !!");
         }
     }
 }
@@ -611,7 +631,7 @@ impl LocalStrategy {
 impl Drop for LocalStrategy {
     fn drop(&mut self) {
         dbg!("LocalStrategy::drop");
-        self.stop();
+        self.is_active.store(false, Ordering::Release);
     }
 }
 
@@ -631,7 +651,7 @@ fn basic_local_strategy(gc: &'static GarbageCollector, is_work: &'static AtomicB
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::sync::RwLock;
+use std::sync::{RwLock, Mutex};
 use core::time;
 use std::thread;
 use std::borrow::BorrowMut;
