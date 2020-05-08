@@ -117,6 +117,35 @@ impl<T> Trace for GcPtr<T> where T: Sized + Trace {
     }
 }
 
+impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
+    fn is_root(&self) -> bool {
+        unreachable!("is_root on GcPtr is unreachable !!");
+    }
+
+    fn reset_root(&self) {
+        self.borrow().t.reset_root();
+    }
+
+    fn trace(&self) {
+        self.borrow().info.has_root.set(true);
+        self.borrow().t.trace();
+    }
+
+    fn reset(&self) {
+        self.borrow().info.has_root.set(false);
+        self.borrow().t.reset();
+    }
+
+    fn is_traceable(&self) -> bool {
+        self.borrow().info.has_root.get()
+    }
+}
+
+impl<T> Finalizer for RefCell<GcPtr<T>> where T: Sized + Trace {
+    fn finalize(&self) {
+    }
+}
+
 impl<T> Finalizer for GcPtr<T> where T: Sized + Trace {
     fn finalize(&self) {
     }
@@ -143,37 +172,25 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
 
     fn reset_root(&self) {
         self.is_root.set(false);
-        if !self.ptr.is_null() {
-            unsafe {
-                (*self.ptr).reset_root();
-            }
+        unsafe {
+            (*self.ptr).reset_root();
         }
     }
 
     fn trace(&self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                (*self.ptr).trace();
-            }
+        unsafe {
+            (*self.ptr).trace();
         }
     }
 
     fn reset(&self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                (*self.ptr).reset();
-            }
+        unsafe {
+            (*self.ptr).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        if !self.ptr.is_null() {
-            unsafe {
-                (*self.ptr).is_traceable()
-            }
-        } else {
-            true
-        }
+        unreachable!();
     }
 }
 
@@ -218,23 +235,13 @@ impl<T> Gc<T> where T: Sized + Trace {
             gc.borrow_mut().create_gc(t)
         })
     }
-
-    pub fn null() -> Gc<T> {
-        LOCAL_GC.with(move |gc| unsafe {
-            gc.borrow_mut().null_gc()
-        })
-    }
 }
 
 impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
     fn clone(&self) -> Self {
-        let gc = LOCAL_GC.with(move |gc| unsafe {
-            gc.borrow_mut().null_gc()
-        });
-        unsafe {
-            (*gc.internal_ptr).is_root.set(true);
-        }
-        gc
+        LOCAL_GC.with(move |gc| unsafe {
+            gc.borrow_mut().clone_from_gc(self)
+        })
     }
 
     fn clone_from(&mut self, source: &Self) {
@@ -247,7 +254,10 @@ impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
 
 impl<T> Drop for Gc<T> where T: Sized + Trace {
     fn drop(&mut self) {
-        self.is_root.set(false);
+        println!("Gc::drop");
+        LOCAL_GC.with(move |gc| unsafe {
+            gc.borrow_mut().remove_tracer(self.internal_ptr);
+        });
     }
 }
 
@@ -277,9 +287,7 @@ impl<T> Trace for Gc<T> where T: Sized + Trace {
     }
 
     fn is_traceable(&self) -> bool {
-        unsafe {
-            (*self.internal_ptr).is_traceable()
-        }
+        self.is_root()
     }
 }
 
@@ -309,37 +317,25 @@ impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
 
     fn reset_root(&self) {
         self.is_root.set(false);
-        if !self.ptr.is_null() {
-            unsafe {
-                (*self.ptr).borrow().reset_root();
-            }
+        unsafe {
+            (*self.ptr).borrow().reset_root();
         }
     }
 
     fn trace(&self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                (*self.ptr).borrow().trace();
-            }
+        unsafe {
+            (*self.ptr).borrow().trace();
         }
     }
 
     fn reset(&self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                (*self.ptr).borrow().reset();
-            }
+        unsafe {
+            (*self.ptr).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        if !self.ptr.is_null() {
-            unsafe {
-                (*self.ptr).borrow().is_traceable()
-            }
-        } else {
-            true
-        }
+        unreachable!();
     }
 }
 
@@ -364,7 +360,9 @@ pub struct GcCell<T> where T: 'static + Sized + Trace {
 
 impl<T> Drop for GcCell<T> where T: Sized + Trace {
     fn drop(&mut self) {
-        self.is_root.set(false);
+        LOCAL_GC.with(move |gc| unsafe {
+            gc.borrow_mut().remove_tracer(self.internal_ptr);
+        });
     }
 }
 
@@ -390,20 +388,17 @@ impl<T> GcCell<T> where T: 'static + Sized + Trace {
             gc.borrow_mut().create_gc_cell(t)
         })
     }
-
-    pub fn null() -> GcCell<T> {
-        LOCAL_GC.with(move |gc| unsafe {
-            gc.borrow_mut().null_gc_cell()
-        })
-    }
 }
 
 impl<T> Clone for GcCell<T> where T: 'static + Sized + Trace {
     fn clone(&self) -> Self {
         let gc = LOCAL_GC.with(move |gc| unsafe {
-            gc.borrow_mut().null_gc_cell()
+            gc.borrow_mut().clone_from_gc_cell(self)
         });
-        gc.is_root.set(true);
+        unsafe {
+            (*gc.internal_ptr).ptr = (*self.internal_ptr).ptr;
+            (*gc.internal_ptr).is_root.set(true);
+        }
         gc
     }
 
@@ -442,9 +437,7 @@ impl<T> Trace for GcCell<T> where T: Sized + Trace {
     }
 
     fn is_traceable(&self) -> bool {
-        unsafe {
-            (*self.ptr).borrow().is_traceable()
-        }
+        self.is_root()
     }
 }
 
@@ -456,7 +449,8 @@ impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
 type GcObjMem = *mut u8;
 
 pub struct GarbageCollector {
-    vec: Mutex<HashMap<*const dyn Trace, ((GcObjMem, Layout), Option<(GcObjMem, Layout)>)>>,
+    trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
+    objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalizer>>,
 }
 
@@ -466,7 +460,8 @@ unsafe impl Send for GarbageCollector {}
 impl GarbageCollector {
     fn new() -> GarbageCollector {
         GarbageCollector {
-            vec: Mutex::new(HashMap::new()),
+            trs: RwLock::new(HashMap::new()),
+            objs: Mutex::new(HashMap::new()),
             fin: Mutex::new(HashMap::new()),
         }
     }
@@ -480,22 +475,26 @@ impl GarbageCollector {
         let gc = Gc {
             internal_ptr: gc_inter_ptr,
         };
-        gc.t.reset_root();
-        let mut vec = self.vec.lock().unwrap();
+        (*(*gc.internal_ptr).ptr).reset_root();
+        let mut trs = self.trs.write().unwrap();
+        let mut objs = self.objs.lock().unwrap();
         let mut fin = self.fin.lock().unwrap();
-        vec.insert(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
-        fin.insert(gc.internal_ptr, (*gc_ptr).t.as_finalize());
+        trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+        objs.insert(gc_ptr, mem_info_gc_ptr);
+        fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
         gc
     }
 
-    unsafe fn null_gc<T>(&mut self) -> Gc<T> where T: Sized + Trace {
-        let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcInternal<T>>();
-        std::ptr::write(gc_inter_ptr, GcInternal::new(std::ptr::null()));
-        let mut vec = self.vec.lock().unwrap();
-        vec.insert(gc_inter_ptr, (mem_info, None));
-        Gc {
+    unsafe fn clone_from_gc<T>(&mut self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
+        let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
+        std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
+        let mut trs = self.trs.write().unwrap();
+        trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+        let gc = Gc {
             internal_ptr: gc_inter_ptr,
-        }
+        };
+        (*(*gc.internal_ptr).ptr).reset_root();
+        gc
     }
 
     unsafe fn create_gc_cell<T>(&mut self, t: T) -> GcCell<T> where T: Sized + Trace {
@@ -506,22 +505,26 @@ impl GarbageCollector {
         let gc = GcCell {
             internal_ptr: gc_cell_inter_ptr,
         };
-        gc.borrow().t.reset_root();
-        let mut vec = self.vec.lock().unwrap();
+        (*(*gc.internal_ptr).ptr).reset_root();
+        let mut trs = self.trs.write().unwrap();
+        let mut objs = self.objs.lock().unwrap();
         let mut fin = self.fin.lock().unwrap();
-        vec.insert(gc.internal_ptr, (mem_info_internal_ptr, Some(mem_info_gc_ptr)));
-        fin.insert(gc.internal_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
+        trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
+        objs.insert(gc_ptr, mem_info_gc_ptr);
+        fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
         gc
     }
 
-    unsafe fn null_gc_cell<T>(&mut self) -> GcCell<T> where T: Sized + Trace {
+    unsafe fn clone_from_gc_cell<T>(&mut self, gc: &GcCell<T>) -> GcCell<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcCellInternal<T>>();
-        std::ptr::write(gc_inter_ptr, GcCellInternal::new(std::ptr::null()));
-        let mut vec = self.vec.lock().unwrap();
-        vec.insert(gc_inter_ptr, (mem_info, None));
-        GcCell {
+        std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr));
+        let mut trs = self.trs.write().unwrap();
+        trs.insert(gc_inter_ptr, mem_info);
+        let gc = GcCell {
             internal_ptr: gc_inter_ptr,
-        }
+        };
+        (*(*gc.internal_ptr).ptr).reset_root();
+        gc
     }
 
     unsafe fn alloc_mem<T>(&mut self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
@@ -531,56 +534,71 @@ impl GarbageCollector {
         (gc_inter_ptr, (mem, layout))
     }
 
+    pub unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
+        dbg!("remove_tracer(&self, tracer: *const dyn Trace)");
+        let mut trs = self.trs.write().unwrap();
+        let del = (&*trs)[&tracer];
+        dealloc(del.0, del.1);
+        trs.remove(&tracer);
+    }
+
     pub unsafe fn collect(&self) {
         dbg!("Start collect ...");
-        let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
-        let mut vec = self.vec.lock().unwrap();
-        for (gc_info, _) in &*vec {
+        let mut collected_int_objects: Vec<*const dyn Trace> = Vec::new();
+        let mut trs = self.trs.read().unwrap();
+        for (gc_info, _) in &*trs {
             let tracer = &(**gc_info);
             if tracer.is_root() {
                 tracer.trace();
             }
         }
-        for (gc_info, _) in &*vec {
-            let tracer = &(**gc_info);
-            if !tracer.is_traceable() {
+        let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
+        let mut objs = self.objs.lock().unwrap();
+        for (gc_info, _) in &*objs {
+            let obj = &(**gc_info);
+            if !obj.is_traceable() {
                 collected_objects.push(*gc_info);
-            } else {
-                tracer.reset();
             }
+        }
+        for (gc_info, _) in &*trs {
+            let tracer = &(**gc_info);
+            tracer.reset();
         }
         dbg!("collected_objects: {}", collected_objects.len());
         let mut fin = self.fin.lock().unwrap();
         for col in collected_objects {
-            let del = (&*vec)[&col];
+            let del = (&*objs)[&col];
             let finilizer = (&*fin)[&col];
             (*finilizer).finalize();
-            dealloc((del.0).0, (del.0).1);
-            if let Some(t) = del.1 {
-                dealloc(t.0, t.1);
-            }
-            vec.remove(&col);
+            dealloc(del.0, del.1);
+            objs.remove(&col);
             fin.remove(&col);
         }
     }
 
     unsafe fn collect_all(&self) {
-        dbg!("Collect all objects ...");
+        dbg!("Start collect ...");
+        let mut collected_int_objects: Vec<*const dyn Trace> = Vec::new();
+        let mut trs = self.trs.write().unwrap();
+        for (gc_info, _) in &*trs {
+            collected_int_objects.push(*gc_info);
+        }
         let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
-        let mut vec = self.vec.lock().unwrap();
-        for (gc_info, _) in &*vec {
+        let mut objs = self.objs.lock().unwrap();
+        for (gc_info, _) in &*objs {
             collected_objects.push(*gc_info);
         }
+        for col in collected_int_objects {
+            self.remove_tracer(col);
+        }
+        dbg!("collected_objects: {}", collected_objects.len());
         let mut fin = self.fin.lock().unwrap();
         for col in collected_objects {
-            let del = (&*vec)[&col];
+            let del = (&*objs)[&col];
             let finilizer = (&*fin)[&col];
             (*finilizer).finalize();
-            dealloc((del.0).0, (del.0).1);
-            if let Some(t) = del.1 {
-                dealloc(t.0, t.1);
-            }
-            vec.remove(&col);
+            dealloc(del.0, del.1);
+            objs.remove(&col);
             fin.remove(&col);
         }
     }
