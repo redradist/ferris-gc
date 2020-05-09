@@ -122,9 +122,11 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
     }
 
     fn reset_root(&self) {
-        self.is_root.set(false);
-        unsafe {
-            (*self.ptr).reset_root();
+        if self.is_root.get() {
+            self.is_root.set(false);
+            unsafe {
+                (*self.ptr).reset_root();
+            }
         }
     }
 
@@ -270,9 +272,11 @@ impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
     }
 
     fn reset_root(&self) {
-        self.is_root.set(false);
-        unsafe {
-            (*self.ptr).borrow().reset_root();
+        if self.is_root.get() {
+            self.is_root.set(false);
+            unsafe {
+                (*self.ptr).borrow().reset_root();
+            }
         }
     }
 
