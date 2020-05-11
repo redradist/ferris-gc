@@ -1,4 +1,4 @@
-# ferris-gc
+# FerrisGC
 Complete reimplementation of https://github.com/Manishearth/rust-gc from scratch providing just compatible interface
 
 One of the main difference is a thread safe Garbage Collector implementation as well as Thread Local Garbage Collector 
