@@ -598,12 +598,12 @@ impl LocalGarbageCollector {
     }
 
     unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
-        let mut mem_to_trc = self.mem_to_trc.read().unwrap();
+        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
         let mut trs = self.trs.write().unwrap();
         let (tracer_thin_ptr, _) = unsafe { transmute::<_, (*const (), *const ())>(tracer) };
-        let del = trs[&mem_to_trc[&(tracer_thin_ptr as usize)]];
+        let tracee = &mem_to_trc.remove(&(tracer_thin_ptr as usize)).unwrap();
+        let del = trs.remove(&tracee).unwrap();
         dealloc(del.0, del.1);
-        trs.remove(&tracer);
     }
 
     pub unsafe fn collect(&self) {
