@@ -190,8 +190,7 @@ impl<T> Gc<T> where T: Sized + Trace {
         //     }
         // }
         unsafe {
-            let mut writer = (*GLOBAL_GC).write().unwrap();
-            writer.create_gc(t)
+            (*GLOBAL_GC).create_gc(t)
         }
     }
 }
@@ -199,8 +198,7 @@ impl<T> Gc<T> where T: Sized + Trace {
 impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
     fn clone(&self) -> Self {
         unsafe {
-            let mut writer = (*GLOBAL_GC).write().unwrap();
-            writer.clone_from_gc(self)
+            (*GLOBAL_GC).clone_from_gc(self)
         }
     }
 
@@ -216,8 +214,7 @@ impl<T> Drop for Gc<T> where T: Sized + Trace {
     fn drop(&mut self) {
         println!("Gc::drop");
         unsafe {
-            let mut writer = (*GLOBAL_GC).write().unwrap();
-            writer.remove_tracer(self.internal_ptr);
+            (*GLOBAL_GC).remove_tracer(self.internal_ptr);
         }
     }
 }
@@ -328,8 +325,7 @@ impl<T> Drop for GcCell<T> where T: Sized + Trace {
     fn drop(&mut self) {
         println!("Gc::drop");
         unsafe {
-            let mut writer = (*GLOBAL_GC).write().unwrap();
-            writer.remove_tracer(self.internal_ptr);
+            (*GLOBAL_GC).remove_tracer(self.internal_ptr);
         }
     }
 }
@@ -355,8 +351,7 @@ impl<T> GcCell<T> where T: 'static + Sized + Trace {
         //     }
         // }
         unsafe {
-            let mut writer = (*GLOBAL_GC).write().unwrap();
-            writer.create_gc_cell(t)
+            (*GLOBAL_GC).create_gc_cell(t)
         }
     }
 }
@@ -364,8 +359,7 @@ impl<T> GcCell<T> where T: 'static + Sized + Trace {
 impl<T> Clone for GcCell<T> where T: 'static + Sized + Trace {
     fn clone(&self) -> Self {
         let gc = unsafe {
-            let mut writer = (*GLOBAL_GC).write().unwrap();
-            writer.clone_from_gc_cell(self)
+            (*GLOBAL_GC).clone_from_gc_cell(self)
         };
         unsafe {
             (*gc.internal_ptr).ptr = (*self.internal_ptr).ptr;
@@ -438,7 +432,7 @@ impl GlobalGarbageCollector {
         }
     }
 
-    unsafe fn create_gc<T>(&mut self, t: T) -> Gc<T>
+    unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
         where T: Sized + Trace {
         let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<GcPtr<T>>();
         let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
@@ -457,7 +451,7 @@ impl GlobalGarbageCollector {
         gc
     }
 
-    unsafe fn clone_from_gc<T>(&mut self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
+    unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
         std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
         let mut trs = self.trs.write().unwrap();
@@ -469,7 +463,7 @@ impl GlobalGarbageCollector {
         gc
     }
 
-    unsafe fn create_gc_cell<T>(&mut self, t: T) -> GcCell<T> where T: Sized + Trace {
+    unsafe fn create_gc_cell<T>(&self, t: T) -> GcCell<T> where T: Sized + Trace {
         let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<RefCell<GcPtr<T>>>();
         let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcCellInternal<T>>();
         std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
@@ -487,7 +481,7 @@ impl GlobalGarbageCollector {
         gc
     }
 
-    unsafe fn clone_from_gc_cell<T>(&mut self, gc: &GcCell<T>) -> GcCell<T> where T: Sized + Trace {
+    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcCell<T>) -> GcCell<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcCellInternal<T>>();
         std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr));
         let mut trs = self.trs.write().unwrap();
@@ -499,7 +493,7 @@ impl GlobalGarbageCollector {
         gc
     }
 
-    unsafe fn alloc_mem<T>(&mut self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
+    unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
         let layout = Layout::new::<T>();
         let mem = alloc(layout);
         let gc_inter_ptr: *mut T = mem as *mut _;
@@ -659,23 +653,22 @@ use std::thread;
 use std::borrow::BorrowMut;
 use crate::gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
 lazy_static! {
-    static ref GLOBAL_GC: RwLock<GlobalGarbageCollector> = {
-        RwLock::new(GlobalGarbageCollector::new())
+    static ref GLOBAL_GC: GlobalGarbageCollector = {
+        GlobalGarbageCollector::new()
     };
-    // pub static ref GLOBAL_GC_STRATEGY: RwLock<GlobalStrategy> = {
-    //     let reader = (*GLOBAL_GC).get_mut().unwrap();
-    //     let gc = &*reader;
-    //     RwLock::new(GlobalStrategy::new(gc,
-    //         move |global_gc, _| {
-    //             let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
-    //             *basic_strategy_global_gc = Some(global_gc);
-    //             None
-    //         },
-    //         move |global_gc| {
-    //             let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
-    //             *basic_strategy_global_gc = None;
-    //         }))
-    // };
+    pub static ref GLOBAL_GC_STRATEGY: RwLock<GlobalStrategy> = {
+        let gc = &(*GLOBAL_GC);
+        RwLock::new(GlobalStrategy::new(gc,
+            move |global_gc, _| {
+                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
+                *basic_strategy_global_gc = Some(global_gc);
+                None
+            },
+            move |global_gc| {
+                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
+                *basic_strategy_global_gc = None;
+            }))
+    };
 }
 
 #[cfg(test)]
@@ -685,9 +678,8 @@ mod tests {
     #[test]
     fn one_object() {
         let one = Gc::new(1);
-        let mut reader = (*GLOBAL_GC).read().unwrap();
-        unsafe { reader.collect() };
-        assert_eq!(reader.trs.read().unwrap().len(), 1);
+        unsafe { (*GLOBAL_GC).collect() };
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 1);
     }
 
     #[test]
@@ -695,27 +687,24 @@ mod tests {
         {
             let one = Gc::new(1);
         }
-        let mut reader = (*GLOBAL_GC).read().unwrap();
-        unsafe { reader.collect() };
-        assert_eq!(reader.trs.read().unwrap().len(), 0);
+        unsafe { (*GLOBAL_GC).collect() };
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 0);
     }
 
     #[test]
     fn two_objects() {
         let mut one = Gc::new(1);
         one = Gc::new(2);
-        let mut reader = (*GLOBAL_GC).read().unwrap();
-        unsafe { reader.collect() };
-        assert_eq!(reader.trs.read().unwrap().len(), 2);
+        unsafe { (*GLOBAL_GC).collect() };
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 2);
     }
 
     #[test]
     fn gc_collect_one_from_two() {
         let mut one = Gc::new(1);
         one = Gc::new(2);
-        let mut reader = (*GLOBAL_GC).read().unwrap();
-        unsafe { reader.collect() };
-        assert_eq!(reader.trs.read().unwrap().len(), 0);
+        unsafe { (*GLOBAL_GC).collect() };
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 0);
     }
 
     #[test]
@@ -724,8 +713,7 @@ mod tests {
             let mut one = Gc::new(1);
             one = Gc::new(2);
         }
-        let mut reader = (*GLOBAL_GC).read().unwrap();
-        unsafe { reader.collect() };
-        assert_eq!(reader.trs.read().unwrap().len(), 0);
+        unsafe { (*GLOBAL_GC).collect() };
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 0);
     }
 }

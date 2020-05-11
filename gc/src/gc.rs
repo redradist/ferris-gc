@@ -521,7 +521,7 @@ impl LocalGarbageCollector {
         }
     }
 
-    unsafe fn create_gc<T>(&mut self, t: T) -> Gc<T>
+    unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
         where T: Sized + Trace {
         let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<GcPtr<T>>();
         let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
@@ -540,7 +540,7 @@ impl LocalGarbageCollector {
         gc
     }
 
-    unsafe fn clone_from_gc<T>(&mut self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
+    unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
         std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
         let mut trs = self.trs.write().unwrap();
@@ -552,7 +552,7 @@ impl LocalGarbageCollector {
         gc
     }
 
-    unsafe fn create_gc_cell<T>(&mut self, t: T) -> GcCell<T> where T: Sized + Trace {
+    unsafe fn create_gc_cell<T>(&self, t: T) -> GcCell<T> where T: Sized + Trace {
         let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<RefCell<GcPtr<T>>>();
         let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcCellInternal<T>>();
         std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
@@ -570,7 +570,7 @@ impl LocalGarbageCollector {
         gc
     }
 
-    unsafe fn clone_from_gc_cell<T>(&mut self, gc: &GcCell<T>) -> GcCell<T> where T: Sized + Trace {
+    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcCell<T>) -> GcCell<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcCellInternal<T>>();
         std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr));
         let mut trs = self.trs.write().unwrap();
@@ -582,7 +582,7 @@ impl LocalGarbageCollector {
         gc
     }
 
-    unsafe fn alloc_mem<T>(&mut self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
+    unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
         let layout = Layout::new::<T>();
         let mem = alloc(layout);
         let gc_inter_ptr: *mut T = mem as *mut _;
