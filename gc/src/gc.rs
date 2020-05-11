@@ -349,7 +349,7 @@ impl<T> Finalizer for Gc<T> where T: Sized + Trace {
 
 pub struct GcCellInternal<T> where T: 'static + Sized + Trace {
     is_root: Cell<bool>,
-    ptr: *mut GcCellInternal<T>,
+    ptr: *const RefCell<GcPtr<T>>,
 }
 
 impl<T> GcCellInternal<T> where T: 'static + Sized + Trace {
@@ -408,7 +408,7 @@ impl<T> Deref for GcCellInternal<T> where T: 'static + Sized + Trace {
 }
 
 pub struct GcCell<T> where T: 'static + Sized + Trace {
-    internal_ptr: *const RefCell<GcInternal<T>>,
+    internal_ptr: *mut GcCellInternal<T>,
 }
 
 impl<T> Drop for GcCell<T> where T: Sized + Trace {
