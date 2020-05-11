@@ -181,6 +181,7 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 
 impl<T> Gc<T> where T: Sized + Trace {
     pub fn new<'a>(t: T) -> Gc<T> {
+        basic_gc_strategy_start();
         // GLOBAL_GC_STRATEGY.with(|strategy| unsafe {
         //     if !strategy.borrow().is_active() {
         //         let strategy = unsafe { &mut *strategy.as_ptr() };
@@ -344,6 +345,7 @@ impl<T> Deref for GcCell<T> where T: 'static + Sized + Trace {
 
 impl<T> GcCell<T> where T: 'static + Sized + Trace {
     pub fn new<'a>(t: T) -> GcCell<T> {
+        basic_gc_strategy_start();
         // GLOBAL_GC_STRATEGY.with(|strategy| unsafe {
         //     if !strategy.borrow().is_active() {
         //         let strategy = unsafe { &mut *strategy.as_ptr() };
@@ -416,18 +418,18 @@ impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
 
 type GcObjMem = *mut u8;
 
-pub struct GarbageCollector {
+pub struct GlobalGarbageCollector {
     trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalizer>>,
 }
 
-unsafe impl Sync for GarbageCollector {}
-unsafe impl Send for GarbageCollector {}
+unsafe impl Sync for GlobalGarbageCollector {}
+unsafe impl Send for GlobalGarbageCollector {}
 
-impl GarbageCollector {
-    fn new() -> GarbageCollector {
-        GarbageCollector {
+impl GlobalGarbageCollector {
+    fn new() -> GlobalGarbageCollector {
+        GlobalGarbageCollector {
             trs: RwLock::new(HashMap::new()),
             objs: Mutex::new(HashMap::new()),
             fin: Mutex::new(HashMap::new()),
@@ -512,7 +514,6 @@ impl GarbageCollector {
 
     pub unsafe fn collect(&self) {
         dbg!("Start collect ...");
-        let mut collected_int_objects: Vec<*const dyn Trace> = Vec::new();
         let mut trs = self.trs.read().unwrap();
         for (gc_info, _) in &*trs {
             let tracer = &(**gc_info);
@@ -572,25 +573,25 @@ impl GarbageCollector {
     }
 }
 
-impl Drop for GarbageCollector {
+impl Drop for GlobalGarbageCollector {
     fn drop(&mut self) {
-        dbg!("GarbageCollector::drop");
+        dbg!("GlobalGarbageCollector::drop");
     }
 }
 
-pub type LocalStrategyFn = Box<dyn FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
+pub type GlobalStrategyFn = Box<dyn FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
 
-pub struct LocalStrategy {
-    gc: Cell<&'static GarbageCollector>,
+pub struct GlobalStrategy {
+    gc: Cell<&'static GlobalGarbageCollector>,
     is_active: AtomicBool,
-    func: RefCell<LocalStrategyFn>,
+    func: RefCell<GlobalStrategyFn>,
     join_handle: RefCell<Option<JoinHandle<()>>>,
 }
 
-impl LocalStrategy {
-    fn new<F>(gc: &'static mut GarbageCollector, f: F) -> LocalStrategy
-        where F: 'static + FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
-        LocalStrategy {
+impl GlobalStrategy {
+    fn new<F>(gc: &'static mut GlobalGarbageCollector, f: F) -> GlobalStrategy
+        where F: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
+        GlobalStrategy {
             gc: Cell::new(gc),
             is_active: AtomicBool::new(false),
             func: RefCell::new(Box::new(f)),
@@ -598,12 +599,12 @@ impl LocalStrategy {
         }
     }
 
-    pub fn prototype<F>(&self, f: F) -> LocalStrategy
-        where F: 'static + FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
+    pub fn prototype<F>(&self, f: F) -> GlobalStrategy
+        where F: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
         if self.is_active() {
             self.stop();
         }
-        LocalStrategy {
+        GlobalStrategy {
             gc: Cell::new(self.gc.get()),
             is_active: AtomicBool::new(false),
             func: RefCell::new(Box::new(f)),
@@ -616,38 +617,25 @@ impl LocalStrategy {
     }
 
     pub fn start(&'static self) {
-        dbg!("LocalStrategy::start");
+        dbg!("GlobalStrategy::start");
         self.is_active.store(true, Ordering::Release);
         self.join_handle.replace((&mut *(self.func.borrow_mut()))(self.gc.get(), &self.is_active));
     }
 
     pub fn stop(&self) {
-        dbg!("LocalStrategy::stop");
+        dbg!("GlobalStrategy::stop");
         self.is_active.store(false, Ordering::Release);
         if let Some(join_handle) = self.join_handle.borrow_mut().take()  {
-            join_handle.join().expect("LocalStrategy::stop, LocalStrategy Thread being joined has panicked !!");
+            join_handle.join().expect("GlobalStrategy::stop, GlobalStrategy Thread being joined has panicked !!");
         }
     }
 }
 
-impl Drop for LocalStrategy {
+impl Drop for GlobalStrategy {
     fn drop(&mut self) {
-        dbg!("LocalStrategy::drop");
+        dbg!("GlobalStrategy::drop");
         self.is_active.store(false, Ordering::Release);
     }
-}
-
-fn basic_local_strategy(gc: &'static GarbageCollector, is_work: &'static AtomicBool) -> Option<JoinHandle<()>> {
-    Some(thread::spawn(move || {
-        while is_work.load(Ordering::Acquire) {
-            let ten_secs = time::Duration::from_secs(10);
-            thread::sleep(ten_secs);
-            unsafe {
-                gc.collect();
-            }
-        }
-        dbg!("Stop thread::spawn");
-    }))
 }
 
 use std::ops::{Deref, DerefMut};
@@ -656,14 +644,15 @@ use std::sync::{RwLock, Mutex};
 use core::time;
 use std::thread;
 use std::borrow::BorrowMut;
+use crate::gc_strategy::basic_gc_strategy_start;
 lazy_static! {
-    pub static ref GLOBAL_GC: RwLock<GarbageCollector> = {
-        RwLock::new(GarbageCollector::new())
+    pub static ref GLOBAL_GC: RwLock<GlobalGarbageCollector> = {
+        RwLock::new(GlobalGarbageCollector::new())
     };
-    // pub static ref GLOBAL_GC_STRATEGY: RefCell<LocalStrategy> = {
+    // pub static ref GLOBAL_GC_STRATEGY: RefCell<GlobalStrategy> = {
     //     GLOBAL_GC.with(move |gc| {
     //         let gc = unsafe { &mut *gc.as_ptr() };
-    //         RefCell::new(LocalStrategy::new(gc, move |obj, sda| {
+    //         RefCell::new(GlobalStrategy::new(gc, move |obj, sda| {
     //             basic_local_strategy(obj, sda)
     //         }))
     //     })
@@ -672,15 +661,14 @@ lazy_static! {
 
 #[cfg(test)]
 mod tests {
-    use crate::gc::sync::Gc;
+    use crate::gc::sync::{Gc, GLOBAL_GC};
 
     #[test]
     fn one_object() {
         let one = Gc::new(1);
-        GLOBAL_GC.with(move |gc| unsafe {
-            gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 1);
-        });
+        let mut reader = (*GLOBAL_GC).read().unwrap();
+        unsafe { reader.collect() };
+        assert_eq!(reader.trs.read().unwrap().len(), 1);
     }
 
     #[test]
@@ -688,29 +676,27 @@ mod tests {
         {
             let one = Gc::new(1);
         }
-        GLOBAL_GC.with(move |gc| unsafe {
-            gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 0);
-        });
+        let mut reader = (*GLOBAL_GC).read().unwrap();
+        unsafe { reader.collect() };
+        assert_eq!(reader.trs.read().unwrap().len(), 0);
     }
 
     #[test]
     fn two_objects() {
         let mut one = Gc::new(1);
         one = Gc::new(2);
-        GLOBAL_GC.with(move |gc| {
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 2);
-        });
+        let mut reader = (*GLOBAL_GC).read().unwrap();
+        unsafe { reader.collect() };
+        assert_eq!(reader.trs.read().unwrap().len(), 2);
     }
 
     #[test]
     fn gc_collect_one_from_two() {
         let mut one = Gc::new(1);
         one = Gc::new(2);
-        GLOBAL_GC.with(move |gc| unsafe {
-            gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 0);
-        });
+        let mut reader = (*GLOBAL_GC).read().unwrap();
+        unsafe { reader.collect() };
+        assert_eq!(reader.trs.read().unwrap().len(), 0);
     }
 
     #[test]
@@ -719,9 +705,8 @@ mod tests {
             let mut one = Gc::new(1);
             one = Gc::new(2);
         }
-        GLOBAL_GC.with(move |gc| unsafe {
-            gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 0);
-        });
+        let mut reader = (*GLOBAL_GC).read().unwrap();
+        unsafe { reader.collect() };
+        assert_eq!(reader.trs.read().unwrap().len(), 0);
     }
 }

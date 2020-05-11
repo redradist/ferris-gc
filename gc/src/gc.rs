@@ -276,6 +276,7 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 
 impl<T> Gc<T> where T: Sized + Trace {
     pub fn new<'a>(t: T) -> Gc<T> {
+        basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 let strategy = unsafe { &mut *strategy.as_ptr() };
@@ -431,6 +432,7 @@ impl<T> Deref for GcCell<T> where T: 'static + Sized + Trace {
 
 impl<T> GcCell<T> where T: 'static + Sized + Trace {
     pub fn new<'a>(t: T) -> GcCell<T> {
+        basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| unsafe {
             if !strategy.borrow().is_active() {
                 let strategy = unsafe { &mut *strategy.as_ptr() };
@@ -501,18 +503,18 @@ impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
 
 type GcObjMem = *mut u8;
 
-pub struct GarbageCollector {
+pub struct LocalGarbageCollector {
     trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalizer>>,
 }
 
-unsafe impl Sync for GarbageCollector {}
-unsafe impl Send for GarbageCollector {}
+unsafe impl Sync for LocalGarbageCollector {}
+unsafe impl Send for LocalGarbageCollector {}
 
-impl GarbageCollector {
-    fn new() -> GarbageCollector {
-        GarbageCollector {
+impl LocalGarbageCollector {
+    fn new() -> LocalGarbageCollector {
+        LocalGarbageCollector {
             trs: RwLock::new(HashMap::new()),
             objs: Mutex::new(HashMap::new()),
             fin: Mutex::new(HashMap::new()),
@@ -657,41 +659,53 @@ impl GarbageCollector {
     }
 }
 
-impl Drop for GarbageCollector {
+impl Drop for LocalGarbageCollector {
     fn drop(&mut self) {
         dbg!("GarbageCollector::drop");
     }
 }
 
-pub type LocalStrategyFn = Box<dyn FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
+impl PartialEq for &LocalGarbageCollector {
+    fn eq(&self, other: &Self) -> bool {
+        *self == *other
+    }
+}
+
+pub type StartLocalStrategyFn = Box<dyn FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
+pub type StopLocalStrategyFn = Box<dyn FnMut(&'static LocalGarbageCollector)>;
 
 pub struct LocalStrategy {
-    gc: Cell<&'static GarbageCollector>,
+    gc: Cell<&'static LocalGarbageCollector>,
     is_active: AtomicBool,
-    func: RefCell<LocalStrategyFn>,
+    start_func: RefCell<StartLocalStrategyFn>,
+    stop_func: RefCell<StopLocalStrategyFn>,
     join_handle: RefCell<Option<JoinHandle<()>>>,
 }
 
 impl LocalStrategy {
-    fn new<F>(gc: &'static mut GarbageCollector, f: F) -> LocalStrategy
-        where F: 'static + FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
+    fn new<StartFn, StopFn>(gc: &'static mut LocalGarbageCollector, start_fn: StartFn, stop_fn: StopFn) -> LocalStrategy
+        where StartFn: 'static + FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
+               StopFn: 'static + FnMut(&'static LocalGarbageCollector) {
         LocalStrategy {
             gc: Cell::new(gc),
             is_active: AtomicBool::new(false),
-            func: RefCell::new(Box::new(f)),
+            start_func: RefCell::new(Box::new(start_fn)),
+            stop_func: RefCell::new(Box::new(stop_fn)),
             join_handle: RefCell::new(None)
         }
     }
 
-    pub fn prototype<F>(&self, f: F) -> LocalStrategy
-        where F: 'static + FnMut(&'static GarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
+    pub fn prototype<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn) -> LocalStrategy
+        where StartFn: 'static + FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
+               StopFn: 'static + FnMut(&'static LocalGarbageCollector) {
         if self.is_active() {
             self.stop();
         }
         LocalStrategy {
             gc: Cell::new(self.gc.get()),
             is_active: AtomicBool::new(false),
-            func: RefCell::new(Box::new(f)),
+            start_func: RefCell::new(Box::new(start_fn)),
+            stop_func: RefCell::new(Box::new(stop_fn)),
             join_handle: RefCell::new(None)
         }
     }
@@ -703,7 +717,7 @@ impl LocalStrategy {
     pub fn start(&'static self) {
         dbg!("LocalStrategy::start");
         self.is_active.store(true, Ordering::Release);
-        self.join_handle.replace((&mut *(self.func.borrow_mut()))(self.gc.get(), &self.is_active));
+        self.join_handle.replace((&mut *(self.start_func.borrow_mut()))(self.gc.get(), &self.is_active));
     }
 
     pub fn stop(&self) {
@@ -712,6 +726,7 @@ impl LocalStrategy {
         if let Some(join_handle) = self.join_handle.borrow_mut().take()  {
             join_handle.join().expect("LocalStrategy::stop, LocalStrategy Thread being joined has panicked !!");
         }
+        (&mut *(self.stop_func.borrow_mut()))(self.gc.get());
     }
 }
 
@@ -722,26 +737,22 @@ impl Drop for LocalStrategy {
     }
 }
 
-fn basic_local_strategy(gc: &'static GarbageCollector, is_work: &'static AtomicBool) -> Option<JoinHandle<()>> {
-    Some(thread::spawn(move || {
-        while is_work.load(Ordering::Acquire) {
-            let ten_secs = time::Duration::from_secs(10);
-            thread::sleep(ten_secs);
-            unsafe {
-                gc.collect();
-            }
-        }
-        dbg!("Stop thread::spawn");
-    }))
-}
-
+use crate::gc_strategy::{BASIC_STRATEGY_LOCAL_GCS, basic_gc_strategy_start};
 thread_local! {
-    static LOCAL_GC: RefCell<GarbageCollector> = RefCell::new(GarbageCollector::new());
+    static LOCAL_GC: RefCell<LocalGarbageCollector> = RefCell::new(LocalGarbageCollector::new());
     pub static LOCAL_GC_STRATEGY: RefCell<LocalStrategy> = {
         LOCAL_GC.with(move |gc| {
             let gc = unsafe { &mut *gc.as_ptr() };
-            RefCell::new(LocalStrategy::new(gc, move |obj, sda| {
-                basic_local_strategy(obj, sda)
+            RefCell::new(LocalStrategy::new(gc,
+            move |local_gc, _| {
+                let mut basic_strategy_local_gcs = BASIC_STRATEGY_LOCAL_GCS.write().unwrap();
+                basic_strategy_local_gcs.push(local_gc);
+                None
+            },
+            move |local_gc| {
+                let mut basic_strategy_local_gcs = BASIC_STRATEGY_LOCAL_GCS.write().unwrap();
+                let index = basic_strategy_local_gcs.iter().position(|&r| r == local_gc).unwrap();
+                basic_strategy_local_gcs.remove(index);
             }))
         })
     };
@@ -756,7 +767,7 @@ mod tests {
         let one = Gc::new(1);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 1);
+            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 1);
         });
     }
 
@@ -767,7 +778,7 @@ mod tests {
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 0);
+            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
         });
     }
 
@@ -776,7 +787,7 @@ mod tests {
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| {
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 2);
+            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 2);
         });
     }
 
@@ -786,7 +797,7 @@ mod tests {
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 0);
+            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
         });
     }
 
@@ -798,7 +809,7 @@ mod tests {
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().vec.borrow().len(), 0);
+            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
         });
     }
 }
