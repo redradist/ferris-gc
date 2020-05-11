@@ -587,9 +587,9 @@ pub type StopGlobalStrategyFn = Box<dyn FnMut(&'static GlobalGarbageCollector)>;
 pub struct GlobalStrategy {
     gc: Cell<&'static GlobalGarbageCollector>,
     is_active: AtomicBool,
-    start_func: RefCell<StartGlobalStrategyFn>,
-    stop_func: RefCell<StopGlobalStrategyFn>,
-    join_handle: RefCell<Option<JoinHandle<()>>>,
+    start_func: Mutex<StartGlobalStrategyFn>,
+    stop_func: Mutex<StopGlobalStrategyFn>,
+    join_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 unsafe impl Sync for GlobalStrategy {}
@@ -602,25 +602,22 @@ impl GlobalStrategy {
         GlobalStrategy {
             gc: Cell::new(gc),
             is_active: AtomicBool::new(false),
-            start_func: RefCell::new(Box::new(start_fn)),
-            stop_func: RefCell::new(Box::new(stop_fn)),
-            join_handle: RefCell::new(None)
+            start_func: Mutex::new(Box::new(start_fn)),
+            stop_func: Mutex::new(Box::new(stop_fn)),
+            join_handle: Mutex::new(None)
         }
     }
 
-    pub fn prototype<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn) -> GlobalStrategy
+    pub fn change_strategy<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn)
         where StartFn: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
               StopFn: 'static + FnMut(&'static GlobalGarbageCollector) {
+        let mut start_func = self.start_func.lock().unwrap();
+        let mut stop_func = self.stop_func.lock().unwrap();
         if self.is_active() {
             self.stop();
         }
-        GlobalStrategy {
-            gc: Cell::new(self.gc.get()),
-            is_active: AtomicBool::new(false),
-            start_func: RefCell::new(Box::new(start_fn)),
-            stop_func: RefCell::new(Box::new(stop_fn)),
-            join_handle: RefCell::new(None)
-        }
+        *start_func = Box::new(start_fn);
+        *stop_func = Box::new(stop_fn);
     }
 
     pub fn is_active(&self) -> bool {
@@ -630,16 +627,20 @@ impl GlobalStrategy {
     pub fn start(&'static self) {
         dbg!("GlobalStrategy::start");
         self.is_active.store(true, Ordering::Release);
-        self.join_handle.replace((&mut *(self.start_func.borrow_mut()))(self.gc.get(), &self.is_active));
+        let mut start_func = self.start_func.lock().unwrap();
+        let mut join_handle = self.join_handle.lock().unwrap();
+        *join_handle = (&mut *(start_func))(self.gc.get(), &self.is_active);
     }
 
     pub fn stop(&self) {
         dbg!("GlobalStrategy::stop");
         self.is_active.store(false, Ordering::Release);
-        if let Some(join_handle) = self.join_handle.borrow_mut().take()  {
+        let mut join_handle = self.join_handle.lock().unwrap();
+        if let Some(join_handle) = join_handle.take()  {
             join_handle.join().expect("GlobalStrategy::stop, GlobalStrategy Thread being joined has panicked !!");
         }
-        (&mut *(self.stop_func.borrow_mut()))(self.gc.get());
+        let mut stop_func = self.stop_func.lock().unwrap();
+        (&mut *(stop_func))(self.gc.get());
     }
 }
 

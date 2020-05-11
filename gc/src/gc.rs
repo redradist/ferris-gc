@@ -695,19 +695,14 @@ impl LocalStrategy {
         }
     }
 
-    pub fn prototype<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn) -> LocalStrategy
+    pub fn change_strategy<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn)
         where StartFn: 'static + FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
                StopFn: 'static + FnMut(&'static LocalGarbageCollector) {
         if self.is_active() {
             self.stop();
         }
-        LocalStrategy {
-            gc: Cell::new(self.gc.get()),
-            is_active: AtomicBool::new(false),
-            start_func: RefCell::new(Box::new(start_fn)),
-            stop_func: RefCell::new(Box::new(stop_fn)),
-            join_handle: RefCell::new(None)
-        }
+        self.start_func.replace(Box::new(start_fn));
+        self.stop_func.replace(Box::new(stop_fn));
     }
 
     pub fn is_active(&self) -> bool {
