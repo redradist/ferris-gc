@@ -5,7 +5,7 @@ authors = ["redradist, redradist@gmail.com"]
 description = "Flexible implementation of garbage collector for Rust"
 repository = "https://github.com/redradist/ferris-gc"
 readme = "../README.md"
-license = "Apache-2.0, MIT"
+license = "Apache-2.0/MIT"
 keywords = ["garbage", "memory"]
 edition = "2018"
 
