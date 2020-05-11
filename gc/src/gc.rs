@@ -683,7 +683,7 @@ pub struct LocalStrategy {
 }
 
 impl LocalStrategy {
-    fn new<StartFn, StopFn>(gc: &'static mut LocalGarbageCollector, start_fn: StartFn, stop_fn: StopFn) -> LocalStrategy
+    fn new<StartFn, StopFn>(gc: &'static LocalGarbageCollector, start_fn: StartFn, stop_fn: StopFn) -> LocalStrategy
         where StartFn: 'static + FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
                StopFn: 'static + FnMut(&'static LocalGarbageCollector) {
         LocalStrategy {

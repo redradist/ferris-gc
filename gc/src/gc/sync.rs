@@ -182,12 +182,13 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 impl<T> Gc<T> where T: Sized + Trace {
     pub fn new<'a>(t: T) -> Gc<T> {
         basic_gc_strategy_start();
-        // GLOBAL_GC_STRATEGY.with(|strategy| unsafe {
-        //     if !strategy.borrow().is_active() {
-        //         let strategy = unsafe { &mut *strategy.as_ptr() };
-        //         strategy.start();
+        // unsafe {
+        //     let mut writer = (*GLOBAL_GC_STRATEGY).write().unwrap();
+        //     if !writer.is_active() {
+        //         let strategy = unsafe { &mut *writer.as_ptr() };
+        //         writer.start();
         //     }
-        // });
+        // }
         unsafe {
             let mut writer = (*GLOBAL_GC).write().unwrap();
             writer.create_gc(t)
@@ -346,12 +347,13 @@ impl<T> Deref for GcCell<T> where T: 'static + Sized + Trace {
 impl<T> GcCell<T> where T: 'static + Sized + Trace {
     pub fn new<'a>(t: T) -> GcCell<T> {
         basic_gc_strategy_start();
-        // GLOBAL_GC_STRATEGY.with(|strategy| unsafe {
-        //     if !strategy.borrow().is_active() {
-        //         let strategy = unsafe { &mut *strategy.as_ptr() };
-        //         strategy.start();
+        // unsafe {
+        //     let mut writer = (*GLOBAL_GC_STRATEGY).write().unwrap();
+        //     if !writer.is_active() {
+        //         let strategy = unsafe { &mut *writer.as_ptr() };
+        //         writer.start();
         //     }
-        // });
+        // }
         unsafe {
             let mut writer = (*GLOBAL_GC).write().unwrap();
             writer.create_gc_cell(t)
@@ -579,35 +581,44 @@ impl Drop for GlobalGarbageCollector {
     }
 }
 
-pub type GlobalStrategyFn = Box<dyn FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
+pub type StartGlobalStrategyFn = Box<dyn FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
+pub type StopGlobalStrategyFn = Box<dyn FnMut(&'static GlobalGarbageCollector)>;
 
 pub struct GlobalStrategy {
     gc: Cell<&'static GlobalGarbageCollector>,
     is_active: AtomicBool,
-    func: RefCell<GlobalStrategyFn>,
+    start_func: RefCell<StartGlobalStrategyFn>,
+    stop_func: RefCell<StopGlobalStrategyFn>,
     join_handle: RefCell<Option<JoinHandle<()>>>,
 }
 
+unsafe impl Sync for GlobalStrategy {}
+unsafe impl Send for GlobalStrategy {}
+
 impl GlobalStrategy {
-    fn new<F>(gc: &'static mut GlobalGarbageCollector, f: F) -> GlobalStrategy
-        where F: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
+    fn new<StartFn, StopFn>(gc: &'static GlobalGarbageCollector, start_fn: StartFn, stop_fn: StopFn) -> GlobalStrategy
+        where StartFn: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
+              StopFn: 'static + FnMut(&'static GlobalGarbageCollector) {
         GlobalStrategy {
             gc: Cell::new(gc),
             is_active: AtomicBool::new(false),
-            func: RefCell::new(Box::new(f)),
+            start_func: RefCell::new(Box::new(start_fn)),
+            stop_func: RefCell::new(Box::new(stop_fn)),
             join_handle: RefCell::new(None)
         }
     }
 
-    pub fn prototype<F>(&self, f: F) -> GlobalStrategy
-        where F: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> {
+    pub fn prototype<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn) -> GlobalStrategy
+        where StartFn: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
+              StopFn: 'static + FnMut(&'static GlobalGarbageCollector) {
         if self.is_active() {
             self.stop();
         }
         GlobalStrategy {
             gc: Cell::new(self.gc.get()),
             is_active: AtomicBool::new(false),
-            func: RefCell::new(Box::new(f)),
+            start_func: RefCell::new(Box::new(start_fn)),
+            stop_func: RefCell::new(Box::new(stop_fn)),
             join_handle: RefCell::new(None)
         }
     }
@@ -619,7 +630,7 @@ impl GlobalStrategy {
     pub fn start(&'static self) {
         dbg!("GlobalStrategy::start");
         self.is_active.store(true, Ordering::Release);
-        self.join_handle.replace((&mut *(self.func.borrow_mut()))(self.gc.get(), &self.is_active));
+        self.join_handle.replace((&mut *(self.start_func.borrow_mut()))(self.gc.get(), &self.is_active));
     }
 
     pub fn stop(&self) {
@@ -628,6 +639,7 @@ impl GlobalStrategy {
         if let Some(join_handle) = self.join_handle.borrow_mut().take()  {
             join_handle.join().expect("GlobalStrategy::stop, GlobalStrategy Thread being joined has panicked !!");
         }
+        (&mut *(self.stop_func.borrow_mut()))(self.gc.get());
     }
 }
 
@@ -644,18 +656,24 @@ use std::sync::{RwLock, Mutex};
 use core::time;
 use std::thread;
 use std::borrow::BorrowMut;
-use crate::gc_strategy::basic_gc_strategy_start;
+use crate::gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
 lazy_static! {
-    pub static ref GLOBAL_GC: RwLock<GlobalGarbageCollector> = {
+    static ref GLOBAL_GC: RwLock<GlobalGarbageCollector> = {
         RwLock::new(GlobalGarbageCollector::new())
     };
-    // pub static ref GLOBAL_GC_STRATEGY: RefCell<GlobalStrategy> = {
-    //     GLOBAL_GC.with(move |gc| {
-    //         let gc = unsafe { &mut *gc.as_ptr() };
-    //         RefCell::new(GlobalStrategy::new(gc, move |obj, sda| {
-    //             basic_local_strategy(obj, sda)
+    // pub static ref GLOBAL_GC_STRATEGY: RwLock<GlobalStrategy> = {
+    //     let reader = (*GLOBAL_GC).get_mut().unwrap();
+    //     let gc = &*reader;
+    //     RwLock::new(GlobalStrategy::new(gc,
+    //         move |global_gc, _| {
+    //             let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
+    //             *basic_strategy_global_gc = Some(global_gc);
+    //             None
+    //         },
+    //         move |global_gc| {
+    //             let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
+    //             *basic_strategy_global_gc = None;
     //         }))
-    //     })
     // };
 }
 
