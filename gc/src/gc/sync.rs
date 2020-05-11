@@ -672,6 +672,8 @@ lazy_static! {
 
 #[cfg(test)]
 mod tests {
+    use crate::gc::sync::Gc;
+
     #[test]
     fn one_object() {
         let one = Gc::new(1);
