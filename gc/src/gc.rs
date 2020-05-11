@@ -1,7 +1,7 @@
 pub mod sync;
 
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell, Ref};
+use std::collections::{VecDeque, LinkedList, BTreeMap, HashMap, HashSet, BTreeSet, BinaryHeap};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +59,48 @@ primitive_types!(
     f32, f64,
     bool
 );
+
+macro_rules! std_types {
+    ($($std:ident<T>),*) => {
+        $(
+            impl<T> Trace for $std<T> where T: 'static + Sized + Trace {
+                fn is_root(&self) -> bool {
+                    unreachable!("is_root should never be called on primitive type !!");
+                }
+                fn reset_root(&self) {
+                    for child in self {
+                        child.reset_root();
+                    }
+                }
+                fn trace(&self) {
+                    for child in self {
+                        child.trace();
+                    }
+                }
+                fn reset(&self) {
+                    for child in self {
+                        child.reset();
+                    }
+                }
+                fn is_traceable(&self) -> bool {
+                    unreachable!("is_traceable should never be called on primitive type !!");
+                }
+            }
+
+            impl<T> Finalizer for $std<T> where T: 'static + Sized + Trace {
+                fn finalize(&self) {
+                }
+            }
+        )*
+    };
+}
+
+std_types!(
+    Vec<T>, VecDeque<T>, LinkedList<T>,
+    HashSet<T>, BTreeSet<T>, BinaryHeap<T>
+);
+
+// , HashMap<T>, BTreeMap<T>
 
 struct GcInfo {
     has_root: Cell<bool>,
@@ -307,7 +349,7 @@ impl<T> Finalizer for Gc<T> where T: Sized + Trace {
 
 pub struct GcCellInternal<T> where T: 'static + Sized + Trace {
     is_root: Cell<bool>,
-    ptr: *const RefCell<GcPtr<T>>,
+    ptr: *mut GcCellInternal<T>,
 }
 
 impl<T> GcCellInternal<T> where T: 'static + Sized + Trace {
@@ -366,7 +408,7 @@ impl<T> Deref for GcCellInternal<T> where T: 'static + Sized + Trace {
 }
 
 pub struct GcCell<T> where T: 'static + Sized + Trace {
-    internal_ptr: *mut GcCellInternal<T>,
+    internal_ptr: *const RefCell<GcInternal<T>>,
 }
 
 impl<T> Drop for GcCell<T> where T: Sized + Trace {
