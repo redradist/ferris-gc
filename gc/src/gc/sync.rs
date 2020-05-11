@@ -166,6 +166,9 @@ pub struct Gc<T> where T: 'static + Sized + Trace {
     internal_ptr: *mut GcInternal<T>,
 }
 
+unsafe impl<T> Sync for Gc<T> where T: 'static + Sized + Trace {}
+unsafe impl<T> Send for Gc<T> where T: 'static + Sized + Trace {}
+
 impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
     type Target = GcInternal<T>;
 
@@ -253,14 +256,14 @@ impl<T> Finalizer for Gc<T> where T: Sized + Trace {
 }
 
 pub struct GcCellInternal<T> where T: 'static + Sized + Trace {
-    is_root: Cell<bool>,
+    is_root: AtomicBool,
     ptr: *const RefCell<GcPtr<T>>,
 }
 
 impl<T> GcCellInternal<T> where T: 'static + Sized + Trace {
     fn new(ptr: *const RefCell<GcPtr<T>>) -> GcCellInternal<T> {
         GcCellInternal {
-            is_root: Cell::new(true),
+            is_root: AtomicBool::new(true),
             ptr: ptr,
         }
     }
@@ -268,12 +271,12 @@ impl<T> GcCellInternal<T> where T: 'static + Sized + Trace {
 
 impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
     fn is_root(&self) -> bool {
-        self.is_root.get()
+        self.is_root.load(Ordering::Acquire)
     }
 
     fn reset_root(&self) {
-        if self.is_root.get() {
-            self.is_root.set(false);
+        if self.is_root.load(Ordering::Acquire) {
+            self.is_root.store(false, Ordering::Release);
             unsafe {
                 (*self.ptr).borrow().reset_root();
             }
@@ -315,6 +318,9 @@ impl<T> Deref for GcCellInternal<T> where T: 'static + Sized + Trace {
 pub struct GcCell<T> where T: 'static + Sized + Trace {
     internal_ptr: *mut GcCellInternal<T>,
 }
+
+unsafe impl<T> Sync for GcCell<T> where T: 'static + Sized + Trace {}
+unsafe impl<T> Send for GcCell<T> where T: 'static + Sized + Trace {}
 
 impl<T> Drop for GcCell<T> where T: Sized + Trace {
     fn drop(&mut self) {
@@ -359,13 +365,13 @@ impl<T> Clone for GcCell<T> where T: 'static + Sized + Trace {
         };
         unsafe {
             (*gc.internal_ptr).ptr = (*self.internal_ptr).ptr;
-            (*gc.internal_ptr).is_root.set(true);
+            (*gc.internal_ptr).is_root.store(true, Ordering::Release);
         }
         gc
     }
 
     fn clone_from(&mut self, source: &Self) {
-        self.is_root.set(false);
+        self.is_root.store(false, Ordering::Release);
         unsafe {
             (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
         }
@@ -380,7 +386,7 @@ impl<T> Trace for GcCell<T> where T: Sized + Trace {
     }
 
     fn reset_root(&self) {
-        self.is_root.set(false);
+        self.is_root.store(false, Ordering::Release);
         unsafe {
             (*self.ptr).borrow().reset_root();
         }
