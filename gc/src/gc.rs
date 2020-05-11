@@ -3,6 +3,13 @@ pub mod sync;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::alloc::{alloc, dealloc, Layout};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::sync::{RwLock, Mutex};
+use core::time;
+use std::thread;
+use std::borrow::BorrowMut;
 
 pub trait Trace : Finalizer {
     fn is_root(&self) -> bool;
@@ -686,13 +693,6 @@ fn basic_local_strategy(gc: &'static GarbageCollector, is_work: &'static AtomicB
     }))
 }
 
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
-use std::sync::{RwLock, Mutex};
-use core::time;
-use std::thread;
-use std::borrow::BorrowMut;
 thread_local! {
     static LOCAL_GC: RefCell<GarbageCollector> = RefCell::new(GarbageCollector::new());
     pub static LOCAL_GC_STRATEGY: RefCell<LocalStrategy> = {

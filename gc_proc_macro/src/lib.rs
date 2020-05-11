@@ -24,7 +24,7 @@ pub fn derive_trace(item: TokenStream) -> TokenStream {
                     quote! {
                         impl Trace for #ident {
                             fn is_root(&self) -> bool {
-                                unreachable!();
+                                unreachable!("is_root should never be called on user-defined type !!");
                             }
 
                             fn reset_root(&self) {
@@ -40,7 +40,7 @@ pub fn derive_trace(item: TokenStream) -> TokenStream {
                             }
 
                             fn is_traceable(&self) -> bool {
-                                unreachable!();
+                                unreachable!("is_traceable should never be called on user-defined type !!");
                             }
                         }
                     }
@@ -58,7 +58,7 @@ pub fn derive_trace(item: TokenStream) -> TokenStream {
                     quote! {
                         impl Trace for #ident {
                             fn is_root(&self) -> bool {
-                                unreachable!();
+                                unreachable!("is_root should never be called on user-defined type !!");
                             }
 
                             fn reset_root(&self) {
@@ -74,19 +74,13 @@ pub fn derive_trace(item: TokenStream) -> TokenStream {
                             }
 
                             fn is_traceable(&self) -> bool {
-                                unreachable!();
+                                unreachable!("is_traceable should never be called on user-defined type !!");
                             }
                         }
                     }
                 },
                 Fields::Unit => {
-                    panic!("Enum type is not supported !!");
-                    // quote! {
-                    //     #(#attrs)*
-                    //     #vis struct #ident {
-                    //         #(#data_struct.fields)*
-                    //     }
-                    // }
+                    panic!("Unit type is not supported !!");
                 },
             }
         },
