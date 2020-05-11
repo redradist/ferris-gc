@@ -182,13 +182,11 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 impl<T> Gc<T> where T: Sized + Trace {
     pub fn new<'a>(t: T) -> Gc<T> {
         basic_gc_strategy_start();
-        // unsafe {
-        //     let mut writer = (*GLOBAL_GC_STRATEGY).write().unwrap();
-        //     if !writer.is_active() {
-        //         let strategy = unsafe { &mut *writer.as_ptr() };
-        //         writer.start();
-        //     }
-        // }
+        let mut global_strategy = (*GLOBAL_GC_STRATEGY).write().unwrap();
+        if !global_strategy.is_active() {
+            // TODO: Need somehow to get &'static to a strategy
+            // global_strategy.start();
+        }
         unsafe {
             (*GLOBAL_GC).create_gc(t)
         }
@@ -343,13 +341,11 @@ impl<T> Deref for GcCell<T> where T: 'static + Sized + Trace {
 impl<T> GcCell<T> where T: 'static + Sized + Trace {
     pub fn new<'a>(t: T) -> GcCell<T> {
         basic_gc_strategy_start();
-        // unsafe {
-        //     let mut writer = (*GLOBAL_GC_STRATEGY).write().unwrap();
-        //     if !writer.is_active() {
-        //         let strategy = unsafe { &mut *writer.as_ptr() };
-        //         writer.start();
-        //     }
-        // }
+        let mut global_strategy = (*GLOBAL_GC_STRATEGY).write().unwrap();
+        if !global_strategy.is_active() {
+            // TODO: Need somehow to get &'static to a strategy
+            // global_strategy.start();
+        }
         unsafe {
             (*GLOBAL_GC).create_gc_cell(t)
         }
