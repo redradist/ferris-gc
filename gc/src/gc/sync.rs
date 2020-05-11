@@ -103,14 +103,14 @@ impl<T> Finalizer for GcPtr<T> where T: Sized + Trace {
 }
 
 pub struct GcInternal<T> where T: 'static + Sized + Trace {
-    is_root: Cell<bool>,
+    is_root: AtomicBool,
     ptr: *const GcPtr<T>,
 }
 
 impl<T> GcInternal<T> where T: 'static + Sized + Trace {
     fn new(ptr: *const GcPtr<T>) -> GcInternal<T> {
         GcInternal {
-            is_root: Cell::new(true),
+            is_root: AtomicBool::new(true),
             ptr: ptr,
         }
     }
@@ -118,12 +118,12 @@ impl<T> GcInternal<T> where T: 'static + Sized + Trace {
 
 impl<T> Trace for GcInternal<T> where T: Sized + Trace {
     fn is_root(&self) -> bool {
-        self.is_root.get()
+        self.is_root.load(Ordering::Acquire)
     }
 
     fn reset_root(&self) {
-        if self.is_root.get() {
-            self.is_root.set(false);
+        if self.is_root.load(Ordering::Acquire) {
+            self.is_root.store(false, Ordering::Release);
             unsafe {
                 (*self.ptr).reset_root();
             }
@@ -200,7 +200,7 @@ impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
     }
 
     fn clone_from(&mut self, source: &Self) {
-        self.is_root.set(false);
+        self.is_root.store(false, Ordering::Release);
         unsafe {
             (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
         }
