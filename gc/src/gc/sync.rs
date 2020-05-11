@@ -1,5 +1,6 @@
 use core::time;
 use std::alloc::{alloc, dealloc, Layout};
+use std::mem::transmute;
 use std::borrow::BorrowMut;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -11,6 +12,7 @@ use std::thread::JoinHandle;
 
 use crate::gc::{Finalizer, Trace};
 use crate::gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
+use std::hash::{Hash, Hasher};
 
 struct GcInfo {
     root_ref_count: AtomicUsize,
@@ -201,11 +203,13 @@ impl<T> Gc<T> where T: Sized + Trace {
 impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
     fn clone(&self) -> Self {
         unsafe {
+            dbg!("Gc<T>::clone()");
             (*GLOBAL_GC).clone_from_gc(self)
         }
     }
 
     fn clone_from(&mut self, source: &Self) {
+        dbg!("Gc<T>::clone_from()");
         self.is_root.store(false, Ordering::Release);
         unsafe {
             (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
@@ -413,6 +417,7 @@ impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
 type GcObjMem = *mut u8;
 
 pub struct GlobalGarbageCollector {
+    mem_to_trc: RwLock<HashMap<usize, *const dyn Trace>>,
     trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalizer>>,
@@ -425,6 +430,7 @@ unsafe impl Send for GlobalGarbageCollector {}
 impl GlobalGarbageCollector {
     fn new() -> GlobalGarbageCollector {
         GlobalGarbageCollector {
+            mem_to_trc: RwLock::new(HashMap::new()),
             trs: RwLock::new(HashMap::new()),
             objs: Mutex::new(HashMap::new()),
             fin: Mutex::new(HashMap::new()),
@@ -441,9 +447,11 @@ impl GlobalGarbageCollector {
             internal_ptr: gc_inter_ptr,
         };
         (*(*gc.internal_ptr).ptr).reset_root();
+        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
         let mut trs = self.trs.write().unwrap();
         let mut objs = self.objs.lock().unwrap();
         let mut fin = self.fin.lock().unwrap();
+        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
         trs.insert(gc_inter_ptr, mem_info_internal_ptr);
         objs.insert(gc_ptr, mem_info_gc_ptr);
         fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
@@ -453,7 +461,9 @@ impl GlobalGarbageCollector {
     unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
         std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
+        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
         let mut trs = self.trs.write().unwrap();
+        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
         trs.insert(gc_inter_ptr, mem_info_internal_ptr);
         let gc = Gc {
             internal_ptr: gc_inter_ptr,
@@ -471,9 +481,11 @@ impl GlobalGarbageCollector {
             internal_ptr: gc_cell_inter_ptr,
         };
         (*(*gc.internal_ptr).ptr).reset_root();
+        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
         let mut trs = self.trs.write().unwrap();
         let mut objs = self.objs.lock().unwrap();
         let mut fin = self.fin.lock().unwrap();
+        mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
         trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
         objs.insert(gc_ptr, mem_info_gc_ptr);
         fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
@@ -483,7 +495,9 @@ impl GlobalGarbageCollector {
     unsafe fn clone_from_gc_cell<T>(&self, gc: &GcCell<T>) -> GcCell<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcCellInternal<T>>();
         std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr));
+        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
         let mut trs = self.trs.write().unwrap();
+        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
         trs.insert(gc_inter_ptr, mem_info);
         let gc = GcCell {
             internal_ptr: gc_inter_ptr,
@@ -499,10 +513,11 @@ impl GlobalGarbageCollector {
         (gc_inter_ptr, (mem, layout))
     }
 
-    pub unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
+    unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
+        let mut mem_to_trc = self.mem_to_trc.read().unwrap();
         let mut trs = self.trs.write().unwrap();
-        dbg!("trs.len = {}", trs.len());
-        let del = trs[&tracer];
+        let (tracer_thin_ptr, _) = unsafe { transmute::<_, (*const (), *const ())>(tracer) };
+        let del = trs[&mem_to_trc[&(tracer_thin_ptr as usize)]];
         dealloc(del.0, del.1);
         trs.remove(&tracer);
     }
