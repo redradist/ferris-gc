@@ -521,6 +521,10 @@ impl LocalGarbageCollector {
         }
     }
 
+    pub fn get_objs(&self) -> &Mutex<HashMap<*const Trace, (*mut u8, Layout)>> {
+        &self.objs
+    }
+
     unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
         where T: Sized + Trace {
         let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<GcPtr<T>>();
