@@ -1,17 +1,19 @@
+use core::time;
+use std::alloc::{alloc, dealloc, Layout};
+use std::borrow::BorrowMut;
+use std::cell::{Cell, Ref, RefCell};
+use std::collections::{BinaryHeap, BTreeMap, BTreeSet, HashMap, HashSet, LinkedList, VecDeque};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::thread::JoinHandle;
+
+use crate::gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_LOCAL_GCS};
+
 pub mod sync;
 
-use std::cell::{Cell, RefCell, Ref};
-use std::collections::{VecDeque, LinkedList, BTreeMap, HashMap, HashSet, BTreeSet, BinaryHeap};
-use std::alloc::{alloc, dealloc, Layout};
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
-use std::sync::{RwLock, Mutex};
-use core::time;
-use std::thread;
-use std::borrow::BorrowMut;
-
-pub trait Trace : Finalizer {
+pub trait Trace: Finalizer {
     fn is_root(&self) -> bool;
     fn reset_root(&self);
     fn trace(&self);
@@ -191,13 +193,11 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for RefCell<GcPtr<T>> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 impl<T> Finalizer for GcPtr<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 pub struct GcInternal<T> where T: 'static + Sized + Trace {
@@ -246,8 +246,7 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for GcInternal<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 impl<T> Deref for GcInternal<T> where T: 'static + Sized + Trace {
@@ -344,8 +343,7 @@ impl<T> Trace for Gc<T> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for Gc<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 pub struct GcCellInternal<T> where T: 'static + Sized + Trace {
@@ -394,8 +392,7 @@ impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for GcCellInternal<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 impl<T> Deref for GcCellInternal<T> where T: 'static + Sized + Trace {
@@ -497,8 +494,7 @@ impl<T> Trace for GcCell<T> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 type GcObjMem = *mut u8;
@@ -590,7 +586,6 @@ impl LocalGarbageCollector {
     }
 
     pub unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
-        dbg!("remove_tracer(&self, tracer: *const dyn Trace)");
         let mut trs = self.trs.write().unwrap();
         let del = (&*trs)[&tracer];
         dealloc(del.0, del.1);
@@ -599,7 +594,6 @@ impl LocalGarbageCollector {
 
     pub unsafe fn collect(&self) {
         dbg!("Start collect ...");
-        let mut collected_int_objects: Vec<*const dyn Trace> = Vec::new();
         let mut trs = self.trs.read().unwrap();
         for (gc_info, _) in &*trs {
             let tracer = &(**gc_info);
@@ -632,7 +626,7 @@ impl LocalGarbageCollector {
     }
 
     unsafe fn collect_all(&self) {
-        dbg!("Start collect ...");
+        dbg!("Start collect_all ...");
         let mut collected_int_objects: Vec<*const dyn Trace> = Vec::new();
         let mut trs = self.trs.write().unwrap();
         for (gc_info, _) in &*trs {
@@ -659,12 +653,6 @@ impl LocalGarbageCollector {
     }
 }
 
-impl Drop for LocalGarbageCollector {
-    fn drop(&mut self) {
-        dbg!("GarbageCollector::drop");
-    }
-}
-
 impl PartialEq for &LocalGarbageCollector {
     fn eq(&self, other: &Self) -> bool {
         *self == *other
@@ -685,19 +673,19 @@ pub struct LocalStrategy {
 impl LocalStrategy {
     fn new<StartFn, StopFn>(gc: &'static LocalGarbageCollector, start_fn: StartFn, stop_fn: StopFn) -> LocalStrategy
         where StartFn: 'static + FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
-               StopFn: 'static + FnMut(&'static LocalGarbageCollector) {
+              StopFn: 'static + FnMut(&'static LocalGarbageCollector) {
         LocalStrategy {
             gc: Cell::new(gc),
             is_active: AtomicBool::new(false),
             start_func: RefCell::new(Box::new(start_fn)),
             stop_func: RefCell::new(Box::new(stop_fn)),
-            join_handle: RefCell::new(None)
+            join_handle: RefCell::new(None),
         }
     }
 
     pub fn change_strategy<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn)
         where StartFn: 'static + FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
-               StopFn: 'static + FnMut(&'static LocalGarbageCollector) {
+              StopFn: 'static + FnMut(&'static LocalGarbageCollector) {
         if self.is_active() {
             self.stop();
         }
@@ -718,7 +706,7 @@ impl LocalStrategy {
     pub fn stop(&self) {
         dbg!("LocalStrategy::stop");
         self.is_active.store(false, Ordering::Release);
-        if let Some(join_handle) = self.join_handle.borrow_mut().take()  {
+        if let Some(join_handle) = self.join_handle.borrow_mut().take() {
             join_handle.join().expect("LocalStrategy::stop, LocalStrategy Thread being joined has panicked !!");
         }
         (&mut *(self.stop_func.borrow_mut()))(self.gc.get());
@@ -727,12 +715,10 @@ impl LocalStrategy {
 
 impl Drop for LocalStrategy {
     fn drop(&mut self) {
-        dbg!("LocalStrategy::drop");
         self.is_active.store(false, Ordering::Release);
     }
 }
 
-use crate::gc_strategy::{BASIC_STRATEGY_LOCAL_GCS, basic_gc_strategy_start};
 thread_local! {
     static LOCAL_GC: RefCell<LocalGarbageCollector> = RefCell::new(LocalGarbageCollector::new());
     pub static LOCAL_GC_STRATEGY: RefCell<LocalStrategy> = {

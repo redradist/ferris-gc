@@ -1,8 +1,16 @@
+use core::time;
+use std::alloc::{alloc, dealloc, Layout};
+use std::borrow::BorrowMut;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::alloc::{alloc, dealloc, Layout};
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-use crate::gc::{Trace, Finalizer};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+use std::thread::JoinHandle;
+
+use crate::gc::{Finalizer, Trace};
+use crate::gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
 
 struct GcInfo {
     root_ref_count: AtomicUsize,
@@ -93,13 +101,11 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for RefCell<GcPtr<T>> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 impl<T> Finalizer for GcPtr<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 pub struct GcInternal<T> where T: 'static + Sized + Trace {
@@ -148,8 +154,7 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for GcInternal<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 impl<T> Deref for GcInternal<T> where T: 'static + Sized + Trace {
@@ -181,11 +186,11 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 
 impl<T> Gc<T> where T: Sized + Trace {
     pub fn new<'a>(t: T) -> Gc<T> {
+        dbg!("Gc<T>::new()");
         basic_gc_strategy_start();
-        let mut global_strategy = (*GLOBAL_GC_STRATEGY).write().unwrap();
+        let mut global_strategy = &(*GLOBAL_GC_STRATEGY);
         if !global_strategy.is_active() {
-            // TODO: Need somehow to get &'static to a strategy
-            // global_strategy.start();
+            global_strategy.start();
         }
         unsafe {
             (*GLOBAL_GC).create_gc(t)
@@ -248,8 +253,7 @@ impl<T> Trace for Gc<T> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for Gc<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 pub struct GcCellInternal<T> where T: 'static + Sized + Trace {
@@ -298,8 +302,7 @@ impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for GcCellInternal<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 impl<T> Deref for GcCellInternal<T> where T: 'static + Sized + Trace {
@@ -317,6 +320,7 @@ pub struct GcCell<T> where T: 'static + Sized + Trace {
 }
 
 unsafe impl<T> Sync for GcCell<T> where T: 'static + Sized + Trace {}
+
 unsafe impl<T> Send for GcCell<T> where T: 'static + Sized + Trace {}
 
 impl<T> Drop for GcCell<T> where T: Sized + Trace {
@@ -341,10 +345,9 @@ impl<T> Deref for GcCell<T> where T: 'static + Sized + Trace {
 impl<T> GcCell<T> where T: 'static + Sized + Trace {
     pub fn new<'a>(t: T) -> GcCell<T> {
         basic_gc_strategy_start();
-        let mut global_strategy = (*GLOBAL_GC_STRATEGY).write().unwrap();
+        let mut global_strategy = &(*GLOBAL_GC_STRATEGY);
         if !global_strategy.is_active() {
-            // TODO: Need somehow to get &'static to a strategy
-            // global_strategy.start();
+            global_strategy.start();
         }
         unsafe {
             (*GLOBAL_GC).create_gc_cell(t)
@@ -404,8 +407,7 @@ impl<T> Trace for GcCell<T> where T: Sized + Trace {
 }
 
 impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
-    fn finalize(&self) {
-    }
+    fn finalize(&self) {}
 }
 
 type GcObjMem = *mut u8;
@@ -417,6 +419,7 @@ pub struct GlobalGarbageCollector {
 }
 
 unsafe impl Sync for GlobalGarbageCollector {}
+
 unsafe impl Send for GlobalGarbageCollector {}
 
 impl GlobalGarbageCollector {
@@ -497,9 +500,9 @@ impl GlobalGarbageCollector {
     }
 
     pub unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
-        dbg!("remove_tracer(&self, tracer: *const dyn Trace)");
         let mut trs = self.trs.write().unwrap();
-        let del = (&*trs)[&tracer];
+        dbg!("trs.len = {}", trs.len());
+        let del = trs[&tracer];
         dealloc(del.0, del.1);
         trs.remove(&tracer);
     }
@@ -507,6 +510,7 @@ impl GlobalGarbageCollector {
     pub unsafe fn collect(&self) {
         dbg!("Start collect ...");
         let mut trs = self.trs.read().unwrap();
+        dbg!("trs.len = {}", (*trs).len());
         for (gc_info, _) in &*trs {
             let tracer = &(**gc_info);
             if tracer.is_root() {
@@ -538,9 +542,9 @@ impl GlobalGarbageCollector {
     }
 
     unsafe fn collect_all(&self) {
-        dbg!("Start collect ...");
+        dbg!("Start collect_all ...");
         let mut collected_int_objects: Vec<*const dyn Trace> = Vec::new();
-        let mut trs = self.trs.write().unwrap();
+        let mut trs = self.trs.read().unwrap();
         for (gc_info, _) in &*trs {
             collected_int_objects.push(*gc_info);
         }
@@ -562,12 +566,6 @@ impl GlobalGarbageCollector {
             objs.remove(&col);
             fin.remove(&col);
         }
-    }
-}
-
-impl Drop for GlobalGarbageCollector {
-    fn drop(&mut self) {
-        dbg!("GlobalGarbageCollector::drop");
     }
 }
 
@@ -594,7 +592,7 @@ impl GlobalStrategy {
             is_active: AtomicBool::new(false),
             start_func: Mutex::new(Box::new(start_fn)),
             stop_func: Mutex::new(Box::new(stop_fn)),
-            join_handle: Mutex::new(None)
+            join_handle: Mutex::new(None),
         }
     }
 
@@ -626,7 +624,7 @@ impl GlobalStrategy {
         dbg!("GlobalStrategy::stop");
         self.is_active.store(false, Ordering::Release);
         let mut join_handle = self.join_handle.lock().unwrap();
-        if let Some(join_handle) = join_handle.take()  {
+        if let Some(join_handle) = join_handle.take() {
             join_handle.join().expect("GlobalStrategy::stop, GlobalStrategy Thread being joined has panicked !!");
         }
         let mut stop_func = self.stop_func.lock().unwrap();
@@ -636,25 +634,17 @@ impl GlobalStrategy {
 
 impl Drop for GlobalStrategy {
     fn drop(&mut self) {
-        dbg!("GlobalStrategy::drop");
         self.is_active.store(false, Ordering::Release);
     }
 }
 
-use std::ops::{Deref, DerefMut};
-use std::thread::JoinHandle;
-use std::sync::{RwLock, Mutex};
-use core::time;
-use std::thread;
-use std::borrow::BorrowMut;
-use crate::gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
 lazy_static! {
     static ref GLOBAL_GC: GlobalGarbageCollector = {
         GlobalGarbageCollector::new()
     };
-    pub static ref GLOBAL_GC_STRATEGY: RwLock<GlobalStrategy> = {
+    pub static ref GLOBAL_GC_STRATEGY: GlobalStrategy = {
         let gc = &(*GLOBAL_GC);
-        RwLock::new(GlobalStrategy::new(gc,
+        GlobalStrategy::new(gc,
             move |global_gc, _| {
                 let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
                 *basic_strategy_global_gc = Some(global_gc);
@@ -663,7 +653,7 @@ lazy_static! {
             move |global_gc| {
                 let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
                 *basic_strategy_global_gc = None;
-            }))
+            })
     };
 }
 
