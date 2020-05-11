@@ -14,7 +14,7 @@ use std::mem::transmute;
 
 pub mod sync;
 
-pub trait Trace: Finalizer {
+pub trait Trace: Finalize {
     fn is_root(&self) -> bool;
     fn reset_root(&self);
     fn trace(&self);
@@ -22,9 +22,9 @@ pub trait Trace: Finalizer {
     fn is_traceable(&self) -> bool;
 }
 
-pub trait Finalizer {
+pub trait Finalize {
     fn finalize(&self);
-    fn as_finalize(&self) -> &dyn Finalizer
+    fn as_finalize(&self) -> &dyn Finalize
         where Self: Sized {
         self
     }
@@ -48,7 +48,7 @@ macro_rules! primitive_types {
                 }
             }
 
-            impl Finalizer for $prm {
+            impl Finalize for $prm {
                 fn finalize(&self) {
                 }
             }
@@ -90,7 +90,7 @@ macro_rules! std_types {
                 }
             }
 
-            impl<T> Finalizer for $std<T> where T: 'static + Sized + Trace {
+            impl<T> Finalize for $std<T> where T: 'static + Sized + Trace {
                 fn finalize(&self) {
                 }
             }
@@ -193,11 +193,11 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for RefCell<GcPtr<T>> where T: Sized + Trace {
+impl<T> Finalize for RefCell<GcPtr<T>> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
-impl<T> Finalizer for GcPtr<T> where T: Sized + Trace {
+impl<T> Finalize for GcPtr<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -246,7 +246,7 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for GcInternal<T> where T: Sized + Trace {
+impl<T> Finalize for GcInternal<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -343,7 +343,7 @@ impl<T> Trace for Gc<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for Gc<T> where T: Sized + Trace {
+impl<T> Finalize for Gc<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -392,7 +392,7 @@ impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for GcCellInternal<T> where T: Sized + Trace {
+impl<T> Finalize for GcCellInternal<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -494,7 +494,7 @@ impl<T> Trace for GcCell<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
+impl<T> Finalize for GcCell<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -504,7 +504,7 @@ pub struct LocalGarbageCollector {
     mem_to_trc: RwLock<HashMap<usize, *const dyn Trace>>,
     trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
-    fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalizer>>,
+    fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalize>>,
 }
 
 unsafe impl Sync for LocalGarbageCollector {}

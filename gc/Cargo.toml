@@ -1,10 +1,22 @@
 [package]
 name = "ferris-gc"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["redradist, redradist@gmail.com"]
+description = "Flexible implementation of garbage collector for Rust"
+repository = "https://github.com/redradist/ferris-gc"
+readme = "../README.md"
+license = "APACHE-2.0, MIT"
+keywords = ["garbage", "memory"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+proc-macro = ["ferris-gc-proc-macro"]
+
 [dependencies]
 lazy_static = "1.4.0"
+ferris-gc-proc-macro = { path = "../gc_proc_macro", version = "0.1.0", optional = true }
+
+[dev-dependencies]
+ferris-gc-proc-macro = { path = "../gc_proc_macro", version = "0.1.0" }

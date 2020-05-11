@@ -97,13 +97,13 @@ pub fn derive_trace(item: TokenStream) -> TokenStream {
     trace_impl.into()
 }
 
-#[proc_macro_derive(Finalizer)]
-pub fn derive_finalizer(item: TokenStream) -> TokenStream {
+#[proc_macro_derive(Finalize)]
+pub fn derive_finalize(item: TokenStream) -> TokenStream {
     let derive_input = syn::parse_macro_input!(item as syn::DeriveInput);
 
     let ident = &derive_input.ident;
     let finalizer_impl = quote! {
-        impl Finalizer for #ident {
+        impl Finalize for #ident {
             fn finalize(&self) {
             }
         }

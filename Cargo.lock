@@ -2,8 +2,9 @@
 # It is not intended for manual editing.
 [[package]]
 name = "ferris-gc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "ferris-gc-proc-macro",
  "lazy_static",
 ]
 

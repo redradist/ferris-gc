@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 
-use crate::gc::{Finalizer, Trace};
+use crate::gc::{Finalize, Trace};
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
 use std::hash::{Hash, Hasher};
 
@@ -102,11 +102,11 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for RefCell<GcPtr<T>> where T: Sized + Trace {
+impl<T> Finalize for RefCell<GcPtr<T>> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
-impl<T> Finalizer for GcPtr<T> where T: Sized + Trace {
+impl<T> Finalize for GcPtr<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -155,7 +155,7 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for GcInternal<T> where T: Sized + Trace {
+impl<T> Finalize for GcInternal<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -256,7 +256,7 @@ impl<T> Trace for Gc<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for Gc<T> where T: Sized + Trace {
+impl<T> Finalize for Gc<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -305,7 +305,7 @@ impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for GcCellInternal<T> where T: Sized + Trace {
+impl<T> Finalize for GcCellInternal<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -410,7 +410,7 @@ impl<T> Trace for GcCell<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalizer for GcCell<T> where T: Sized + Trace {
+impl<T> Finalize for GcCell<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
@@ -420,7 +420,7 @@ pub struct GlobalGarbageCollector {
     mem_to_trc: RwLock<HashMap<usize, *const dyn Trace>>,
     trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
-    fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalizer>>,
+    fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalize>>,
 }
 
 unsafe impl Sync for GlobalGarbageCollector {}
