@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 
-use crate::gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_LOCAL_GCS};
+use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_LOCAL_GCS};
 use std::mem::transmute;
 
 pub mod sync;

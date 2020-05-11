@@ -1,5 +1,8 @@
 #[macro_use]
 extern crate lazy_static;
 
-pub mod gc;
-mod gc_strategy;
+mod gc;
+mod basic_gc_strategy;
+
+pub use gc::*;
+pub use basic_gc_strategy::{BASIC_STRATEGY_LOCAL_GCS, BASIC_STRATEGY_GLOBAL_GC};

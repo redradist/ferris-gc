@@ -1,5 +1,5 @@
 [package]
-name = "easy-gc-proc-macro"
+name = "ferris-gc-proc-macro"
 version = "0.1.0"
 authors = ["redradist <redradist@gmail.com>"]
 edition = "2018"

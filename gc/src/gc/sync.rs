@@ -11,7 +11,7 @@ use std::thread;
 use std::thread::JoinHandle;
 
 use crate::gc::{Finalizer, Trace};
-use crate::gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
+use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
 use std::hash::{Hash, Hasher};
 
 struct GcInfo {
