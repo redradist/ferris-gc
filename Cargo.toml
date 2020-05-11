@@ -1,5 +1,5 @@
 [workspace]
 members = [
     "gc",
-    "gc_proc_macro",
+    "ferris_gc_proc_macro",
 ]
