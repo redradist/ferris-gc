@@ -647,7 +647,6 @@ impl GlobalStrategy {
 
 impl Drop for GlobalStrategy {
     fn drop(&mut self) {
-        self.is_active.store(false, Ordering::Release);
     }
 }
 

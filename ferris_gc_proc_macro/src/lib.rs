@@ -144,7 +144,10 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
         #(#attrs)*
         #vis fn #name (#(#args),*) #ret {
             // Should be added proper closing background threads
-            #body
+            {
+               let cleanup = ApplicationCleanUp;
+                #body
+            }
         }
     };
 
