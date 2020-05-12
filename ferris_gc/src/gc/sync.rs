@@ -464,14 +464,14 @@ impl GlobalGarbageCollector {
     unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
         std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
-        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-        let mut trs = self.trs.write().unwrap();
-        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
-        trs.insert(gc_inter_ptr, mem_info_internal_ptr);
         let gc = Gc {
             internal_ptr: gc_inter_ptr,
         };
         (*(*gc.internal_ptr).ptr).reset_root();
+        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
+        let mut trs = self.trs.write().unwrap();
+        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+        trs.insert(gc_inter_ptr, mem_info_internal_ptr);
         gc
     }
 
@@ -498,14 +498,14 @@ impl GlobalGarbageCollector {
     unsafe fn clone_from_gc_cell<T>(&self, gc: &GcCell<T>) -> GcCell<T> where T: Sized + Trace {
         let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcCellInternal<T>>();
         std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr));
-        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-        let mut trs = self.trs.write().unwrap();
-        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
-        trs.insert(gc_inter_ptr, mem_info);
         let gc = GcCell {
             internal_ptr: gc_inter_ptr,
         };
         (*(*gc.internal_ptr).ptr).reset_root();
+        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
+        let mut trs = self.trs.write().unwrap();
+        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+        trs.insert(gc_inter_ptr, mem_info);
         gc
     }
 
