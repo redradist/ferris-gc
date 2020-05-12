@@ -113,3 +113,42 @@ pub fn derive_finalize(item: TokenStream) -> TokenStream {
     println!("Result Finalizer Impl is {}", print_tokens.to_string());
     finalizer_impl.into()
 }
+
+#[proc_macro_attribute]
+pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(item as syn::ItemFn);
+    let attr_args = syn::parse_macro_input!(attrs as syn::AttributeArgs);
+
+    let sig = &input.sig;
+    let vis = input.vis;
+    let name = &input.sig.ident;
+    let mut args = Vec::new();
+    for arg in &input.sig.inputs {
+        args.push(arg);
+    }
+    let ret = match &input.sig.output {
+        ReturnType::Default => {
+            quote! {
+            }
+        },
+        ReturnType::Type(arrow, box_type) => {
+            quote! {
+                -> #box_type
+            }
+        }
+    };
+    let body = &input.block;
+    let attrs = &input.attrs;
+
+    let res_fun = quote! {
+        #(#attrs)*
+        #vis fn #name (#(#args),*) #ret {
+            // Should be added proper closing background threads
+            #body
+        }
+    };
+
+    let print_tokens = Into::<TokenStream>::into(res_fun.clone());
+    println!("Result Function is {}", print_tokens.to_string());
+    res_fun.into()
+}

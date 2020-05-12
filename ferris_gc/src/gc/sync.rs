@@ -173,8 +173,8 @@ pub struct Gc<T> where T: 'static + Sized + Trace {
     internal_ptr: *mut GcInternal<T>,
 }
 
-unsafe impl<T> Sync for Gc<T> where T: 'static + Sized + Trace {}
-unsafe impl<T> Send for Gc<T> where T: 'static + Sized + Trace {}
+unsafe impl<T> Sync for Gc<T> where T: 'static + Sized + Trace + Sync {}
+unsafe impl<T> Send for Gc<T> where T: 'static + Sized + Trace + Send {}
 
 impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
     type Target = GcInternal<T>;
@@ -323,9 +323,8 @@ pub struct GcCell<T> where T: 'static + Sized + Trace {
     internal_ptr: *mut GcCellInternal<T>,
 }
 
-unsafe impl<T> Sync for GcCell<T> where T: 'static + Sized + Trace {}
-
-unsafe impl<T> Send for GcCell<T> where T: 'static + Sized + Trace {}
+unsafe impl<T> Sync for GcCell<T> where T: 'static + Sized + Trace + Sync {}
+unsafe impl<T> Send for GcCell<T> where T: 'static + Sized + Trace + Send {}
 
 impl<T> Drop for GcCell<T> where T: Sized + Trace {
     fn drop(&mut self) {
@@ -527,16 +526,13 @@ impl GlobalGarbageCollector {
     }
 
     pub unsafe fn collect(&self) {
-        dbg!("Start collect ...");
         let mut trs = self.trs.read().unwrap();
-        dbg!("trs.len = {}", (*trs).len());
         for (gc_info, _) in &*trs {
             let tracer = &(**gc_info);
             if tracer.is_root() {
                 tracer.trace();
             }
         }
-        dbg!("Before collected_objects");
         let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
         let mut objs = self.objs.lock().unwrap();
         for (gc_info, _) in &*objs {
@@ -549,7 +545,6 @@ impl GlobalGarbageCollector {
             let tracer = &(**gc_info);
             tracer.reset();
         }
-        dbg!("collected_objects: {}", collected_objects.len());
         let mut fin = self.fin.lock().unwrap();
         for col in collected_objects {
             let del = (&*objs)[&col];
@@ -562,7 +557,6 @@ impl GlobalGarbageCollector {
     }
 
     unsafe fn collect_all(&self) {
-        dbg!("Start collect_all ...");
         let mut collected_int_objects: Vec<*const dyn Trace> = Vec::new();
         let mut trs = self.trs.read().unwrap();
         for (gc_info, _) in &*trs {
@@ -576,7 +570,6 @@ impl GlobalGarbageCollector {
         for col in collected_int_objects {
             self.remove_tracer(col);
         }
-        dbg!("collected_objects: {}", collected_objects.len());
         let mut fin = self.fin.lock().unwrap();
         for col in collected_objects {
             let del = (&*objs)[&col];

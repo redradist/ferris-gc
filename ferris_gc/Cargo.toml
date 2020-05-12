@@ -1,6 +1,6 @@
 [package]
 name = "ferris-gc"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["redradist, redradist@gmail.com"]
 description = "Flexible implementation of garbage collector for Rust"
 repository = "https://github.com/redradist/ferris-gc"

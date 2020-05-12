@@ -611,7 +611,6 @@ impl LocalGarbageCollector {
     }
 
     pub unsafe fn collect(&self) {
-        dbg!("Start collect ...");
         let mut trs = self.trs.read().unwrap();
         for (gc_info, _) in &*trs {
             let tracer = &(**gc_info);
@@ -631,7 +630,6 @@ impl LocalGarbageCollector {
             let tracer = &(**gc_info);
             tracer.reset();
         }
-        dbg!("collected_objects: {}", collected_objects.len());
         let mut fin = self.fin.lock().unwrap();
         for col in collected_objects {
             let del = (&*objs)[&col];
@@ -644,7 +642,6 @@ impl LocalGarbageCollector {
     }
 
     unsafe fn collect_all(&self) {
-        dbg!("Start collect_all ...");
         let mut collected_int_objects: Vec<*const dyn Trace> = Vec::new();
         let mut trs = self.trs.write().unwrap();
         for (gc_info, _) in &*trs {
@@ -658,7 +655,6 @@ impl LocalGarbageCollector {
         for col in collected_int_objects {
             self.remove_tracer(col);
         }
-        dbg!("collected_objects: {}", collected_objects.len());
         let mut fin = self.fin.lock().unwrap();
         for col in collected_objects {
             let del = (&*objs)[&col];

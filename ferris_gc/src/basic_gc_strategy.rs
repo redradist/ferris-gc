@@ -17,7 +17,7 @@ pub fn basic_gc_strategy_start() {
     START_BASIC_GC_STRATEGY.call_once(|| {
         thread::spawn(move || {
             loop {
-                let ten_secs = time::Duration::from_secs(10);
+                let ten_secs = time::Duration::from_millis(500);
                 thread::sleep(ten_secs);
                 {
                     if let Some(global_gc) = *(*BASIC_STRATEGY_GLOBAL_GC).read().unwrap() {
