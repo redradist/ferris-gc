@@ -86,14 +86,16 @@ fn main() {
 ```
 
 Lets try to understand step-by-step what is what here:
-1) #[derive(Trace, Finalize)]
-   Macro that implement Trace and Finalize for the particular object.
-   It is needed because `Gc::new` and `GcCell::new` waiting object that implement trait `Trace` and using this trait GarbageCollector is able to collect unreachable objects ...
-   Trait `Finalizer` will be called when object is disposed. Also you can implement custom trait `Finalizer` for your particular needs
+1) \#[derive(Trace, Finalize)]
 
-2) #[ferris_gc_main]
+   Macro that implements Trace and Finalize for the particular object.
+   It is needed because `Gc::new` and `GcCell::new` waiting object that implement trait `Trace` and using this trait GarbageCollector is able to collect unreachable objects ...
+   Trait `Finalize` will be called when object is disposed. Also you can implement custom trait `Finalize` for your particular needs
+
+2) \#[ferris_gc_main]
+
    Macro for main function in your program is needed for disposing all objects after Application finished.
-   It is usefull because otherwise object `gc3` will not be disposed by GarbageCollector and finalize will not be called ...
+   It is useful because otherwise object `gc3` will not be disposed by GarbageCollector and finalize will not be called ...
 
 To add dependencies you should add:
 ```toml
