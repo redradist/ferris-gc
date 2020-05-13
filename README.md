@@ -5,7 +5,7 @@ One of the main difference is a thread safe Garbage Collector implementation as 
 
 Here is the simple example of using FerrisGC:
 ```rust
-use ferris_gc::{Gc, Trace, Finalize, GcCell};
+use ferris_gc::{Gc, Trace, Finalize, GcCell, ferris_gc_main, ApplicationCleanup};
 use ferris_gc::sync::Gc as GlobalGc;
 use ferris_gc::sync::GcCell as GlobalGcCell;
 use core::time;
@@ -66,13 +66,14 @@ impl Finalize for MyStruct2 {
     }
 }
 
+#[ferris_gc_main]
 fn main() {
     {
         let gc = Gc::new(2);
         let gc1 = Gc::new(MyStruct { jh: 3 });
         let gc2 = GcCell::new(MyStruct { jh: 3 });
         gc2.borrow_mut().jh = 2;
-        let gc3 = Gc::new(MyStruct2 { jh: gc });
+        let gc3 = Gc::new(MyStruct2 { jh: gc.clone() });
     }
     {
         let gc2 = GlobalGc::new(MyStruct { jh: 3 });
@@ -87,5 +88,5 @@ fn main() {
 To add dependencies you should add:
 ```toml
 [dependencies]
-ferris-gc = { version = "0.1.1", features = ["proc-macro"] }
+ferris-gc = { version = "0.1.2", features = ["proc-macro"] }
 ```

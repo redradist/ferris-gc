@@ -23,11 +23,9 @@ lazy_static! {
 }
 static START_BASIC_GC_STRATEGY: Once = Once::new();
 
-pub struct ApplicationCleanUp;
-impl Drop for ApplicationCleanUp {
+pub struct ApplicationCleanup;
+impl Drop for ApplicationCleanup {
     fn drop(&mut self) {
-        println!("drop ApplicationCleanUp");
-
         let app_active = &(*APPLICATION_ACTIVE);
         app_active.store(false, Ordering::Release);
         let mut bthreads = (&*BACKGROUND_THREADS).write().unwrap();
@@ -62,6 +60,18 @@ pub fn basic_gc_strategy_start() {
                                 local_gc.collect();
                             }
                         }
+                    }
+                }
+                if let Some(global_gc) = *(*BASIC_STRATEGY_GLOBAL_GC).read().unwrap() {
+                    unsafe {
+                        global_gc.collect_all();
+                    }
+                }
+                let local_gcs_read_guard = (*BASIC_STRATEGY_LOCAL_GCS).read().unwrap();
+                let local_gcs = &(*local_gcs_read_guard);
+                unsafe {
+                    for local_gc in local_gcs.into_iter() {
+                        local_gc.collect_all();
                     }
                 }
             })

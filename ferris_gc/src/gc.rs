@@ -14,6 +14,26 @@ use std::mem::transmute;
 
 pub mod sync;
 
+trait ThinPtr {
+    fn get_thin_ptr(&self) -> usize;
+}
+
+impl ThinPtr for &dyn Trace {
+    fn get_thin_ptr(&self) -> usize {
+        let fat_ptr = (*self) as *const dyn Trace;
+        let (thin_ptr, _) = unsafe { transmute::<_, (*const (), *const ())>(fat_ptr) };
+        thin_ptr as usize
+    }
+}
+
+impl ThinPtr for *const dyn Trace {
+    fn get_thin_ptr(&self) -> usize {
+        let fat_ptr = (*self);
+        let (thin_ptr, _) = unsafe { transmute::<_, (*const (), *const ())>(fat_ptr) };
+        thin_ptr as usize
+    }
+}
+
 pub trait Trace: Finalize {
     fn is_root(&self) -> bool;
     fn reset_root(&self);
@@ -242,7 +262,9 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
     }
 
     fn is_traceable(&self) -> bool {
-        unreachable!();
+        unsafe {
+            (*self.ptr).is_traceable()
+        }
     }
 }
 
@@ -297,7 +319,6 @@ impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
     }
 
     fn clone_from(&mut self, source: &Self) {
-        self.is_root.set(false);
         unsafe {
             (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
         }
@@ -306,7 +327,6 @@ impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
 
 impl<T> Drop for Gc<T> where T: Sized + Trace {
     fn drop(&mut self) {
-        println!("Gc::drop");
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().remove_tracer(self.internal_ptr);
         });
@@ -388,7 +408,9 @@ impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
     }
 
     fn is_traceable(&self) -> bool {
-        unreachable!();
+        unsafe {
+            (*self.ptr).borrow().is_traceable()
+        }
     }
 }
 
@@ -456,7 +478,6 @@ impl<T> Clone for GcCell<T> where T: 'static + Sized + Trace {
     }
 
     fn clone_from(&mut self, source: &Self) {
-        self.is_root.set(false);
         unsafe {
             (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
         }
@@ -508,7 +529,6 @@ pub struct LocalGarbageCollector {
 }
 
 unsafe impl Sync for LocalGarbageCollector {}
-
 unsafe impl Send for LocalGarbageCollector {}
 
 impl LocalGarbageCollector {
@@ -597,28 +617,39 @@ impl LocalGarbageCollector {
     unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
         let layout = Layout::new::<T>();
         let mem = alloc(layout);
-        let gc_inter_ptr: *mut T = mem as *mut _;
-        (gc_inter_ptr, (mem, layout))
+        let type_ptr: *mut T = mem as *mut _;
+        (type_ptr, (mem, layout))
     }
 
     unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
         let mut mem_to_trc = self.mem_to_trc.write().unwrap();
         let mut trs = self.trs.write().unwrap();
-        let (tracer_thin_ptr, _) = unsafe { transmute::<_, (*const (), *const ())>(tracer) };
-        let tracee = &mem_to_trc.remove(&(tracer_thin_ptr as usize)).unwrap();
-        let del = trs.remove(&tracee).unwrap();
+        let tracer = &mem_to_trc.remove(&(tracer.get_thin_ptr())).unwrap();
+        let del = trs.remove(&tracer).unwrap();
         dealloc(del.0, del.1);
     }
 
     pub unsafe fn collect(&self) {
-        let mut trs = self.trs.read().unwrap();
+        let mut trs = self.trs.write().unwrap();
         for (gc_info, _) in &*trs {
             let tracer = &(**gc_info);
             if tracer.is_root() {
                 tracer.trace();
             }
         }
-        let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
+        let mut collected_tracers = Vec::new();
+        for (gc_info, del) in &*trs {
+            let tracer = &(**gc_info);
+            if !tracer.is_traceable() {
+                collected_tracers.push(*gc_info);
+            }
+        }
+        for tracer_ptr in collected_tracers {
+            let del = (&*trs)[&tracer_ptr];
+            dealloc(del.0, del.1);
+            trs.remove(&tracer_ptr);
+        }
+        let mut collected_objects = Vec::new();
         let mut objs = self.objs.lock().unwrap();
         for (gc_info, _) in &*objs {
             let obj = &(**gc_info);
@@ -631,6 +662,7 @@ impl LocalGarbageCollector {
             tracer.reset();
         }
         let mut fin = self.fin.lock().unwrap();
+        let clone_collected_objects = collected_objects.clone();
         for col in collected_objects {
             let del = (&*objs)[&col];
             let finilizer = (&*fin)[&col];
@@ -641,19 +673,21 @@ impl LocalGarbageCollector {
         }
     }
 
-    unsafe fn collect_all(&self) {
-        let mut collected_int_objects: Vec<*const dyn Trace> = Vec::new();
+    pub unsafe fn collect_all(&self) {
+        let mut collected_tracers: Vec<*const dyn Trace> = Vec::new();
         let mut trs = self.trs.write().unwrap();
         for (gc_info, _) in &*trs {
-            collected_int_objects.push(*gc_info);
+            collected_tracers.push(*gc_info);
         }
         let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
         let mut objs = self.objs.lock().unwrap();
         for (gc_info, _) in &*objs {
             collected_objects.push(*gc_info);
         }
-        for col in collected_int_objects {
-            self.remove_tracer(col);
+        for tracer_ptr in collected_tracers {
+            let del = (&*trs)[&tracer_ptr];
+            dealloc(del.0, del.1);
+            trs.remove(&tracer_ptr);
         }
         let mut fin = self.fin.lock().unwrap();
         for col in collected_objects {
@@ -669,7 +703,7 @@ impl LocalGarbageCollector {
 
 impl PartialEq for &LocalGarbageCollector {
     fn eq(&self, other: &Self) -> bool {
-        *self == *other
+        ((*self) as *const LocalGarbageCollector) == ((*other) as *const LocalGarbageCollector)
     }
 }
 
@@ -712,13 +746,11 @@ impl LocalStrategy {
     }
 
     pub fn start(&'static self) {
-        dbg!("LocalStrategy::start");
         self.is_active.store(true, Ordering::Release);
         self.join_handle.replace((&mut *(self.start_func.borrow_mut()))(self.gc.get(), &self.is_active));
     }
 
     pub fn stop(&self) {
-        dbg!("LocalStrategy::stop");
         self.is_active.store(false, Ordering::Release);
         if let Some(join_handle) = self.join_handle.borrow_mut().take() {
             join_handle.join().expect("LocalStrategy::stop, LocalStrategy Thread being joined has panicked !!");
@@ -729,6 +761,8 @@ impl LocalStrategy {
 
 impl Drop for LocalStrategy {
     fn drop(&mut self) {
+        self.is_active.store(false, Ordering::Release);
+        (&mut *(self.stop_func.borrow_mut()))(self.gc.get());
     }
 }
 

@@ -122,6 +122,9 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &input.sig;
     let vis = input.vis;
     let name = &input.sig.ident;
+    if name != "main" {
+        panic!("#[ferris_gc_main] is applied only for main function")
+    }
     let mut args = Vec::new();
     for arg in &input.sig.inputs {
         args.push(arg);
@@ -144,8 +147,8 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
         #(#attrs)*
         #vis fn #name (#(#args),*) #ret {
             // Should be added proper closing background threads
+            let cleanup = ApplicationCleanup;
             {
-               let cleanup = ApplicationCleanUp;
                 #body
             }
         }
