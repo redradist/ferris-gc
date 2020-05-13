@@ -64,7 +64,7 @@ pub fn basic_gc_strategy_start() {
                 }
                 if let Some(global_gc) = *(*BASIC_STRATEGY_GLOBAL_GC).read().unwrap() {
                     unsafe {
-                        global_gc.collect_all();
+                        global_gc.collect();
                     }
                 }
                 let local_gcs_read_guard = (*BASIC_STRATEGY_LOCAL_GCS).read().unwrap();

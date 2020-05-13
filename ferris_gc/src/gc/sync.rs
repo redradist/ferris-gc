@@ -1,18 +1,15 @@
-use core::time;
 use std::alloc::{alloc, dealloc, Layout};
 use std::mem::transmute;
-use std::borrow::BorrowMut;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
 use std::thread::JoinHandle;
 
 use crate::gc::{Finalize, Trace};
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 struct GcInfo {
     root_ref_count: AtomicUsize,
@@ -433,7 +430,7 @@ impl GlobalGarbageCollector {
         }
     }
 
-    pub fn get_objs(&self) -> &Mutex<HashMap<*const Trace, (*mut u8, Layout)>> {
+    pub fn get_objs(&self) -> &Mutex<HashMap<*const dyn Trace, (*mut u8, Layout)>> {
         &self.objs
     }
 

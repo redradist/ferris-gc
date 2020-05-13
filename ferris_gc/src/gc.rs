@@ -1,12 +1,10 @@
-use core::time;
 use std::alloc::{alloc, dealloc, Layout};
 use std::borrow::BorrowMut;
-use std::cell::{Cell, Ref, RefCell};
-use std::collections::{BinaryHeap, BTreeMap, BTreeSet, HashMap, HashSet, LinkedList, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{BinaryHeap, BTreeSet, HashMap, HashSet, LinkedList, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::thread::JoinHandle;
 
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_LOCAL_GCS};
@@ -28,7 +26,7 @@ impl ThinPtr for &dyn Trace {
 
 impl ThinPtr for *const dyn Trace {
     fn get_thin_ptr(&self) -> usize {
-        let fat_ptr = (*self);
+        let fat_ptr = *self;
         let (thin_ptr, _) = unsafe { transmute::<_, (*const (), *const ())>(fat_ptr) };
         thin_ptr as usize
     }
