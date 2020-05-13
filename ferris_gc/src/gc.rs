@@ -539,7 +539,7 @@ impl LocalGarbageCollector {
         }
     }
 
-    pub fn get_objs(&self) -> &Mutex<HashMap<*const Trace, (*mut u8, Layout)>> {
+    pub fn get_objs(&self) -> &Mutex<HashMap<*const dyn Trace, (*mut u8, Layout)>> {
         &self.objs
     }
 
@@ -636,7 +636,7 @@ impl LocalGarbageCollector {
             }
         }
         let mut collected_tracers = Vec::new();
-        for (gc_info, del) in &*trs {
+        for (gc_info, _) in &*trs {
             let tracer = &(**gc_info);
             if !tracer.is_traceable() {
                 collected_tracers.push(*gc_info);
@@ -660,7 +660,7 @@ impl LocalGarbageCollector {
             tracer.reset();
         }
         let mut fin = self.fin.lock().unwrap();
-        let clone_collected_objects = collected_objects.clone();
+        let _clone_collected_objects = collected_objects.clone();
         for col in collected_objects {
             let del = (&*objs)[&col];
             let finilizer = (&*fin)[&col];
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn one_object() {
-        let one = Gc::new(1);
+        let _one = Gc::new(1);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 1);
@@ -800,7 +800,7 @@ mod tests {
     #[test]
     fn gc_collect_one_from_one() {
         {
-            let one = Gc::new(1);
+            let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();

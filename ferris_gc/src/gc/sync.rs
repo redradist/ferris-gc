@@ -188,7 +188,7 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 impl<T> Gc<T> where T: Sized + Trace {
     pub fn new<'a>(t: T) -> Gc<T> {
         basic_gc_strategy_start();
-        let mut global_strategy = &(*GLOBAL_GC_STRATEGY);
+        let global_strategy = &(*GLOBAL_GC_STRATEGY);
         if !global_strategy.is_active() {
             global_strategy.start();
         }
@@ -343,7 +343,7 @@ impl<T> Deref for GcCell<T> where T: 'static + Sized + Trace {
 impl<T> GcCell<T> where T: 'static + Sized + Trace {
     pub fn new<'a>(t: T) -> GcCell<T> {
         basic_gc_strategy_start();
-        let mut global_strategy = &(*GLOBAL_GC_STRATEGY);
+        let global_strategy = &(*GLOBAL_GC_STRATEGY);
         if !global_strategy.is_active() {
             global_strategy.start();
         }
@@ -528,7 +528,7 @@ impl GlobalGarbageCollector {
             }
         }
         let mut collected_tracers = Vec::new();
-        for (gc_info, del) in &*trs {
+        for (gc_info, _) in &*trs {
             let tracer = &(**gc_info);
             if !tracer.is_traceable() {
                 collected_tracers.push(*gc_info);
@@ -552,7 +552,7 @@ impl GlobalGarbageCollector {
             tracer.reset();
         }
         let mut fin = self.fin.lock().unwrap();
-        let clone_collected_objects = collected_objects.clone();
+        let _clone_collected_objects = collected_objects.clone();
         for col in collected_objects {
             let del = (&*objs)[&col];
             let finilizer = (&*fin)[&col];
@@ -672,7 +672,7 @@ lazy_static! {
                 *basic_strategy_global_gc = Some(global_gc);
                 None
             },
-            move |global_gc| {
+            move |_global_gc| {
                 let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
                 *basic_strategy_global_gc = None;
             })
@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn one_object() {
-        let one = Gc::new(1);
+        let _one = Gc::new(1);
         unsafe { (*GLOBAL_GC).collect() };
         assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 1);
     }
@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn gc_collect_one_from_one() {
         {
-            let one = Gc::new(1);
+            let _one = Gc::new(1);
         }
         unsafe { (*GLOBAL_GC).collect() };
         assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 0);

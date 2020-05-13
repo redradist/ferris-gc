@@ -2,9 +2,9 @@ use std::sync::{RwLock, Once};
 use crate::gc::LocalGarbageCollector;
 use crate::gc::sync::GlobalGarbageCollector;
 use std::{thread, time};
-use std::sync::Arc;
+
 use std::thread::JoinHandle;
-use std::borrow::BorrowMut;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 lazy_static! {
@@ -29,7 +29,7 @@ impl Drop for ApplicationCleanup {
         let app_active = &(*APPLICATION_ACTIVE);
         app_active.store(false, Ordering::Release);
         let mut bthreads = (&*BACKGROUND_THREADS).write().unwrap();
-        while ((*bthreads).len() > 0) {
+        while (*bthreads).len() > 0 {
             let bthread = (*bthreads).pop().unwrap();
             bthread.join();
         }
