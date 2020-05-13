@@ -671,7 +671,7 @@ impl LocalGarbageCollector {
         }
     }
 
-    pub unsafe fn collect_all(&self) {
+    unsafe fn collect_all(&self) {
         let mut collected_tracers: Vec<*const dyn Trace> = Vec::new();
         let mut trs = self.trs.write().unwrap();
         for (gc_info, _) in &*trs {
