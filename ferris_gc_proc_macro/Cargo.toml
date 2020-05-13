@@ -1,6 +1,6 @@
 [package]
 name = "ferris-gc-proc-macro"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["redradist, redradist@gmail.com"]
 description = "Plugin for ferris-gc"
 license = "Apache-2.0/MIT"
