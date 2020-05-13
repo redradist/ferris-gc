@@ -71,7 +71,7 @@ pub fn basic_gc_strategy_start() {
                 let local_gcs = &(*local_gcs_read_guard);
                 unsafe {
                     for local_gc in local_gcs.into_iter() {
-                        local_gc.collect_all();
+                        local_gc.collect();
                     }
                 }
             })
