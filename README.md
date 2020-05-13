@@ -100,5 +100,5 @@ Lets try to understand step-by-step what is what here:
 To add dependencies you should add:
 ```toml
 [dependencies]
-ferris-gc = { version = "0.1.2", features = ["proc-macro"] }
+ferris-gc = { version = "0.1.3", features = ["proc-macro"] }
 ```
