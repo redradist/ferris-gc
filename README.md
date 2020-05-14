@@ -5,7 +5,7 @@ One of the main difference is a thread safe Garbage Collector implementation as 
 
 Here is the simple example of using FerrisGC:
 ```rust
-use ferris_gc::{Gc, Trace, Finalize, GcCell, ferris_gc_main, ApplicationCleanup};
+use ferris_gc::{Gc, Trace, Finalize, GcCell, ferris_gc_main, ApplicationCleanup, GcOpt};
 use ferris_gc::sync::Gc as GlobalGc;
 use ferris_gc::sync::GcCell as GlobalGcCell;
 use core::time;
@@ -50,6 +50,15 @@ struct MyStruct2 {
     jh: Gc<u32>,
 }
 
+#[derive(Trace, Finalize)]
+struct MyStructStd {
+    jh: GcOpt<u32>, // The same as Option<Gc<u32>>
+    jh2: Box<&'static str>,
+    jh3: Option<Box<&'static str>>,
+    jh4: GcOpt<Box<&'static str>>, // The same as Option<Gc<Box<&'static str>>>
+    jh5: Gc<Option<Box<&'static str>>>,
+}
+
 impl Drop for MyStruct2 {
     fn drop(&mut self) {
         println!("MyStruct in drop !!");
@@ -76,10 +85,14 @@ fn main() {
         let gc3 = Gc::new(MyStruct2 { jh: gc.clone() });
     }
     {
+        let gc1 = Gc::new(MyStruct { jh: 3 });
         let gc2 = GlobalGc::new(MyStruct { jh: 3 });
+        thread::spawn(move || {
+            println!("gc2.jh is {}", gc2.jh);
+        });
     }
     let gc3 = Gc::new(MyStruct { jh: 3 });
-    let ten_secs = time::Duration::from_secs(20);
+    let ten_secs = time::Duration::from_secs(5);
     thread::sleep(ten_secs);
     println!("Hello, GC World !!");
 }
@@ -100,5 +113,5 @@ Lets try to understand step-by-step what is what here:
 To add dependencies you should add:
 ```toml
 [dependencies]
-ferris-gc = { version = "0.1.3", features = ["proc-macro"] }
+ferris-gc = { version = "0.1.4", features = ["proc-macro"] }
 ```

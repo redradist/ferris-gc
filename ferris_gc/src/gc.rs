@@ -1,7 +1,7 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::borrow::BorrowMut;
 use std::cell::{Cell, RefCell};
-use std::collections::{BinaryHeap, BTreeSet, HashMap, HashSet, LinkedList, VecDeque};
+use std::collections::{BinaryHeap, BTreeSet, HashMap, BTreeMap, HashSet, LinkedList, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,80 +48,8 @@ pub trait Finalize {
     }
 }
 
-macro_rules! primitive_types {
-    ($($prm:ident),*) => {
-        $(
-            impl Trace for $prm {
-                fn is_root(&self) -> bool {
-                    unreachable!("is_root should never be called on primitive type !!");
-                }
-                fn reset_root(&self) {
-                }
-                fn trace(&self) {
-                }
-                fn reset(&self) {
-                }
-                fn is_traceable(&self) -> bool {
-                    unreachable!("is_traceable should never be called on primitive type !!");
-                }
-            }
-
-            impl Finalize for $prm {
-                fn finalize(&self) {
-                }
-            }
-        )*
-    };
-}
-
-primitive_types!(
-    u8, i8, u16, i16, u32, i32, u64, i64, u128, i128,
-    usize, isize,
-    f32, f64,
-    bool
-);
-
-macro_rules! std_types {
-    ($($std:ident<T>),*) => {
-        $(
-            impl<T> Trace for $std<T> where T: 'static + Sized + Trace {
-                fn is_root(&self) -> bool {
-                    unreachable!("is_root should never be called on primitive type !!");
-                }
-                fn reset_root(&self) {
-                    for child in self {
-                        child.reset_root();
-                    }
-                }
-                fn trace(&self) {
-                    for child in self {
-                        child.trace();
-                    }
-                }
-                fn reset(&self) {
-                    for child in self {
-                        child.reset();
-                    }
-                }
-                fn is_traceable(&self) -> bool {
-                    unreachable!("is_traceable should never be called on primitive type !!");
-                }
-            }
-
-            impl<T> Finalize for $std<T> where T: 'static + Sized + Trace {
-                fn finalize(&self) {
-                }
-            }
-        )*
-    };
-}
-
-std_types!(
-    Vec<T>, VecDeque<T>, LinkedList<T>,
-    HashSet<T>, BTreeSet<T>, BinaryHeap<T>
-);
-
-// , HashMap<T>, BTreeMap<T>
+pub type GcOpt<T> = Option<Gc<T>>;
+pub type GcCellOpt<T> = Option<Gc<T>>;
 
 struct GcInfo {
     has_root: Cell<bool>,

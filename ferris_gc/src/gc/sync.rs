@@ -11,6 +11,9 @@ use crate::gc::{Finalize, Trace};
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
 use std::hash::Hasher;
 
+pub type GcOpt<T> = Option<Gc<T>>;
+pub type GcCellOpt<T> = Option<Gc<T>>;
+
 struct GcInfo {
     root_ref_count: AtomicUsize,
 }
