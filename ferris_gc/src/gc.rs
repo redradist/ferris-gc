@@ -48,8 +48,8 @@ pub trait Finalize {
     }
 }
 
-pub type GcOpt<T> = Option<Gc<T>>;
-pub type GcCellOpt<T> = Option<Gc<T>>;
+pub type OptGc<T> = Option<Gc<T>>;
+pub type OptGcCell<T> = Option<Gc<T>>;
 
 struct GcInfo {
     has_root: Cell<bool>,
