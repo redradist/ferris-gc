@@ -52,13 +52,13 @@ pub type OptGc<T> = Option<Gc<T>>;
 pub type OptGcCell<T> = Option<Gc<T>>;
 
 struct GcInfo {
-    has_root: Cell<bool>,
+    has_root: AtomicBool,
 }
 
 impl GcInfo {
     fn new() -> GcInfo {
         GcInfo {
-            has_root: Cell::new(false),
+            has_root: AtomicBool::new(false),
         }
     }
 }
@@ -101,17 +101,17 @@ impl<T> Trace for GcPtr<T> where T: Sized + Trace {
     }
 
     fn trace(&self) {
-        self.info.has_root.set(true);
+        self.info.has_root.store(true, Ordering::Release);
         self.t.trace();
     }
 
     fn reset(&self) {
-        self.info.has_root.set(false);
+        self.info.has_root.store(false, Ordering::Release);
         self.t.reset();
     }
 
     fn is_traceable(&self) -> bool {
-        self.info.has_root.get()
+        self.info.has_root.load(Ordering::Acquire)
     }
 }
 
@@ -125,17 +125,17 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
     }
 
     fn trace(&self) {
-        self.borrow().info.has_root.set(true);
+        self.borrow().info.has_root.store(true, Ordering::Release);
         self.borrow().t.trace();
     }
 
     fn reset(&self) {
-        self.borrow().info.has_root.set(false);
+        self.borrow().info.has_root.store(false, Ordering::Release);
         self.borrow().t.reset();
     }
 
     fn is_traceable(&self) -> bool {
-        self.borrow().info.has_root.get()
+        self.borrow().info.has_root.load(Ordering::Acquire)
     }
 }
 
@@ -148,14 +148,14 @@ impl<T> Finalize for GcPtr<T> where T: Sized + Trace {
 }
 
 pub struct GcInternal<T> where T: 'static + Sized + Trace {
-    is_root: Cell<bool>,
+    is_root: AtomicBool,
     ptr: *const GcPtr<T>,
 }
 
 impl<T> GcInternal<T> where T: 'static + Sized + Trace {
     fn new(ptr: *const GcPtr<T>) -> GcInternal<T> {
         GcInternal {
-            is_root: Cell::new(true),
+            is_root: AtomicBool::new(true),
             ptr: ptr,
         }
     }
@@ -163,12 +163,12 @@ impl<T> GcInternal<T> where T: 'static + Sized + Trace {
 
 impl<T> Trace for GcInternal<T> where T: Sized + Trace {
     fn is_root(&self) -> bool {
-        self.is_root.get()
+        self.is_root.load(Ordering::Acquire)
     }
 
     fn reset_root(&self) {
-        if self.is_root.get() {
-            self.is_root.set(false);
+        if self.is_root.load(Ordering::Acquire) {
+            self.is_root.store(false, Ordering::Release);
             unsafe {
                 (*self.ptr).reset_root();
             }
@@ -287,14 +287,14 @@ impl<T> Finalize for Gc<T> where T: Sized + Trace {
 }
 
 pub struct GcRefCellInternal<T> where T: 'static + Sized + Trace {
-    is_root: Cell<bool>,
+    is_root: AtomicBool,
     ptr: *const RefCell<GcPtr<T>>,
 }
 
 impl<T> GcRefCellInternal<T> where T: 'static + Sized + Trace {
     fn new(ptr: *const RefCell<GcPtr<T>>) -> GcRefCellInternal<T> {
         GcRefCellInternal {
-            is_root: Cell::new(true),
+            is_root: AtomicBool::new(true),
             ptr: ptr,
         }
     }
@@ -302,12 +302,12 @@ impl<T> GcRefCellInternal<T> where T: 'static + Sized + Trace {
 
 impl<T> Trace for GcRefCellInternal<T> where T: Sized + Trace {
     fn is_root(&self) -> bool {
-        self.is_root.get()
+        self.is_root.load(Ordering::Acquire)
     }
 
     fn reset_root(&self) {
-        if self.is_root.get() {
-            self.is_root.set(false);
+        if self.is_root.load(Ordering::Acquire) {
+            self.is_root.store(false, Ordering::Release);
             unsafe {
                 (*self.ptr).borrow().reset_root();
             }
@@ -382,7 +382,7 @@ impl<T> Clone for GcRefCell<T> where T: 'static + Sized + Trace {
         });
         unsafe {
             (*gc.internal_ptr).ptr = (*self.internal_ptr).ptr;
-            (*gc.internal_ptr).is_root.set(true);
+            (*gc.internal_ptr).is_root.store(true, Ordering::Release);
         }
         gc
     }
@@ -772,6 +772,24 @@ mod tests {
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
+        });
+    }
+
+    #[test]
+    fn collect_from_another_thread() {
+        // Verifies that collect() can safely be called from a different thread
+        // (background GC strategy does this). This would be UB with Cell<bool>.
+        let _one = Gc::new(42);
+        LOCAL_GC.with(|gc| {
+            let gc_ptr = gc.as_ptr();
+            // Safety: LocalGarbageCollector is Sync (uses atomics now)
+            let gc_ref = unsafe { &*gc_ptr };
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    unsafe { gc_ref.collect(); }
+                });
+            });
+            assert_eq!(gc.borrow().trs.read().unwrap().len(), 1);
         });
     }
 }
