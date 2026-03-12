@@ -252,21 +252,21 @@ impl<T> Finalize for Gc<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
-pub struct GcCellInternal<T> where T: 'static + Sized + Trace {
+pub struct GcRefCellInternal<T> where T: 'static + Sized + Trace {
     is_root: AtomicBool,
     ptr: *const RefCell<GcPtr<T>>,
 }
 
-impl<T> GcCellInternal<T> where T: 'static + Sized + Trace {
-    fn new(ptr: *const RefCell<GcPtr<T>>) -> GcCellInternal<T> {
-        GcCellInternal {
+impl<T> GcRefCellInternal<T> where T: 'static + Sized + Trace {
+    fn new(ptr: *const RefCell<GcPtr<T>>) -> GcRefCellInternal<T> {
+        GcRefCellInternal {
             is_root: AtomicBool::new(true),
             ptr: ptr,
         }
     }
 }
 
-impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
+impl<T> Trace for GcRefCellInternal<T> where T: Sized + Trace {
     fn is_root(&self) -> bool {
         self.is_root.load(Ordering::Acquire)
     }
@@ -299,12 +299,12 @@ impl<T> Trace for GcCellInternal<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalize for GcCellInternal<T> where T: Sized + Trace {
+impl<T> Finalize for GcRefCellInternal<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
 pub struct GcRefCell<T> where T: 'static + Sized + Trace {
-    internal_ptr: *mut GcCellInternal<T>,
+    internal_ptr: *mut GcRefCellInternal<T>,
     ptr: *const RefCell<GcPtr<T>>,
 }
 
@@ -462,9 +462,9 @@ impl GlobalGarbageCollector {
     unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T> where T: Sized + Trace {
         unsafe {
             let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<RefCell<GcPtr<T>>>();
-            let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcCellInternal<T>>();
+            let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcRefCellInternal<T>>();
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
-            std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr));
+            std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
             let gc = GcRefCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
@@ -486,8 +486,8 @@ impl GlobalGarbageCollector {
 
     unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T> where T: Sized + Trace {
         unsafe {
-            let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcCellInternal<T>>();
-            std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr));
+            let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcRefCellInternal<T>>();
+            std::ptr::write(gc_inter_ptr, GcRefCellInternal::new(gc.ptr));
             let gc = GcRefCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
