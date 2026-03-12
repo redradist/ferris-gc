@@ -190,10 +190,7 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 impl<T> Gc<T> where T: Sized + Trace {
     pub fn new(t: T) -> Gc<T> {
         basic_gc_strategy_start();
-        let global_strategy = &(*GLOBAL_GC_STRATEGY);
-        if !global_strategy.is_active() {
-            global_strategy.start();
-        }
+        GLOBAL_GC_STRATEGY.ensure_started();
         unsafe {
             (*GLOBAL_GC).create_gc(t)
         }
@@ -332,10 +329,7 @@ impl<T> Deref for GcRefCell<T> where T: 'static + Sized + Trace {
 impl<T> GcRefCell<T> where T: 'static + Sized + Trace {
     pub fn new(t: T) -> GcRefCell<T> {
         basic_gc_strategy_start();
-        let global_strategy = &(*GLOBAL_GC_STRATEGY);
-        if !global_strategy.is_active() {
-            global_strategy.start();
-        }
+        GLOBAL_GC_STRATEGY.ensure_started();
         unsafe {
             (*GLOBAL_GC).create_gc_cell(t)
         }
@@ -666,6 +660,15 @@ impl GlobalStrategy {
 
     pub fn is_active(&self) -> bool {
         self.is_active.load(Ordering::Acquire)
+    }
+
+    /// Atomically check if inactive and start. Safe to call from multiple threads.
+    pub fn ensure_started(&'static self) {
+        if self.is_active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            let mut start_func = self.start_func.lock().unwrap();
+            let mut join_handle = self.join_handle.lock().unwrap();
+            *join_handle = (&mut *(start_func))(self.gc.get(), &self.is_active);
+        }
     }
 
     pub fn start(&'static self) {
