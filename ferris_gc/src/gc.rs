@@ -748,85 +748,109 @@ mod tests {
     use crate::{Trace, Finalize};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Clean residual state from previous tests that may have run on this thread.
+    fn clean_gc_state() {
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow_mut().collect();
+        });
+    }
+
     #[test]
     fn one_object() {
+        clean_gc_state();
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
         let _one = Gc::new(1);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 1);
+            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 1);
         });
     }
 
     #[test]
     fn gc_collect_one_from_one() {
+        clean_gc_state();
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
         {
             let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
+            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 0);
         });
     }
 
     #[test]
-    fn two_objects() {
+    fn two_objects_reassign() {
+        // Reassigning drops the old Gc (remove_tracer removes it from trs),
+        // so only 1 tracer remains for the surviving Gc.
+        clean_gc_state();
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| {
-            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 2);
+            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 1);
         });
+        drop(one);
     }
 
     #[test]
-    fn gc_collect_one_from_two() {
+    fn gc_collect_after_reassign() {
+        // After reassign, one live Gc remains. collect() keeps live objects.
+        clean_gc_state();
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
+            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 1);
         });
+        drop(one);
     }
 
     #[test]
     fn gc_collect_two_from_two() {
+        clean_gc_state();
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
         {
             let mut one = Gc::new(1);
             one = Gc::new(2);
+            drop(one);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
+            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 0);
         });
     }
 
     #[test]
     fn mem_to_trc_cleaned_on_collect() {
-        // mem_to_trc must be cleaned when tracers are collected
+        clean_gc_state();
+        let baseline_trs = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
+        let baseline_m2t = LOCAL_GC.with(|gc| gc.borrow().mem_to_trc.read().unwrap().len());
         {
             let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
-            assert_eq!(gc.borrow_mut().mem_to_trc.read().unwrap().len(), 0);
+            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline_trs, 0);
+            assert_eq!(gc.borrow().mem_to_trc.read().unwrap().len() - baseline_m2t, 0);
         });
     }
 
     #[test]
     fn collect_from_another_thread() {
-        // Verifies that collect() can safely be called from a different thread
-        // (background GC strategy does this). This would be UB with Cell<bool>.
+        clean_gc_state();
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
         let _one = Gc::new(42);
         LOCAL_GC.with(|gc| {
             let gc_ptr = gc.as_ptr();
-            // Safety: LocalGarbageCollector is Sync (uses atomics now)
             let gc_ref = unsafe { &*gc_ptr };
             std::thread::scope(|s| {
                 s.spawn(|| {
                     unsafe { gc_ref.collect(); }
                 });
             });
-            assert_eq!(gc.borrow().trs.read().unwrap().len(), 1);
+            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 1);
         });
     }
 
@@ -856,8 +880,7 @@ mod tests {
 
     #[test]
     fn collect_calls_drop_on_gc_objects() {
-        // Verifies that collect() calls drop_in_place on collected GcPtr objects,
-        // so that inner types with Drop impls have their resources freed.
+        clean_gc_state();
         DROP_COUNT.store(0, Ordering::SeqCst);
         {
             let _obj = Gc::new(DropCounter { _value: String::from("hello") });
@@ -870,16 +893,15 @@ mod tests {
 
     #[test]
     fn clone_from_registers_with_gc() {
-        // Verifies that clone_from goes through GC registration (not raw ptr copy).
-        // After clone_from + drop of original, GC should track 2 tracers (clone + source).
+        clean_gc_state();
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
         let source = Gc::new(42);
         let mut target = Gc::new(99);
         target.clone_from(&source);
-        // target now points to same GcPtr as source; both should be tracked
         LOCAL_GC.with(|gc| {
-            let trs_len = gc.borrow().trs.read().unwrap().len();
-            // clone_from creates a new GcInternal tracer, so we should have at least 2
-            assert!(trs_len >= 2, "clone_from should register new tracer with GC, got {trs_len}");
+            let delta = gc.borrow().trs.read().unwrap().len() - baseline;
+            // source + target + the new clone's tracer = at least 2 alive
+            assert!(delta >= 2, "clone_from should register new tracer with GC, got {delta}");
         });
     }
 }

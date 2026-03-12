@@ -715,46 +715,68 @@ lazy_static! {
 #[cfg(test)]
 mod tests {
     use crate::gc::sync::{Gc, GLOBAL_GC};
+    use std::sync::Mutex;
+
+    // Serialize sync GC tests since they share GLOBAL_GC.
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Clean residual state and return baseline trs count.
+    fn setup() -> (std::sync::MutexGuard<'static, ()>, usize) {
+        let guard = TEST_MUTEX.lock().unwrap();
+        unsafe { (*GLOBAL_GC).collect() };
+        let baseline = (*GLOBAL_GC).trs.read().unwrap().len();
+        (guard, baseline)
+    }
 
     #[test]
     fn one_object() {
+        let (_guard, baseline) = setup();
         let _one = Gc::new(1);
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 1);
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 1);
     }
 
     #[test]
     fn gc_collect_one_from_one() {
+        let (_guard, baseline) = setup();
         {
             let _one = Gc::new(1);
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 0);
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 0);
     }
 
     #[test]
-    fn two_objects() {
+    fn two_objects_reassign() {
+        let (_guard, baseline) = setup();
         let mut one = Gc::new(1);
         one = Gc::new(2);
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 2);
+        // Reassignment drops old Gc (remove_tracer), so only 1 tracer remains
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 1);
+        drop(one);
     }
 
     #[test]
-    fn gc_collect_one_from_two() {
+    fn gc_collect_after_reassign() {
+        let (_guard, baseline) = setup();
         let mut one = Gc::new(1);
         one = Gc::new(2);
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 0);
+        // one is still live, so 1 tracer remains
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 1);
+        drop(one);
     }
 
     #[test]
     fn gc_collect_two_from_two() {
+        let (_guard, baseline) = setup();
         {
             let mut one = Gc::new(1);
             one = Gc::new(2);
+            drop(one);
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len(), 0);
+        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 0);
     }
 }
