@@ -541,6 +541,9 @@ impl LocalGarbageCollector {
         unsafe {
             let layout = Layout::new::<T>();
             let mem = alloc(layout);
+            if mem.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
             let type_ptr: *mut T = mem as *mut _;
             (type_ptr, (mem, layout))
         }
