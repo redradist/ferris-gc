@@ -528,6 +528,7 @@ impl GlobalGarbageCollector {
 
     pub unsafe fn collect(&self) {
         unsafe {
+            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
             let mut trs = self.trs.write().unwrap();
             for (gc_info, _) in &*trs {
                 let tracer = &(**gc_info);
@@ -544,6 +545,8 @@ impl GlobalGarbageCollector {
             }
             for tracer_ptr in collected_tracers {
                 let del = (&*trs)[&tracer_ptr];
+                let (thin_ptr, _) = transmute::<_, (*const (), *const ())>(tracer_ptr);
+                mem_to_trc.remove(&(thin_ptr as usize));
                 dealloc(del.0, del.1);
                 trs.remove(&tracer_ptr);
             }
@@ -574,6 +577,7 @@ impl GlobalGarbageCollector {
 
     unsafe fn collect_all(&self) {
         unsafe {
+            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
             let mut collected_tracers: Vec<*const dyn Trace> = Vec::new();
             let mut trs = self.trs.write().unwrap();
             for (gc_info, _) in &*trs {
@@ -586,6 +590,8 @@ impl GlobalGarbageCollector {
             }
             for tracer_ptr in collected_tracers {
                 let del = (&*trs)[&tracer_ptr];
+                let (thin_ptr, _) = transmute::<_, (*const (), *const ())>(tracer_ptr);
+                mem_to_trc.remove(&(thin_ptr as usize));
                 dealloc(del.0, del.1);
                 trs.remove(&tracer_ptr);
             }

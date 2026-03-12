@@ -561,6 +561,7 @@ impl LocalGarbageCollector {
 
     pub unsafe fn collect(&self) {
         unsafe {
+            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
             let mut trs = self.trs.write().unwrap();
             for (gc_info, _) in &*trs {
                 let tracer = &(**gc_info);
@@ -577,6 +578,7 @@ impl LocalGarbageCollector {
             }
             for tracer_ptr in collected_tracers {
                 let del = (&*trs)[&tracer_ptr];
+                mem_to_trc.remove(&tracer_ptr.get_thin_ptr());
                 dealloc(del.0, del.1);
                 trs.remove(&tracer_ptr);
             }
@@ -607,6 +609,7 @@ impl LocalGarbageCollector {
 
     unsafe fn collect_all(&self) {
         unsafe {
+            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
             let mut collected_tracers: Vec<*const dyn Trace> = Vec::new();
             let mut trs = self.trs.write().unwrap();
             for (gc_info, _) in &*trs {
@@ -619,6 +622,7 @@ impl LocalGarbageCollector {
             }
             for tracer_ptr in collected_tracers {
                 let del = (&*trs)[&tracer_ptr];
+                mem_to_trc.remove(&tracer_ptr.get_thin_ptr());
                 dealloc(del.0, del.1);
                 trs.remove(&tracer_ptr);
             }
@@ -772,6 +776,19 @@ mod tests {
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
+        });
+    }
+
+    #[test]
+    fn mem_to_trc_cleaned_on_collect() {
+        // mem_to_trc must be cleaned when tracers are collected
+        {
+            let _one = Gc::new(1);
+        }
+        LOCAL_GC.with(move |gc| unsafe {
+            gc.borrow_mut().collect();
+            assert_eq!(gc.borrow_mut().trs.read().unwrap().len(), 0);
+            assert_eq!(gc.borrow_mut().mem_to_trc.read().unwrap().len(), 0);
         });
     }
 
