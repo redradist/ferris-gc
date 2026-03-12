@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_LOCAL_GCS};
@@ -46,13 +46,13 @@ pub type OptGc<T> = Option<Gc<T>>;
 pub type OptGcCell<T> = Option<GcRefCell<T>>;
 
 struct GcInfo {
-    has_root: AtomicBool,
+    root_ref_count: AtomicUsize,
 }
 
 impl GcInfo {
     fn new() -> GcInfo {
         GcInfo {
-            has_root: AtomicBool::new(false),
+            root_ref_count: AtomicUsize::new(0),
         }
     }
 }
@@ -95,23 +95,23 @@ impl<T> Trace for GcPtr<T> where T: Sized + Trace {
     }
 
     fn trace(&self) {
-        // Guard: skip if already traced (breaks cycles)
-        if !self.info.has_root.load(Ordering::Acquire) {
-            self.info.has_root.store(true, Ordering::Release);
+        // Guard: only recurse into children on first trace (breaks cycles)
+        let prev = self.info.root_ref_count.fetch_add(1, Ordering::AcqRel);
+        if prev == 0 {
             self.t.trace();
         }
     }
 
     fn reset(&self) {
-        // Guard: skip if already reset (breaks cycles)
-        if self.info.has_root.load(Ordering::Acquire) {
-            self.info.has_root.store(false, Ordering::Release);
+        // Guard: only recurse into children on last reset (breaks cycles)
+        let prev = self.info.root_ref_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
             self.t.reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        self.info.has_root.load(Ordering::Acquire)
+        self.info.root_ref_count.load(Ordering::Acquire) > 0
     }
 }
 
@@ -125,21 +125,21 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
     }
 
     fn trace(&self) {
-        if !self.borrow().info.has_root.load(Ordering::Acquire) {
-            self.borrow().info.has_root.store(true, Ordering::Release);
+        let prev = self.borrow().info.root_ref_count.fetch_add(1, Ordering::AcqRel);
+        if prev == 0 {
             self.borrow().t.trace();
         }
     }
 
     fn reset(&self) {
-        if self.borrow().info.has_root.load(Ordering::Acquire) {
-            self.borrow().info.has_root.store(false, Ordering::Release);
+        let prev = self.borrow().info.root_ref_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
             self.borrow().t.reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        self.borrow().info.has_root.load(Ordering::Acquire)
+        self.borrow().info.root_ref_count.load(Ordering::Acquire) > 0
     }
 }
 
