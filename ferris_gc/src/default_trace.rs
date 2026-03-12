@@ -132,17 +132,17 @@ macro_rules! collection_types {
                     unreachable!("is_root should never be called on primitive type !!");
                 }
                 fn reset_root(&self) {
-                    for (key, child) in self {
+                    for (_key, child) in self {
                         child.reset_root();
                     }
                 }
                 fn trace(&self) {
-                    for (key, child) in self {
+                    for (_key, child) in self {
                         child.trace();
                     }
                 }
                 fn reset(&self) {
-                    for (key, child) in self {
+                    for (_key, child) in self {
                         child.reset();
                     }
                 }
@@ -153,7 +153,7 @@ macro_rules! collection_types {
 
             impl<K, T> Finalize for $std<K, T> where T: 'static + Sized + Trace {
                 fn finalize(&self) {
-                    for (key, child) in self {
+                    for (_key, child) in self {
                         child.finalize();
                     }
                 }

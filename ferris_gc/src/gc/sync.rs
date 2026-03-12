@@ -8,10 +8,9 @@ use std::thread::JoinHandle;
 
 use crate::gc::{Finalize, Trace};
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
-use std::hash::Hasher;
 
 pub type OptGc<T> = Option<Gc<T>>;
-pub type OptGcCell<T> = Option<Gc<T>>;
+pub type OptGcCell<T> = Option<GcRefCell<T>>;
 
 struct GcInfo {
     root_ref_count: AtomicUsize,
@@ -189,7 +188,7 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 }
 
 impl<T> Gc<T> where T: Sized + Trace {
-    pub fn new<'a>(t: T) -> Gc<T> {
+    pub fn new(t: T) -> Gc<T> {
         basic_gc_strategy_start();
         let global_strategy = &(*GLOBAL_GC_STRATEGY);
         if !global_strategy.is_active() {
@@ -331,7 +330,7 @@ impl<T> Deref for GcRefCell<T> where T: 'static + Sized + Trace {
 }
 
 impl<T> GcRefCell<T> where T: 'static + Sized + Trace {
-    pub fn new<'a>(t: T) -> GcRefCell<T> {
+    pub fn new(t: T) -> GcRefCell<T> {
         basic_gc_strategy_start();
         let global_strategy = &(*GLOBAL_GC_STRATEGY);
         if !global_strategy.is_active() {
@@ -345,16 +344,10 @@ impl<T> GcRefCell<T> where T: 'static + Sized + Trace {
 
 impl<T> Clone for GcRefCell<T> where T: 'static + Sized + Trace {
     fn clone(&self) -> Self {
-        let gc = unsafe {
-            (*GLOBAL_GC).clone_from_gc_cell(self)
-        };
         unsafe {
-            (*gc.internal_ptr).ptr = (*self.internal_ptr).ptr;
-            (*gc.internal_ptr).is_root.store(true, Ordering::Release);
+            (*GLOBAL_GC).clone_from_gc_cell(self)
         }
-        gc
     }
-
 }
 
 impl<T> Trace for GcRefCell<T> where T: Sized + Trace {
@@ -596,6 +589,7 @@ impl GlobalGarbageCollector {
         }
     }
 
+    #[allow(dead_code)]
     unsafe fn collect_all(&self) {
         unsafe {
             let (tracer_deallocs, object_deallocs) = {
@@ -754,6 +748,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_assignments)]
     fn two_objects_reassign() {
         let (_guard, baseline) = setup();
         let mut one = Gc::new(1);
@@ -765,6 +760,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_assignments)]
     fn gc_collect_after_reassign() {
         let (_guard, baseline) = setup();
         let mut one = Gc::new(1);
@@ -776,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_assignments)]
     fn gc_collect_two_from_two() {
         let (_guard, baseline) = setup();
         {

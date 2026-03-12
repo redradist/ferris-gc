@@ -31,7 +31,7 @@ impl Drop for ApplicationCleanup {
         let mut bthreads = (&*BACKGROUND_THREADS).write().unwrap();
         while (*bthreads).len() > 0 {
             let bthread = (*bthreads).pop().unwrap();
-            bthread.join();
+            let _ = bthread.join();
         }
     }
 }

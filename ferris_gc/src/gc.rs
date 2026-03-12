@@ -1,7 +1,6 @@
 use std::alloc::{alloc, dealloc, Layout};
-use std::borrow::BorrowMut;
 use std::cell::{Cell, RefCell};
-use std::collections::{BinaryHeap, BTreeSet, HashMap, BTreeMap, HashSet, LinkedList, VecDeque};
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +43,7 @@ pub trait Finalize {
 }
 
 pub type OptGc<T> = Option<Gc<T>>;
-pub type OptGcCell<T> = Option<Gc<T>>;
+pub type OptGcCell<T> = Option<GcRefCell<T>>;
 
 struct GcInfo {
     has_root: AtomicBool,
@@ -219,7 +218,7 @@ impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
 }
 
 impl<T> Gc<T> where T: Sized + Trace {
-    pub fn new<'a>(t: T) -> Gc<T> {
+    pub fn new(t: T) -> Gc<T> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
@@ -360,9 +359,9 @@ impl<T> Deref for GcRefCell<T> where T: 'static + Sized + Trace {
 }
 
 impl<T> GcRefCell<T> where T: 'static + Sized + Trace {
-    pub fn new<'a>(t: T) -> GcRefCell<T> {
+    pub fn new(t: T) -> GcRefCell<T> {
         basic_gc_strategy_start();
-        LOCAL_GC_STRATEGY.with(|strategy| unsafe {
+        LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 let strategy = unsafe { &mut *strategy.as_ptr() };
                 strategy.start();
@@ -376,16 +375,10 @@ impl<T> GcRefCell<T> where T: 'static + Sized + Trace {
 
 impl<T> Clone for GcRefCell<T> where T: 'static + Sized + Trace {
     fn clone(&self) -> Self {
-        let gc = LOCAL_GC.with(move |gc| unsafe {
+        LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().clone_from_gc_cell(self)
-        });
-        unsafe {
-            (*gc.internal_ptr).ptr = (*self.internal_ptr).ptr;
-            (*gc.internal_ptr).is_root.store(true, Ordering::Release);
-        }
-        gc
+        })
     }
-
 }
 
 impl<T> Trace for GcRefCell<T> where T: Sized + Trace {
@@ -627,6 +620,7 @@ impl LocalGarbageCollector {
         }
     }
 
+    #[allow(dead_code)]
     unsafe fn collect_all(&self) {
         unsafe {
             let (tracer_deallocs, object_deallocs) = {
@@ -698,8 +692,8 @@ impl LocalStrategy {
         if self.is_active() {
             self.stop();
         }
-        self.start_func.replace(Box::new(start_fn));
-        self.stop_func.replace(Box::new(stop_fn));
+        let _ = self.start_func.replace(Box::new(start_fn));
+        let _ = self.stop_func.replace(Box::new(stop_fn));
     }
 
     pub fn is_active(&self) -> bool {
@@ -785,6 +779,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_assignments)]
     fn two_objects_reassign() {
         // Reassigning drops the old Gc (remove_tracer removes it from trs),
         // so only 1 tracer remains for the surviving Gc.
@@ -799,6 +794,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_assignments)]
     fn gc_collect_after_reassign() {
         // After reassign, one live Gc remains. collect() keeps live objects.
         clean_gc_state();
@@ -813,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unused_assignments)]
     fn gc_collect_two_from_two() {
         clean_gc_state();
         let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());

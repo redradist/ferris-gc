@@ -1,7 +1,6 @@
 use proc_macro::TokenStream;
-use std::borrow::{Borrow, BorrowMut};
 use quote::quote;
-use syn::{ReturnType, Type, Data, Fields};
+use syn::{ReturnType, Data, Fields};
 
 #[proc_macro_derive(Trace, attributes(unsafe_ignore_trace))]
 pub fn derive_trace(item: TokenStream) -> TokenStream {
@@ -84,10 +83,10 @@ pub fn derive_trace(item: TokenStream) -> TokenStream {
                 },
             }
         },
-        Data::Enum(data_enum) => {
+        Data::Enum(_data_enum) => {
             panic!("Enum type is not supported !!");
         },
-        Data::Union(data_union) => {
+        Data::Union(_data_union) => {
             panic!("Union type is not supported !!");
         },
     };
@@ -117,9 +116,9 @@ pub fn derive_finalize(item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemFn);
-    let attr_args = syn::parse_macro_input!(attrs as syn::AttributeArgs);
+    let _attr_args = syn::parse_macro_input!(attrs as syn::AttributeArgs);
 
-    let sig = &input.sig;
+    let _sig = &input.sig;
     let vis = input.vis;
     let name = &input.sig.ident;
     if name != "main" {
@@ -134,7 +133,7 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
             }
         },
-        ReturnType::Type(arrow, box_type) => {
+        ReturnType::Type(_arrow, box_type) => {
             quote! {
                 -> #box_type
             }
