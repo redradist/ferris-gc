@@ -432,11 +432,14 @@ impl<T> Finalize for GcRefCell<T> where T: Sized + Trace {
 
 type GcObjMem = *mut u8;
 
+type DropFn = unsafe fn(*mut u8);
+
 pub struct LocalGarbageCollector {
     mem_to_trc: RwLock<HashMap<usize, *const dyn Trace>>,
     trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalize>>,
+    drop_fns: Mutex<HashMap<*const dyn Trace, DropFn>>,
 }
 
 unsafe impl Sync for LocalGarbageCollector {}
@@ -449,6 +452,7 @@ impl LocalGarbageCollector {
             trs: RwLock::new(HashMap::new()),
             objs: Mutex::new(HashMap::new()),
             fin: Mutex::new(HashMap::new()),
+            drop_fns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -476,6 +480,8 @@ impl LocalGarbageCollector {
             trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             objs.insert(gc_ptr, mem_info_gc_ptr);
             fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
+            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut GcPtr<T>); } }
+            self.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_ptr::<T>);
             gc
         }
     }
@@ -516,6 +522,8 @@ impl LocalGarbageCollector {
             trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
             objs.insert(gc_ptr, mem_info_gc_ptr);
             fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
+            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>); } }
+            self.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_cell_ptr::<T>);
             gc
         }
     }
@@ -553,87 +561,108 @@ impl LocalGarbageCollector {
         unsafe {
             let mut mem_to_trc = self.mem_to_trc.write().unwrap();
             let mut trs = self.trs.write().unwrap();
-            let tracer = &mem_to_trc.remove(&(tracer.get_thin_ptr())).unwrap();
-            let del = trs.remove(&tracer).unwrap();
-            dealloc(del.0, del.1);
+            if let Some(tracer) = mem_to_trc.remove(&(tracer.get_thin_ptr())) {
+                if let Some(del) = trs.remove(&tracer) {
+                    dealloc(del.0, del.1);
+                }
+            }
         }
     }
 
     pub unsafe fn collect(&self) {
         unsafe {
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
-            for (gc_info, _) in &*trs {
-                let tracer = &(**gc_info);
-                if tracer.is_root() {
-                    tracer.trace();
+            // Phase 1-5: under locks, identify what to collect
+            let (tracer_deallocs, object_deallocs) = {
+                let mut mem_to_trc = self.mem_to_trc.write().unwrap();
+                let mut trs = self.trs.write().unwrap();
+                // Trace from roots
+                for (gc_info, _) in &*trs {
+                    let tracer = &(**gc_info);
+                    if tracer.is_root() {
+                        tracer.trace();
+                    }
                 }
-            }
-            let mut collected_tracers = Vec::new();
-            for (gc_info, _) in &*trs {
-                let tracer = &(**gc_info);
-                if !tracer.is_traceable() {
-                    collected_tracers.push(*gc_info);
+                // Identify unreachable tracers
+                let collected_tracers: Vec<_> = trs.iter()
+                    .filter(|(gc_info, _)| !(&***gc_info).is_traceable())
+                    .map(|(k, _)| *k)
+                    .collect();
+                // Remove collected tracers from maps, gather dealloc info
+                let mut tracer_deallocs = Vec::new();
+                for tracer_ptr in collected_tracers {
+                    let del = trs.remove(&tracer_ptr).unwrap();
+                    mem_to_trc.remove(&tracer_ptr.get_thin_ptr());
+                    tracer_deallocs.push(del);
                 }
-            }
-            for tracer_ptr in collected_tracers {
-                let del = (&*trs)[&tracer_ptr];
-                mem_to_trc.remove(&tracer_ptr.get_thin_ptr());
-                dealloc(del.0, del.1);
-                trs.remove(&tracer_ptr);
-            }
-            let mut collected_objects = Vec::new();
-            let mut objs = self.objs.lock().unwrap();
-            for (gc_info, _) in &*objs {
-                let obj = &(**gc_info);
-                if !obj.is_traceable() {
-                    collected_objects.push(*gc_info);
+                // Identify unreachable objects
+                let mut objs = self.objs.lock().unwrap();
+                let collected_objects: Vec<_> = objs.iter()
+                    .filter(|(gc_info, _)| !(&***gc_info).is_traceable())
+                    .map(|(k, _)| *k)
+                    .collect();
+                // Reset remaining tracers
+                for (gc_info, _) in &*trs {
+                    let tracer = &(**gc_info);
+                    tracer.reset();
                 }
+                // Remove collected objects from maps, gather dealloc info
+                let mut fin = self.fin.lock().unwrap();
+                let mut drop_fns = self.drop_fns.lock().unwrap();
+                let mut object_deallocs = Vec::new();
+                for col in collected_objects {
+                    let del = objs.remove(&col).unwrap();
+                    let finalizer = fin.remove(&col);
+                    let drop_fn = drop_fns.remove(&col);
+                    object_deallocs.push((del, finalizer, drop_fn));
+                }
+                (tracer_deallocs, object_deallocs)
+            };
+            // Phase 6: all locks released — safe to call drop_in_place
+            for (mem, layout) in tracer_deallocs {
+                dealloc(mem, layout);
             }
-            for (gc_info, _) in &*trs {
-                let tracer = &(**gc_info);
-                tracer.reset();
-            }
-            let mut fin = self.fin.lock().unwrap();
-            let _clone_collected_objects = collected_objects.clone();
-            for col in collected_objects {
-                let del = (&*objs)[&col];
-                let finilizer = (&*fin)[&col];
-                (*finilizer).finalize();
-                dealloc(del.0, del.1);
-                objs.remove(&col);
-                fin.remove(&col);
+            for ((mem, layout), finalizer, drop_fn) in object_deallocs {
+                if let Some(f) = finalizer {
+                    (*f).finalize();
+                }
+                if let Some(drop_fn) = drop_fn {
+                    (drop_fn)(mem);
+                }
+                dealloc(mem, layout);
             }
         }
     }
 
     unsafe fn collect_all(&self) {
         unsafe {
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut collected_tracers: Vec<*const dyn Trace> = Vec::new();
-            let mut trs = self.trs.write().unwrap();
-            for (gc_info, _) in &*trs {
-                collected_tracers.push(*gc_info);
+            let (tracer_deallocs, object_deallocs) = {
+                let mut mem_to_trc = self.mem_to_trc.write().unwrap();
+                let mut trs = self.trs.write().unwrap();
+                let mut objs = self.objs.lock().unwrap();
+                let mut fin = self.fin.lock().unwrap();
+                let mut drop_fns = self.drop_fns.lock().unwrap();
+                let tracer_deallocs: Vec<_> = trs.drain().map(|(k, v)| {
+                    mem_to_trc.remove(&k.get_thin_ptr());
+                    v
+                }).collect();
+                let object_deallocs: Vec<_> = objs.drain().map(|(k, v)| {
+                    let finalizer = fin.remove(&k);
+                    let drop_fn = drop_fns.remove(&k);
+                    (v, finalizer, drop_fn)
+                }).collect();
+                (tracer_deallocs, object_deallocs)
+            };
+            for (mem, layout) in tracer_deallocs {
+                dealloc(mem, layout);
             }
-            let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
-            let mut objs = self.objs.lock().unwrap();
-            for (gc_info, _) in &*objs {
-                collected_objects.push(*gc_info);
-            }
-            for tracer_ptr in collected_tracers {
-                let del = (&*trs)[&tracer_ptr];
-                mem_to_trc.remove(&tracer_ptr.get_thin_ptr());
-                dealloc(del.0, del.1);
-                trs.remove(&tracer_ptr);
-            }
-            let mut fin = self.fin.lock().unwrap();
-            for col in collected_objects {
-                let del = (&*objs)[&col];
-                let finilizer = (&*fin)[&col];
-                (*finilizer).finalize();
-                dealloc(del.0, del.1);
-                objs.remove(&col);
-                fin.remove(&col);
+            for ((mem, layout), finalizer, drop_fn) in object_deallocs {
+                if let Some(f) = finalizer {
+                    (*f).finalize();
+                }
+                if let Some(drop_fn) = drop_fn {
+                    (drop_fn)(mem);
+                }
+                dealloc(mem, layout);
             }
         }
     }
@@ -727,6 +756,8 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use crate::gc::{Gc, LOCAL_GC};
+    use crate::{Trace, Finalize};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn one_object() {
@@ -808,5 +839,43 @@ mod tests {
             });
             assert_eq!(gc.borrow().trs.read().unwrap().len(), 1);
         });
+    }
+
+    static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    struct DropCounter {
+        _value: String,
+    }
+
+    impl Trace for DropCounter {
+        fn is_root(&self) -> bool { false }
+        fn reset_root(&self) {}
+        fn trace(&self) {}
+        fn reset(&self) {}
+        fn is_traceable(&self) -> bool { false }
+    }
+
+    impl Finalize for DropCounter {
+        fn finalize(&self) {}
+    }
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn collect_calls_drop_on_gc_objects() {
+        // Verifies that collect() calls drop_in_place on collected GcPtr objects,
+        // so that inner types with Drop impls have their resources freed.
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let _obj = Gc::new(DropCounter { _value: String::from("hello") });
+        }
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow_mut().collect();
+        });
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1, "Drop should be called during collect");
     }
 }
