@@ -6,6 +6,7 @@ mod default_trace;
 mod basic_gc_strategy;
 
 pub use gc::*;
+pub use gc::sync;
 #[allow(unused_imports)]
 pub use default_trace::*;
 pub use basic_gc_strategy::{BASIC_STRATEGY_LOCAL_GCS, BASIC_STRATEGY_GLOBAL_GC, ApplicationCleanup};
