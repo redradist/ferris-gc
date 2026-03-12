@@ -598,7 +598,7 @@ impl GarbageCollector {
 
                 for obj_ptr in surviving_objs {
                     if let Some(cur_gen) = obj_gen.get(&obj_ptr).copied() {
-                        if cur_gen < max_gen || max_gen == Generation::Gen2 {
+                        if cur_gen <= max_gen {
                             let count = survive_count.entry(obj_ptr).or_insert(0);
                             *count += 1;
                             if *count >= cur_gen.promotion_threshold() {
@@ -1091,6 +1091,114 @@ mod tests {
 
     impl Finalize for CyclicNode {
         fn finalize(&self) {}
+    }
+
+    #[test]
+    fn objects_start_in_gen0() {
+        clean_gc_state();
+        let _obj = Gc::new(42);
+        LOCAL_GC.with(|gc| {
+            let gc_ref = gc.borrow();
+            let obj_gen = gc_ref.core.obj_gen.lock().unwrap();
+            assert!(obj_gen.values().any(|g| *g == crate::generation::Generation::Gen0),
+                "newly allocated objects should be in Gen0");
+        });
+    }
+
+    #[test]
+    fn gen0_collection_does_not_collect_promoted_objects() {
+        clean_gc_state();
+        let _obj = Gc::new(100);
+        LOCAL_GC.with(|gc| {
+            let gc_ref = gc.borrow();
+            // Survive 3 Gen0 collections to promote to Gen1
+            for _ in 0..3 {
+                unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
+            }
+            // Verify object was promoted to Gen1
+            {
+                let obj_gen = gc_ref.core.obj_gen.lock().unwrap();
+                assert!(obj_gen.values().any(|g| *g == crate::generation::Generation::Gen1),
+                    "object should be promoted to Gen1 after surviving 3 Gen0 collections");
+            }
+
+            let baseline_objs = gc_ref.core.objs.lock().unwrap().len();
+            // Gen0-only collection should not touch Gen1 objects
+            unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
+            let after_objs = gc_ref.core.objs.lock().unwrap().len();
+            assert_eq!(baseline_objs, after_objs,
+                "Gen0 collection must not collect Gen1 objects");
+        });
+    }
+
+    #[test]
+    fn promotion_gen0_to_gen1() {
+        clean_gc_state();
+        let _obj = Gc::new(77);
+        LOCAL_GC.with(|gc| {
+            let gc_ref = gc.borrow();
+            // Gen0 promotion threshold is 3
+            for _ in 0..2 {
+                unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
+            }
+            // Still Gen0 after 2 survivals
+            {
+                let obj_gen = gc_ref.core.obj_gen.lock().unwrap();
+                assert!(obj_gen.values().all(|g| *g == crate::generation::Generation::Gen0),
+                    "object should still be in Gen0 after 2 survivals");
+            }
+
+            // Third survival triggers promotion
+            unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
+            let obj_gen = gc_ref.core.obj_gen.lock().unwrap();
+            assert!(obj_gen.values().any(|g| *g == crate::generation::Generation::Gen1),
+                "object should be promoted to Gen1 after 3 survivals");
+        });
+    }
+
+    #[test]
+    fn promotion_gen1_to_gen2() {
+        clean_gc_state();
+        let _obj = Gc::new(55);
+        LOCAL_GC.with(|gc| {
+            let gc_ref = gc.borrow();
+            // Promote to Gen1 first (3 Gen0 collections)
+            for _ in 0..3 {
+                unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
+            }
+            // Now survive 5 Gen1 collections to promote to Gen2
+            for _ in 0..5 {
+                unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen1); }
+            }
+            let obj_gen = gc_ref.core.obj_gen.lock().unwrap();
+            assert!(obj_gen.values().any(|g| *g == crate::generation::Generation::Gen2),
+                "object should be promoted to Gen2 after surviving Gen1 threshold");
+        });
+    }
+
+    #[test]
+    fn dead_object_collected_by_gen0() {
+        clean_gc_state();
+        {
+            let _obj = Gc::new(99);
+        }
+        LOCAL_GC.with(|gc| {
+            let gc_ref = gc.borrow();
+            let baseline = gc_ref.core.objs.lock().unwrap().len();
+            unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
+            let after = gc_ref.core.objs.lock().unwrap().len();
+            assert!(after < baseline, "dead Gen0 object should be collected by Gen0 collection");
+        });
+    }
+
+    #[test]
+    fn allocation_count_tracks_new_objects() {
+        clean_gc_state();
+        let before = LOCAL_GC.with(|gc| gc.borrow().core.allocation_count.load(Ordering::Relaxed));
+        let _a = Gc::new(1);
+        let _b = Gc::new(2);
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.allocation_count.load(Ordering::Relaxed));
+        assert_eq!(after - before, 2, "allocation_count should increment per new object");
     }
 
     #[test]
