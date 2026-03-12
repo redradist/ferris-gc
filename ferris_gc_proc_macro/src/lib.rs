@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{ReturnType, Data, Fields};
+use syn::{ReturnType, Data, Fields, NestedMeta, Meta, Lit};
 
 #[proc_macro_derive(Trace, attributes(unsafe_ignore_trace))]
 pub fn derive_trace(item: TokenStream) -> TokenStream {
@@ -113,10 +113,68 @@ pub fn derive_finalize(item: TokenStream) -> TokenStream {
     finalizer_impl.into()
 }
 
+/// Attribute macro for the application entry point.
+///
+/// # Usage
+/// ```ignore
+/// #[ferris_gc_main]                          // basic strategy (default)
+/// #[ferris_gc_main(strategy = "threshold")]  // threshold-based generational GC
+/// #[ferris_gc_main(strategy = "adaptive")]   // adaptive auto-tuning generational GC
+/// fn main() { }
+/// ```
 #[proc_macro_attribute]
 pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemFn);
-    let _attr_args = syn::parse_macro_input!(attrs as syn::AttributeArgs);
+    let attr_args = syn::parse_macro_input!(attrs as syn::AttributeArgs);
+
+    // Parse strategy attribute
+    let mut strategy = String::from("basic");
+    for arg in &attr_args {
+        if let NestedMeta::Meta(Meta::NameValue(nv)) = arg {
+            if nv.path.is_ident("strategy") {
+                if let Lit::Str(s) = &nv.lit {
+                    strategy = s.value();
+                } else {
+                    panic!("strategy value must be a string literal");
+                }
+            } else {
+                let name = nv.path.get_ident().map(|i| i.to_string()).unwrap_or_default();
+                panic!("Unknown attribute '{}'. Supported: strategy", name);
+            }
+        } else {
+            panic!("Expected strategy = \"...\". Supported strategies: basic, threshold, adaptive");
+        }
+    }
+
+    let strategy_setup = match strategy.as_str() {
+        "basic" => quote! {},
+        "threshold" => quote! {
+            ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+            ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
+                let (start, stop) = ferris_gc::threshold_local_start(ferris_gc::ThresholdConfig::default());
+                s.borrow().change_strategy(start, stop);
+            });
+            {
+                let (start, stop) = ferris_gc::threshold_global_start(ferris_gc::ThresholdConfig::default());
+                ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+            }
+        },
+        "adaptive" => quote! {
+            ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+            ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
+                let (start, stop) = ferris_gc::adaptive_local_start(ferris_gc::AdaptiveConfig::default());
+                s.borrow().change_strategy(start, stop);
+            });
+            {
+                let (start, stop) = ferris_gc::adaptive_global_start(ferris_gc::AdaptiveConfig::default());
+                ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+            }
+        },
+        other => panic!(
+            "Unknown GC strategy '{}'. Supported: basic, threshold, adaptive",
+            other
+        ),
+    };
 
     let _sig = &input.sig;
     let vis = input.vis;
@@ -145,8 +203,8 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let res_fun = quote! {
         #(#attrs)*
         #vis fn #name (#(#args),*) #ret {
-            // Should be added proper closing background threads
-            let cleanup = ApplicationCleanup;
+            let _cleanup = ferris_gc::ApplicationCleanup;
+            #strategy_setup
             {
                 #body
             }
