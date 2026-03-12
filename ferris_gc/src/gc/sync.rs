@@ -664,11 +664,11 @@ impl GlobalStrategy {
     pub fn change_strategy<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn)
         where StartFn: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
               StopFn: 'static + FnMut(&'static GlobalGarbageCollector) {
-        let mut start_func = self.start_func.lock().unwrap();
-        let mut stop_func = self.stop_func.lock().unwrap();
         if self.is_active() {
             self.stop();
         }
+        let mut start_func = self.start_func.lock().unwrap();
+        let mut stop_func = self.stop_func.lock().unwrap();
         *start_func = Box::new(start_fn);
         *stop_func = Box::new(stop_fn);
     }
@@ -788,5 +788,22 @@ mod tests {
         }
         unsafe { (*GLOBAL_GC).collect() };
         assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 0);
+    }
+
+    #[test]
+    fn change_strategy_while_active_does_not_deadlock() {
+        let (_guard, _) = setup();
+        let _gc = Gc::new(1); // ensures strategy is started
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use crate::gc::sync::GLOBAL_GC_STRATEGY;
+            GLOBAL_GC_STRATEGY.change_strategy(
+                |_gc, _| None,
+                |_gc| {},
+            );
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .expect("change_strategy deadlocked when called while active");
     }
 }
