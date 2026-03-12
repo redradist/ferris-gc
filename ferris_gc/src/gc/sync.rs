@@ -64,13 +64,19 @@ impl<T> Trace for GcPtr<T> where T: Sized + Trace {
     }
 
     fn trace(&self) {
-        self.info.root_ref_count.fetch_add(1, Ordering::AcqRel);
-        self.t.trace();
+        // Guard: only recurse into children on first trace (breaks cycles)
+        let prev = self.info.root_ref_count.fetch_add(1, Ordering::AcqRel);
+        if prev == 0 {
+            self.t.trace();
+        }
     }
 
     fn reset(&self) {
-        self.info.root_ref_count.fetch_sub(1, Ordering::AcqRel);
-        self.t.reset();
+        // Guard: only recurse into children on last reset (breaks cycles)
+        let prev = self.info.root_ref_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            self.t.reset();
+        }
     }
 
     fn is_traceable(&self) -> bool {
@@ -88,13 +94,17 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
     }
 
     fn trace(&self) {
-        self.borrow().info.root_ref_count.fetch_add(1, Ordering::AcqRel);
-        self.borrow().t.trace();
+        let prev = self.borrow().info.root_ref_count.fetch_add(1, Ordering::AcqRel);
+        if prev == 0 {
+            self.borrow().t.trace();
+        }
     }
 
     fn reset(&self) {
-        self.borrow().info.root_ref_count.fetch_sub(1, Ordering::AcqRel);
-        self.borrow().t.reset();
+        let prev = self.borrow().info.root_ref_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            self.borrow().t.reset();
+        }
     }
 
     fn is_traceable(&self) -> bool {

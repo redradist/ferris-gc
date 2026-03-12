@@ -101,13 +101,19 @@ impl<T> Trace for GcPtr<T> where T: Sized + Trace {
     }
 
     fn trace(&self) {
-        self.info.has_root.store(true, Ordering::Release);
-        self.t.trace();
+        // Guard: skip if already traced (breaks cycles)
+        if !self.info.has_root.load(Ordering::Acquire) {
+            self.info.has_root.store(true, Ordering::Release);
+            self.t.trace();
+        }
     }
 
     fn reset(&self) {
-        self.info.has_root.store(false, Ordering::Release);
-        self.t.reset();
+        // Guard: skip if already reset (breaks cycles)
+        if self.info.has_root.load(Ordering::Acquire) {
+            self.info.has_root.store(false, Ordering::Release);
+            self.t.reset();
+        }
     }
 
     fn is_traceable(&self) -> bool {
@@ -125,13 +131,17 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
     }
 
     fn trace(&self) {
-        self.borrow().info.has_root.store(true, Ordering::Release);
-        self.borrow().t.trace();
+        if !self.borrow().info.has_root.load(Ordering::Acquire) {
+            self.borrow().info.has_root.store(true, Ordering::Release);
+            self.borrow().t.trace();
+        }
     }
 
     fn reset(&self) {
-        self.borrow().info.has_root.store(false, Ordering::Release);
-        self.borrow().t.reset();
+        if self.borrow().info.has_root.load(Ordering::Acquire) {
+            self.borrow().info.has_root.store(false, Ordering::Release);
+            self.borrow().t.reset();
+        }
     }
 
     fn is_traceable(&self) -> bool {
@@ -903,5 +913,55 @@ mod tests {
             // source + target + the new clone's tracer = at least 2 alive
             assert!(delta >= 2, "clone_from should register new tracer with GC, got {delta}");
         });
+    }
+
+    struct CyclicNode {
+        next: std::cell::RefCell<Option<Gc<CyclicNode>>>,
+    }
+
+    impl Trace for CyclicNode {
+        fn is_root(&self) -> bool { false }
+        fn reset_root(&self) {
+            if let Some(ref gc) = *self.next.borrow() {
+                gc.reset_root();
+            }
+        }
+        fn trace(&self) {
+            if let Some(ref gc) = *self.next.borrow() {
+                gc.trace();
+            }
+        }
+        fn reset(&self) {
+            if let Some(ref gc) = *self.next.borrow() {
+                gc.reset();
+            }
+        }
+        fn is_traceable(&self) -> bool { false }
+    }
+
+    impl Finalize for CyclicNode {
+        fn finalize(&self) {}
+    }
+
+    #[test]
+    fn cyclic_gc_collect_does_not_overflow() {
+        // Create a cycle: a → b → a. Without cycle protection in trace()/reset(),
+        // collect() will recurse infinitely and overflow the stack.
+        let result = std::thread::Builder::new()
+            .stack_size(256 * 1024) // small stack to detect infinite recursion quickly
+            .spawn(|| {
+                let a = Gc::new(CyclicNode { next: std::cell::RefCell::new(None) });
+                let b = Gc::new(CyclicNode { next: std::cell::RefCell::new(Some(a.clone())) });
+                *a.next.borrow_mut() = Some(b.clone());
+                // Drop user handles — cycle keeps objects alive internally
+                drop(a);
+                drop(b);
+                LOCAL_GC.with(|gc| unsafe {
+                    gc.borrow_mut().collect();
+                });
+            })
+            .unwrap()
+            .join();
+        assert!(result.is_ok(), "collect() with cyclic references must not stack overflow");
     }
 }
