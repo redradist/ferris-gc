@@ -2,93 +2,150 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{ReturnType, Data, Fields, NestedMeta, Meta, Lit};
 
+fn has_ignore_trace(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path.get_ident()
+            .map(|id| id == "unsafe_ignore_trace")
+            .unwrap_or(false)
+    })
+}
+
+/// Generate method bodies (reset_root, trace, reset) for struct fields.
+fn struct_bodies(fields: &Fields) -> (proc_macro2::TokenStream, proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    match fields {
+        Fields::Named(named) => {
+            let traced: Vec<_> = named.named.iter()
+                .filter(|f| !has_ignore_trace(&f.attrs))
+                .filter_map(|f| f.ident.as_ref())
+                .collect();
+            (
+                quote! { #(self.#traced.reset_root();)* },
+                quote! { #(self.#traced.trace();)* },
+                quote! { #(self.#traced.reset();)* },
+            )
+        }
+        Fields::Unnamed(unnamed) => {
+            let indices: Vec<syn::Index> = unnamed.unnamed.iter()
+                .enumerate()
+                .filter(|(_, f)| !has_ignore_trace(&f.attrs))
+                .map(|(i, _)| syn::Index::from(i))
+                .collect();
+            (
+                quote! { #(self.#indices.reset_root();)* },
+                quote! { #(self.#indices.trace();)* },
+                quote! { #(self.#indices.reset();)* },
+            )
+        }
+        Fields::Unit => (quote! {}, quote! {}, quote! {}),
+    }
+}
+
+/// Generate a `match self { ... }` expression for an enum, calling `method` on traced fields.
+fn enum_match(ident: &syn::Ident, data_enum: &syn::DataEnum, method: &str) -> proc_macro2::TokenStream {
+    let method_ident = syn::Ident::new(method, proc_macro2::Span::call_site());
+
+    let arms: Vec<_> = data_enum.variants.iter().map(|variant| {
+        let var_ident = &variant.ident;
+        match &variant.fields {
+            Fields::Named(named) => {
+                let traced: Vec<_> = named.named.iter()
+                    .filter(|f| !has_ignore_trace(&f.attrs))
+                    .filter_map(|f| f.ident.as_ref())
+                    .collect();
+                quote! {
+                    #ident::#var_ident { #(#traced,)* .. } => {
+                        #(#traced.#method_ident();)*
+                    }
+                }
+            }
+            Fields::Unnamed(unnamed) => {
+                let total = unnamed.unnamed.len();
+                let is_traced: Vec<bool> = unnamed.unnamed.iter()
+                    .map(|f| !has_ignore_trace(&f.attrs))
+                    .collect();
+                let binding_names: Vec<syn::Ident> = (0..total)
+                    .map(|i| syn::Ident::new(&format!("_{}", i), proc_macro2::Span::call_site()))
+                    .collect();
+                let pattern: Vec<proc_macro2::TokenStream> = (0..total)
+                    .map(|i| {
+                        if is_traced[i] {
+                            let name = &binding_names[i];
+                            quote! { #name }
+                        } else {
+                            quote! { _ }
+                        }
+                    })
+                    .collect();
+                let traced_names: Vec<&syn::Ident> = (0..total)
+                    .filter(|&i| is_traced[i])
+                    .map(|i| &binding_names[i])
+                    .collect();
+                quote! {
+                    #ident::#var_ident(#(#pattern),*) => {
+                        #(#traced_names.#method_ident();)*
+                    }
+                }
+            }
+            Fields::Unit => {
+                quote! { #ident::#var_ident => {} }
+            }
+        }
+    }).collect();
+
+    quote! {
+        match self {
+            #(#arms)*
+        }
+    }
+}
+
 #[proc_macro_derive(Trace, attributes(unsafe_ignore_trace))]
 pub fn derive_trace(item: TokenStream) -> TokenStream {
     let derive_input = syn::parse_macro_input!(item as syn::DeriveInput);
 
     let ident = &derive_input.ident;
-    let data_type = &derive_input.data;
-    let trace_impl = match data_type {
-        Data::Struct(data_struct) => {
-            match &data_struct.fields {
-                Fields::Named(named_fields) => {
-                    let mut fields = Vec::new();
-                    for field in &named_fields.named {
-                        let attrs = &field.attrs;
-                        if !attrs.into_iter().any(|attr| attr.path.get_ident().unwrap() == "unsafe_ignore_trace") {
-                            let ident = &field.ident;
-                            fields.push(ident);
-                        }
-                    }
-                    quote! {
-                        impl Trace for #ident {
-                            fn is_root(&self) -> bool {
-                                unreachable!("is_root should never be called on user-defined type !!");
-                            }
 
-                            fn reset_root(&self) {
-                                #(self.#fields.reset_root();)*
-                            }
+    // Add Trace bound to all type parameters
+    let mut generics = derive_input.generics.clone();
+    for param in &mut generics.params {
+        if let syn::GenericParam::Type(ref mut type_param) = *param {
+            type_param.bounds.push(syn::parse_quote!(Trace));
+        }
+    }
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-                            fn trace(&self) {
-                                #(self.#fields.trace();)*
-                            }
+    let (reset_root_body, trace_body, reset_body) = match &derive_input.data {
+        Data::Struct(data_struct) => struct_bodies(&data_struct.fields),
+        Data::Enum(data_enum) => (
+            enum_match(ident, data_enum, "reset_root"),
+            enum_match(ident, data_enum, "trace"),
+            enum_match(ident, data_enum, "reset"),
+        ),
+        Data::Union(_) => panic!("#[derive(Trace)] is not supported for union types"),
+    };
 
-                            fn reset(&self) {
-                                #(self.#fields.reset();)*
-                            }
-
-                            fn is_traceable(&self) -> bool {
-                                unreachable!("is_traceable should never be called on user-defined type !!");
-                            }
-                        }
-                    }
-                },
-                Fields::Unnamed(unnamed_fields) => {
-                    let mut fields = Vec::new();
-                    let mut idx = 0;
-                    for field in &unnamed_fields.unnamed {
-                        let attrs = &field.attrs;
-                        if !attrs.into_iter().any(|attr| attr.path.get_ident().unwrap() == "unsafe_ignore_trace") {
-                            fields.push(idx);
-                        }
-                        idx += 1;
-                    }
-                    quote! {
-                        impl Trace for #ident {
-                            fn is_root(&self) -> bool {
-                                unreachable!("is_root should never be called on user-defined type !!");
-                            }
-
-                            fn reset_root(&self) {
-                                #(self.#fields.reset_root();)*
-                            }
-
-                            fn trace(&self) {
-                                #(self.#fields.trace();)*
-                            }
-
-                            fn reset(&self) {
-                                #(self.#fields.reset();)*
-                            }
-
-                            fn is_traceable(&self) -> bool {
-                                unreachable!("is_traceable should never be called on user-defined type !!");
-                            }
-                        }
-                    }
-                },
-                Fields::Unit => {
-                    panic!("Unit type is not supported !!");
-                },
+    let trace_impl = quote! {
+        impl #impl_generics Trace for #ident #ty_generics #where_clause {
+            fn is_root(&self) -> bool {
+                unreachable!("is_root should never be called on user-defined type !!");
             }
-        },
-        Data::Enum(_data_enum) => {
-            panic!("Enum type is not supported !!");
-        },
-        Data::Union(_data_union) => {
-            panic!("Union type is not supported !!");
-        },
+
+            fn reset_root(&self) {
+                #reset_root_body
+            }
+
+            fn trace(&self) {
+                #trace_body
+            }
+
+            fn reset(&self) {
+                #reset_body
+            }
+
+            fn is_traceable(&self) -> bool {
+                unreachable!("is_traceable should never be called on user-defined type !!");
+            }
+        }
     };
 
     let print_tokens = Into::<TokenStream>::into(trace_impl.clone());
@@ -101,8 +158,18 @@ pub fn derive_finalize(item: TokenStream) -> TokenStream {
     let derive_input = syn::parse_macro_input!(item as syn::DeriveInput);
 
     let ident = &derive_input.ident;
+
+    // Add Finalize bound to all type parameters
+    let mut generics = derive_input.generics.clone();
+    for param in &mut generics.params {
+        if let syn::GenericParam::Type(ref mut type_param) = *param {
+            type_param.bounds.push(syn::parse_quote!(Finalize));
+        }
+    }
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
     let finalizer_impl = quote! {
-        impl Finalize for #ident {
+        impl #impl_generics Finalize for #ident #ty_generics #where_clause {
             fn finalize(&self) {
             }
         }
