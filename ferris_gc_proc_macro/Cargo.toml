@@ -4,7 +4,7 @@ version = "0.1.2"
 authors = ["redradist, redradist@gmail.com"]
 description = "Plugin for ferris-gc"
 license = "Apache-2.0/MIT"
-edition = "2018"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

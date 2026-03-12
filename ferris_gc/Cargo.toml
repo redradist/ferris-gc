@@ -7,7 +7,7 @@ repository = "https://github.com/redradist/ferris-gc"
 readme = "../README.md"
 license = "Apache-2.0/MIT"
 keywords = ["garbage", "memory"]
-edition = "2018"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

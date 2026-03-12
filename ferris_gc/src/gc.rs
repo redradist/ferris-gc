@@ -458,160 +458,176 @@ impl LocalGarbageCollector {
 
     unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
         where T: Sized + Trace {
-        let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<GcPtr<T>>();
-        let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
-        std::ptr::write(gc_ptr, GcPtr::new(t));
-        std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
-        let gc = Gc {
-            internal_ptr: gc_inter_ptr,
-            ptr: gc_ptr,
-        };
-        (*(*gc.internal_ptr).ptr).reset_root();
-        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-        let mut trs = self.trs.write().unwrap();
-        let mut objs = self.objs.lock().unwrap();
-        let mut fin = self.fin.lock().unwrap();
-        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
-        trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-        objs.insert(gc_ptr, mem_info_gc_ptr);
-        fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
-        gc
+        unsafe {
+            let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<GcPtr<T>>();
+            let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
+            std::ptr::write(gc_ptr, GcPtr::new(t));
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
+            let gc = Gc {
+                internal_ptr: gc_inter_ptr,
+                ptr: gc_ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
+            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
+            let mut trs = self.trs.write().unwrap();
+            let mut objs = self.objs.lock().unwrap();
+            let mut fin = self.fin.lock().unwrap();
+            mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+            objs.insert(gc_ptr, mem_info_gc_ptr);
+            fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
+            gc
+        }
     }
 
     unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
-        let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
-        std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
-        let gc = Gc {
-            internal_ptr: gc_inter_ptr,
-            ptr: gc.ptr,
-        };
-        (*(*gc.internal_ptr).ptr).reset_root();
-        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-        let mut trs = self.trs.write().unwrap();
-        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
-        trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-        gc
+        unsafe {
+            let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
+            let gc = Gc {
+                internal_ptr: gc_inter_ptr,
+                ptr: gc.ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
+            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
+            let mut trs = self.trs.write().unwrap();
+            mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+            gc
+        }
     }
 
     unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T> where T: Sized + Trace {
-        let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<RefCell<GcPtr<T>>>();
-        let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcRefCellInternal<T>>();
-        std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
-        std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
-        let gc = GcRefCell {
-            internal_ptr: gc_cell_inter_ptr,
-            ptr: gc_ptr,
-        };
-        (*(*gc.internal_ptr).ptr).reset_root();
-        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-        let mut trs = self.trs.write().unwrap();
-        let mut objs = self.objs.lock().unwrap();
-        let mut fin = self.fin.lock().unwrap();
-        mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
-        trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
-        objs.insert(gc_ptr, mem_info_gc_ptr);
-        fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
-        gc
+        unsafe {
+            let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<RefCell<GcPtr<T>>>();
+            let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcRefCellInternal<T>>();
+            std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
+            std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
+            let gc = GcRefCell {
+                internal_ptr: gc_cell_inter_ptr,
+                ptr: gc_ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
+            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
+            let mut trs = self.trs.write().unwrap();
+            let mut objs = self.objs.lock().unwrap();
+            let mut fin = self.fin.lock().unwrap();
+            mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
+            trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
+            objs.insert(gc_ptr, mem_info_gc_ptr);
+            fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
+            gc
+        }
     }
 
     unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T> where T: Sized + Trace {
-        let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcRefCellInternal<T>>();
-        std::ptr::write(gc_inter_ptr, GcRefCellInternal::new(gc.ptr));
-        let gc = GcRefCell {
-            internal_ptr: gc_inter_ptr,
-            ptr: gc.ptr,
-        };
-        (*(*gc.internal_ptr).ptr).reset_root();
-        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-        let mut trs = self.trs.write().unwrap();
-        mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
-        trs.insert(gc_inter_ptr, mem_info);
-        gc
+        unsafe {
+            let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcRefCellInternal<T>>();
+            std::ptr::write(gc_inter_ptr, GcRefCellInternal::new(gc.ptr));
+            let gc = GcRefCell {
+                internal_ptr: gc_inter_ptr,
+                ptr: gc.ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
+            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
+            let mut trs = self.trs.write().unwrap();
+            mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            trs.insert(gc_inter_ptr, mem_info);
+            gc
+        }
     }
 
     unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
-        let layout = Layout::new::<T>();
-        let mem = alloc(layout);
-        let type_ptr: *mut T = mem as *mut _;
-        (type_ptr, (mem, layout))
+        unsafe {
+            let layout = Layout::new::<T>();
+            let mem = alloc(layout);
+            let type_ptr: *mut T = mem as *mut _;
+            (type_ptr, (mem, layout))
+        }
     }
 
     unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
-        let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-        let mut trs = self.trs.write().unwrap();
-        let tracer = &mem_to_trc.remove(&(tracer.get_thin_ptr())).unwrap();
-        let del = trs.remove(&tracer).unwrap();
-        dealloc(del.0, del.1);
+        unsafe {
+            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
+            let mut trs = self.trs.write().unwrap();
+            let tracer = &mem_to_trc.remove(&(tracer.get_thin_ptr())).unwrap();
+            let del = trs.remove(&tracer).unwrap();
+            dealloc(del.0, del.1);
+        }
     }
 
     pub unsafe fn collect(&self) {
-        let mut trs = self.trs.write().unwrap();
-        for (gc_info, _) in &*trs {
-            let tracer = &(**gc_info);
-            if tracer.is_root() {
-                tracer.trace();
+        unsafe {
+            let mut trs = self.trs.write().unwrap();
+            for (gc_info, _) in &*trs {
+                let tracer = &(**gc_info);
+                if tracer.is_root() {
+                    tracer.trace();
+                }
             }
-        }
-        let mut collected_tracers = Vec::new();
-        for (gc_info, _) in &*trs {
-            let tracer = &(**gc_info);
-            if !tracer.is_traceable() {
-                collected_tracers.push(*gc_info);
+            let mut collected_tracers = Vec::new();
+            for (gc_info, _) in &*trs {
+                let tracer = &(**gc_info);
+                if !tracer.is_traceable() {
+                    collected_tracers.push(*gc_info);
+                }
             }
-        }
-        for tracer_ptr in collected_tracers {
-            let del = (&*trs)[&tracer_ptr];
-            dealloc(del.0, del.1);
-            trs.remove(&tracer_ptr);
-        }
-        let mut collected_objects = Vec::new();
-        let mut objs = self.objs.lock().unwrap();
-        for (gc_info, _) in &*objs {
-            let obj = &(**gc_info);
-            if !obj.is_traceable() {
-                collected_objects.push(*gc_info);
+            for tracer_ptr in collected_tracers {
+                let del = (&*trs)[&tracer_ptr];
+                dealloc(del.0, del.1);
+                trs.remove(&tracer_ptr);
             }
-        }
-        for (gc_info, _) in &*trs {
-            let tracer = &(**gc_info);
-            tracer.reset();
-        }
-        let mut fin = self.fin.lock().unwrap();
-        let _clone_collected_objects = collected_objects.clone();
-        for col in collected_objects {
-            let del = (&*objs)[&col];
-            let finilizer = (&*fin)[&col];
-            (*finilizer).finalize();
-            dealloc(del.0, del.1);
-            objs.remove(&col);
-            fin.remove(&col);
+            let mut collected_objects = Vec::new();
+            let mut objs = self.objs.lock().unwrap();
+            for (gc_info, _) in &*objs {
+                let obj = &(**gc_info);
+                if !obj.is_traceable() {
+                    collected_objects.push(*gc_info);
+                }
+            }
+            for (gc_info, _) in &*trs {
+                let tracer = &(**gc_info);
+                tracer.reset();
+            }
+            let mut fin = self.fin.lock().unwrap();
+            let _clone_collected_objects = collected_objects.clone();
+            for col in collected_objects {
+                let del = (&*objs)[&col];
+                let finilizer = (&*fin)[&col];
+                (*finilizer).finalize();
+                dealloc(del.0, del.1);
+                objs.remove(&col);
+                fin.remove(&col);
+            }
         }
     }
 
     unsafe fn collect_all(&self) {
-        let mut collected_tracers: Vec<*const dyn Trace> = Vec::new();
-        let mut trs = self.trs.write().unwrap();
-        for (gc_info, _) in &*trs {
-            collected_tracers.push(*gc_info);
-        }
-        let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
-        let mut objs = self.objs.lock().unwrap();
-        for (gc_info, _) in &*objs {
-            collected_objects.push(*gc_info);
-        }
-        for tracer_ptr in collected_tracers {
-            let del = (&*trs)[&tracer_ptr];
-            dealloc(del.0, del.1);
-            trs.remove(&tracer_ptr);
-        }
-        let mut fin = self.fin.lock().unwrap();
-        for col in collected_objects {
-            let del = (&*objs)[&col];
-            let finilizer = (&*fin)[&col];
-            (*finilizer).finalize();
-            dealloc(del.0, del.1);
-            objs.remove(&col);
-            fin.remove(&col);
+        unsafe {
+            let mut collected_tracers: Vec<*const dyn Trace> = Vec::new();
+            let mut trs = self.trs.write().unwrap();
+            for (gc_info, _) in &*trs {
+                collected_tracers.push(*gc_info);
+            }
+            let mut collected_objects: Vec<*const dyn Trace> = Vec::new();
+            let mut objs = self.objs.lock().unwrap();
+            for (gc_info, _) in &*objs {
+                collected_objects.push(*gc_info);
+            }
+            for tracer_ptr in collected_tracers {
+                let del = (&*trs)[&tracer_ptr];
+                dealloc(del.0, del.1);
+                trs.remove(&tracer_ptr);
+            }
+            let mut fin = self.fin.lock().unwrap();
+            for col in collected_objects {
+                let del = (&*objs)[&col];
+                let finilizer = (&*fin)[&col];
+                (*finilizer).finalize();
+                dealloc(del.0, del.1);
+                objs.remove(&col);
+                fin.remove(&col);
+            }
         }
     }
 }

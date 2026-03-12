@@ -1,4 +1,5 @@
 [workspace]
+resolver = "3"
 members = [
     "ferris_gc",
     "ferris_gc_proc_macro",
