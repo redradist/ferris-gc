@@ -10,7 +10,7 @@ use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_LOCAL_GCS
 
 pub mod sync;
 
-trait ThinPtr {
+pub(crate) trait ThinPtr {
     fn get_thin_ptr(&self) -> usize;
 }
 

@@ -6,7 +6,7 @@ use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
-use crate::gc::{Finalize, Trace};
+use crate::gc::{Finalize, Trace, ThinPtr};
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
 
 pub type OptGc<T> = Option<Gc<T>>;
@@ -517,7 +517,7 @@ impl GlobalGarbageCollector {
         unsafe {
             let mut mem_to_trc = self.mem_to_trc.write().unwrap();
             let mut trs = self.trs.write().unwrap();
-            let tracer_thin_ptr = tracer as *const () as usize;
+            let tracer_thin_ptr = tracer.get_thin_ptr();
             if let Some(tracer) = mem_to_trc.remove(&tracer_thin_ptr) {
                 if let Some(del) = trs.remove(&tracer) {
                     dealloc(del.0, del.1);
@@ -547,7 +547,7 @@ impl GlobalGarbageCollector {
                 let mut tracer_deallocs = Vec::new();
                 for tracer_ptr in collected_tracers {
                     let del = trs.remove(&tracer_ptr).unwrap();
-                    mem_to_trc.remove(&(tracer_ptr as *const () as usize));
+                    mem_to_trc.remove(&tracer_ptr.get_thin_ptr());
                     tracer_deallocs.push(del);
                 }
                 // Identify unreachable objects
@@ -599,7 +599,7 @@ impl GlobalGarbageCollector {
                 let mut fin = self.fin.lock().unwrap();
                 let mut drop_fns = self.drop_fns.lock().unwrap();
                 let tracer_deallocs: Vec<_> = trs.drain().map(|(k, v)| {
-                    mem_to_trc.remove(&(k as *const () as usize));
+                    mem_to_trc.remove(&k.get_thin_ptr());
                     v
                 }).collect();
                 let object_deallocs: Vec<_> = objs.drain().map(|(k, v)| {
