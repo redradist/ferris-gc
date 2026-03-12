@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_LOCAL_GCS};
-use std::mem::transmute;
 
 pub mod sync;
 
@@ -18,17 +17,13 @@ trait ThinPtr {
 
 impl ThinPtr for &dyn Trace {
     fn get_thin_ptr(&self) -> usize {
-        let fat_ptr = (*self) as *const dyn Trace;
-        let (thin_ptr, _) = unsafe { transmute::<_, (*const (), *const ())>(fat_ptr) };
-        thin_ptr as usize
+        (*self) as *const dyn Trace as *const () as usize
     }
 }
 
 impl ThinPtr for *const dyn Trace {
     fn get_thin_ptr(&self) -> usize {
-        let fat_ptr = *self;
-        let (thin_ptr, _) = unsafe { transmute::<_, (*const (), *const ())>(fat_ptr) };
-        thin_ptr as usize
+        *self as *const () as usize
     }
 }
 

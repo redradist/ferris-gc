@@ -1,5 +1,4 @@
 use std::alloc::{alloc, dealloc, Layout};
-use std::mem::transmute;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -525,8 +524,8 @@ impl GlobalGarbageCollector {
         unsafe {
             let mut mem_to_trc = self.mem_to_trc.write().unwrap();
             let mut trs = self.trs.write().unwrap();
-            let (tracer_thin_ptr, _) = transmute::<_, (*const (), *const ())>(tracer);
-            if let Some(tracer) = mem_to_trc.remove(&(tracer_thin_ptr as usize)) {
+            let tracer_thin_ptr = tracer as *const () as usize;
+            if let Some(tracer) = mem_to_trc.remove(&tracer_thin_ptr) {
                 if let Some(del) = trs.remove(&tracer) {
                     dealloc(del.0, del.1);
                 }
@@ -555,8 +554,7 @@ impl GlobalGarbageCollector {
                 let mut tracer_deallocs = Vec::new();
                 for tracer_ptr in collected_tracers {
                     let del = trs.remove(&tracer_ptr).unwrap();
-                    let (thin_ptr, _) = transmute::<_, (*const (), *const ())>(tracer_ptr);
-                    mem_to_trc.remove(&(thin_ptr as usize));
+                    mem_to_trc.remove(&(tracer_ptr as *const () as usize));
                     tracer_deallocs.push(del);
                 }
                 // Identify unreachable objects
@@ -607,8 +605,7 @@ impl GlobalGarbageCollector {
                 let mut fin = self.fin.lock().unwrap();
                 let mut drop_fns = self.drop_fns.lock().unwrap();
                 let tracer_deallocs: Vec<_> = trs.drain().map(|(k, v)| {
-                    let (thin_ptr, _) = transmute::<_, (*const (), *const ())>(k);
-                    mem_to_trc.remove(&(thin_ptr as usize));
+                    mem_to_trc.remove(&(k as *const () as usize));
                     v
                 }).collect();
                 let object_deallocs: Vec<_> = objs.drain().map(|(k, v)| {
