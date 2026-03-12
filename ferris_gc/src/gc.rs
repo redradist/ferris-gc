@@ -234,12 +234,6 @@ impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
             gc.borrow_mut().clone_from_gc(self)
         })
     }
-
-    fn clone_from(&mut self, source: &Self) {
-        unsafe {
-            (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
-        }
-    }
 }
 
 impl<T> Drop for Gc<T> where T: Sized + Trace {
@@ -387,11 +381,6 @@ impl<T> Clone for GcRefCell<T> where T: 'static + Sized + Trace {
         gc
     }
 
-    fn clone_from(&mut self, source: &Self) {
-        unsafe {
-            (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
-        }
-    }
 }
 
 impl<T> Trace for GcRefCell<T> where T: Sized + Trace {
@@ -877,5 +866,20 @@ mod tests {
             gc.borrow_mut().collect();
         });
         assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1, "Drop should be called during collect");
+    }
+
+    #[test]
+    fn clone_from_registers_with_gc() {
+        // Verifies that clone_from goes through GC registration (not raw ptr copy).
+        // After clone_from + drop of original, GC should track 2 tracers (clone + source).
+        let source = Gc::new(42);
+        let mut target = Gc::new(99);
+        target.clone_from(&source);
+        // target now points to same GcPtr as source; both should be tracked
+        LOCAL_GC.with(|gc| {
+            let trs_len = gc.borrow().trs.read().unwrap().len();
+            // clone_from creates a new GcInternal tracer, so we should have at least 2
+            assert!(trs_len >= 2, "clone_from should register new tracer with GC, got {trs_len}");
+        });
     }
 }

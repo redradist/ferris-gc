@@ -198,12 +198,6 @@ impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
             (*GLOBAL_GC).clone_from_gc(self)
         }
     }
-
-    fn clone_from(&mut self, source: &Self) {
-        unsafe {
-            (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
-        }
-    }
 }
 
 impl<T> Drop for Gc<T> where T: Sized + Trace {
@@ -352,11 +346,6 @@ impl<T> Clone for GcRefCell<T> where T: 'static + Sized + Trace {
         gc
     }
 
-    fn clone_from(&mut self, source: &Self) {
-        unsafe {
-            (*self.internal_ptr).ptr = (*source.internal_ptr).ptr;
-        }
-    }
 }
 
 impl<T> Trace for GcRefCell<T> where T: Sized + Trace {
