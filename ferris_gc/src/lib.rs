@@ -4,6 +4,7 @@ extern crate lazy_static;
 mod gc;
 mod default_trace;
 mod basic_gc_strategy;
+mod generation;
 
 pub use gc::*;
 pub use gc::sync;

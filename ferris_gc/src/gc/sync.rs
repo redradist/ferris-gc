@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use crate::gc::{Finalize, Trace, GarbageCollector};
+use crate::generation::Generation;
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
 
 pub type OptGc<T> = Option<Gc<T>>;
@@ -410,14 +411,21 @@ impl GlobalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
             let mut trs = self.core.trs.write().unwrap();
+            let mut tracer_obj = self.core.tracer_obj.write().unwrap();
             let mut objs = self.core.objs.lock().unwrap();
+            let mut obj_gen = self.core.obj_gen.lock().unwrap();
+            let mut survive_count = self.core.survive_count.lock().unwrap();
             let mut fin = self.core.fin.lock().unwrap();
             mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+            tracer_obj.insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
             objs.insert(gc_ptr, mem_info_gc_ptr);
+            obj_gen.insert(gc_ptr, Generation::Gen0);
+            survive_count.insert(gc_ptr, 0);
             fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut GcPtr<T>); } }
             self.core.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_ptr::<T>);
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
     }
@@ -433,8 +441,10 @@ impl GlobalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
             let mut trs = self.core.trs.write().unwrap();
+            let mut tracer_obj = self.core.tracer_obj.write().unwrap();
             mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+            tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
             gc
         }
     }
@@ -452,14 +462,21 @@ impl GlobalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
             let mut trs = self.core.trs.write().unwrap();
+            let mut tracer_obj = self.core.tracer_obj.write().unwrap();
             let mut objs = self.core.objs.lock().unwrap();
+            let mut obj_gen = self.core.obj_gen.lock().unwrap();
+            let mut survive_count = self.core.survive_count.lock().unwrap();
             let mut fin = self.core.fin.lock().unwrap();
             mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
             trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
+            tracer_obj.insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
             objs.insert(gc_ptr, mem_info_gc_ptr);
+            obj_gen.insert(gc_ptr, Generation::Gen0);
+            survive_count.insert(gc_ptr, 0);
             fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>); } }
             self.core.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_cell_ptr::<T>);
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
     }
@@ -475,8 +492,10 @@ impl GlobalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
             let mut trs = self.core.trs.write().unwrap();
+            let mut tracer_obj = self.core.tracer_obj.write().unwrap();
             mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             trs.insert(gc_inter_ptr, mem_info);
+            tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
             gc
         }
     }

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::generation::{Generation, CollectionStats};
 use std::thread::JoinHandle;
 
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_LOCAL_GCS};
@@ -428,6 +429,11 @@ pub(crate) struct GarbageCollector {
     pub(crate) objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
     pub(crate) fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalize>>,
     pub(crate) drop_fns: Mutex<HashMap<*const dyn Trace, DropFn>>,
+    // Generational GC metadata
+    pub(crate) obj_gen: Mutex<HashMap<*const dyn Trace, Generation>>,
+    pub(crate) tracer_obj: RwLock<HashMap<*const dyn Trace, *const dyn Trace>>,
+    pub(crate) survive_count: Mutex<HashMap<*const dyn Trace, u32>>,
+    pub(crate) allocation_count: AtomicUsize,
 }
 
 unsafe impl Sync for GarbageCollector {}
@@ -441,6 +447,10 @@ impl GarbageCollector {
             objs: Mutex::new(HashMap::new()),
             fin: Mutex::new(HashMap::new()),
             drop_fns: Mutex::new(HashMap::new()),
+            obj_gen: Mutex::new(HashMap::new()),
+            tracer_obj: RwLock::new(HashMap::new()),
+            survive_count: Mutex::new(HashMap::new()),
+            allocation_count: AtomicUsize::new(0),
         }
     }
 
@@ -460,11 +470,27 @@ impl GarbageCollector {
         }
     }
 
+    /// Register a new object in Gen0.
+    #[allow(dead_code)]
+    pub(crate) fn register_object(&self, obj_ptr: *const dyn Trace) {
+        self.obj_gen.lock().unwrap().insert(obj_ptr, Generation::Gen0);
+        self.survive_count.lock().unwrap().insert(obj_ptr, 0);
+        self.allocation_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Register a tracer → object mapping.
+    #[allow(dead_code)]
+    pub(crate) fn register_tracer_obj(&self, tracer_ptr: *const dyn Trace, obj_ptr: *const dyn Trace) {
+        self.tracer_obj.write().unwrap().insert(tracer_ptr, obj_ptr);
+    }
+
     pub(crate) unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
         unsafe {
             let mut mem_to_trc = self.mem_to_trc.write().unwrap();
             let mut trs = self.trs.write().unwrap();
+            let mut tracer_obj = self.tracer_obj.write().unwrap();
             if let Some(tracer) = mem_to_trc.remove(&(tracer.get_thin_ptr())) {
+                tracer_obj.remove(&tracer);
                 if let Some(del) = trs.remove(&tracer) {
                     dealloc(del.0, del.1);
                 }
@@ -472,47 +498,129 @@ impl GarbageCollector {
         }
     }
 
+    /// Full collection (all generations). Backwards-compatible with existing callers.
     pub unsafe fn collect(&self) {
         unsafe {
+            self.collect_generation(Generation::Gen2);
+        }
+    }
+
+    /// Generational collection: collect objects in generations 0..=max_gen.
+    /// Mark phase scans ALL roots (cross-gen references handled correctly).
+    /// Sweep phase only collects objects/tracers in target generations.
+    /// Surviving objects in gens < max_gen may be promoted.
+    pub unsafe fn collect_generation(&self, max_gen: Generation) -> CollectionStats {
+        unsafe {
+            let mut stats = CollectionStats {
+                generation: max_gen,
+                objects_scanned: 0,
+                objects_collected: 0,
+                objects_promoted: 0,
+                tracers_collected: 0,
+            };
+
             let (tracer_deallocs, object_deallocs) = {
                 let mut mem_to_trc = self.mem_to_trc.write().unwrap();
                 let mut trs = self.trs.write().unwrap();
+                let mut tracer_obj = self.tracer_obj.write().unwrap();
+                let mut obj_gen = self.obj_gen.lock().unwrap();
+                let mut survive_count = self.survive_count.lock().unwrap();
+
+                // Mark phase: trace from ALL roots (global mark for cross-gen safety)
                 for (gc_info, _) in &*trs {
                     let tracer = &(**gc_info);
                     if tracer.is_root() {
                         tracer.trace();
                     }
                 }
-                let collected_tracers: Vec<_> = trs.iter()
-                    .filter(|(gc_info, _)| !(&***gc_info).is_traceable())
+
+                // Build set of objects in target generations
+                let in_scope_objs: std::collections::HashSet<*const dyn Trace> = obj_gen.iter()
+                    .filter(|(_, g)| **g <= max_gen)
                     .map(|(k, _)| *k)
                     .collect();
+
+                stats.objects_scanned = in_scope_objs.len();
+
+                // Identify in-scope tracers (their object is in target generations)
+                let in_scope_tracers: std::collections::HashSet<*const dyn Trace> = tracer_obj.iter()
+                    .filter(|(_, obj_ptr)| in_scope_objs.contains(obj_ptr))
+                    .map(|(k, _)| *k)
+                    .collect();
+
+                // Sweep tracers: only collect unreachable in-scope tracers
+                let collected_tracers: Vec<_> = trs.iter()
+                    .filter(|(ptr, _)| in_scope_tracers.contains(ptr) && !(&***ptr).is_traceable())
+                    .map(|(k, _)| *k)
+                    .collect();
+
                 let mut tracer_deallocs = Vec::new();
-                for tracer_ptr in collected_tracers {
-                    let del = trs.remove(&tracer_ptr).unwrap();
+                for tracer_ptr in &collected_tracers {
+                    let del = trs.remove(tracer_ptr).unwrap();
                     mem_to_trc.remove(&tracer_ptr.get_thin_ptr());
+                    tracer_obj.remove(tracer_ptr);
                     tracer_deallocs.push(del);
                 }
+                stats.tracers_collected = collected_tracers.len();
+
+                // Sweep objects: only collect unreachable in-scope objects
                 let mut objs = self.objs.lock().unwrap();
                 let collected_objects: Vec<_> = objs.iter()
-                    .filter(|(gc_info, _)| !(&***gc_info).is_traceable())
+                    .filter(|(ptr, _)| in_scope_objs.contains(ptr) && !(&***ptr).is_traceable())
                     .map(|(k, _)| *k)
                     .collect();
+                stats.objects_collected = collected_objects.len();
+
+                // Reset ALL remaining tracers (not just in-scope)
                 for (gc_info, _) in &*trs {
                     let tracer = &(**gc_info);
                     tracer.reset();
                 }
+
+                // Remove collected objects from all maps
                 let mut fin = self.fin.lock().unwrap();
                 let mut drop_fns = self.drop_fns.lock().unwrap();
                 let mut object_deallocs = Vec::new();
-                for col in collected_objects {
-                    let del = objs.remove(&col).unwrap();
-                    let finalizer = fin.remove(&col);
-                    let drop_fn = drop_fns.remove(&col);
+                for col in &collected_objects {
+                    let del = objs.remove(col).unwrap();
+                    let finalizer = fin.remove(col);
+                    let drop_fn = drop_fns.remove(col);
+                    obj_gen.remove(col);
+                    survive_count.remove(col);
                     object_deallocs.push((del, finalizer, drop_fn));
                 }
+
+                // Promotion: surviving in-scope objects may be promoted
+                let surviving_objs: Vec<*const dyn Trace> = in_scope_objs.iter()
+                    .filter(|ptr| !collected_objects.contains(ptr))
+                    .copied()
+                    .collect();
+
+                for obj_ptr in surviving_objs {
+                    if let Some(cur_gen) = obj_gen.get(&obj_ptr).copied() {
+                        if cur_gen < max_gen || max_gen == Generation::Gen2 {
+                            let count = survive_count.entry(obj_ptr).or_insert(0);
+                            *count += 1;
+                            if *count >= cur_gen.promotion_threshold() {
+                                if let Some(next_gen) = cur_gen.next() {
+                                    obj_gen.insert(obj_ptr, next_gen);
+                                    *count = 0;
+                                    stats.objects_promoted += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 (tracer_deallocs, object_deallocs)
             };
+
+            // Reset allocation counter after gen0 collection
+            if max_gen >= Generation::Gen0 {
+                self.allocation_count.store(0, Ordering::Relaxed);
+            }
+
+            // Dealloc phase: all locks released
             for (mem, layout) in tracer_deallocs {
                 dealloc(mem, layout);
             }
@@ -525,6 +633,8 @@ impl GarbageCollector {
                 }
                 dealloc(mem, layout);
             }
+
+            stats
         }
     }
 
@@ -534,9 +644,15 @@ impl GarbageCollector {
             let (tracer_deallocs, object_deallocs) = {
                 let mut mem_to_trc = self.mem_to_trc.write().unwrap();
                 let mut trs = self.trs.write().unwrap();
+                let mut tracer_obj = self.tracer_obj.write().unwrap();
                 let mut objs = self.objs.lock().unwrap();
+                let mut obj_gen = self.obj_gen.lock().unwrap();
+                let mut survive_count = self.survive_count.lock().unwrap();
                 let mut fin = self.fin.lock().unwrap();
                 let mut drop_fns = self.drop_fns.lock().unwrap();
+                tracer_obj.clear();
+                obj_gen.clear();
+                survive_count.clear();
                 let tracer_deallocs: Vec<_> = trs.drain().map(|(k, v)| {
                     mem_to_trc.remove(&k.get_thin_ptr());
                     v
@@ -548,6 +664,7 @@ impl GarbageCollector {
                 }).collect();
                 (tracer_deallocs, object_deallocs)
             };
+            self.allocation_count.store(0, Ordering::Relaxed);
             for (mem, layout) in tracer_deallocs {
                 dealloc(mem, layout);
             }
@@ -594,14 +711,21 @@ impl LocalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
             let mut trs = self.core.trs.write().unwrap();
+            let mut tracer_obj = self.core.tracer_obj.write().unwrap();
             let mut objs = self.core.objs.lock().unwrap();
+            let mut obj_gen = self.core.obj_gen.lock().unwrap();
+            let mut survive_count = self.core.survive_count.lock().unwrap();
             let mut fin = self.core.fin.lock().unwrap();
             mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+            tracer_obj.insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
             objs.insert(gc_ptr, mem_info_gc_ptr);
+            obj_gen.insert(gc_ptr, Generation::Gen0);
+            survive_count.insert(gc_ptr, 0);
             fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut GcPtr<T>); } }
             self.core.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_ptr::<T>);
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
     }
@@ -617,8 +741,10 @@ impl LocalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
             let mut trs = self.core.trs.write().unwrap();
+            let mut tracer_obj = self.core.tracer_obj.write().unwrap();
             mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+            tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
             gc
         }
     }
@@ -636,14 +762,21 @@ impl LocalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
             let mut trs = self.core.trs.write().unwrap();
+            let mut tracer_obj = self.core.tracer_obj.write().unwrap();
             let mut objs = self.core.objs.lock().unwrap();
+            let mut obj_gen = self.core.obj_gen.lock().unwrap();
+            let mut survive_count = self.core.survive_count.lock().unwrap();
             let mut fin = self.core.fin.lock().unwrap();
             mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
             trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
+            tracer_obj.insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
             objs.insert(gc_ptr, mem_info_gc_ptr);
+            obj_gen.insert(gc_ptr, Generation::Gen0);
+            survive_count.insert(gc_ptr, 0);
             fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>); } }
             self.core.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_cell_ptr::<T>);
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
     }
@@ -659,8 +792,10 @@ impl LocalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
             let mut trs = self.core.trs.write().unwrap();
+            let mut tracer_obj = self.core.tracer_obj.write().unwrap();
             mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             trs.insert(gc_inter_ptr, mem_info);
+            tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
             gc
         }
     }
