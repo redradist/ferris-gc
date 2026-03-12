@@ -417,24 +417,25 @@ impl<T> Finalize for GcRefCell<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
-type GcObjMem = *mut u8;
+pub(crate) type GcObjMem = *mut u8;
 
-type DropFn = unsafe fn(*mut u8);
+pub(crate) type DropFn = unsafe fn(*mut u8);
 
-pub struct LocalGarbageCollector {
-    mem_to_trc: RwLock<HashMap<usize, *const dyn Trace>>,
-    trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
-    objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
-    fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalize>>,
-    drop_fns: Mutex<HashMap<*const dyn Trace, DropFn>>,
+/// Shared GC bookkeeping used by both LocalGarbageCollector and GlobalGarbageCollector.
+pub(crate) struct GarbageCollector {
+    pub(crate) mem_to_trc: RwLock<HashMap<usize, *const dyn Trace>>,
+    pub(crate) trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
+    pub(crate) objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
+    pub(crate) fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalize>>,
+    pub(crate) drop_fns: Mutex<HashMap<*const dyn Trace, DropFn>>,
 }
 
-unsafe impl Sync for LocalGarbageCollector {}
-unsafe impl Send for LocalGarbageCollector {}
+unsafe impl Sync for GarbageCollector {}
+unsafe impl Send for GarbageCollector {}
 
-impl LocalGarbageCollector {
-    fn new() -> LocalGarbageCollector {
-        LocalGarbageCollector {
+impl GarbageCollector {
+    pub(crate) fn new() -> GarbageCollector {
+        GarbageCollector {
             mem_to_trc: RwLock::new(HashMap::new()),
             trs: RwLock::new(HashMap::new()),
             objs: Mutex::new(HashMap::new()),
@@ -447,92 +448,7 @@ impl LocalGarbageCollector {
         &self.objs
     }
 
-    unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
-        where T: Sized + Trace {
-        unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<GcPtr<T>>();
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
-            std::ptr::write(gc_ptr, GcPtr::new(t));
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
-            let gc = Gc {
-                internal_ptr: gc_inter_ptr,
-                ptr: gc_ptr,
-            };
-            (*(*gc.internal_ptr).ptr).reset_root();
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
-            let mut objs = self.objs.lock().unwrap();
-            let mut fin = self.fin.lock().unwrap();
-            mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
-            trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            objs.insert(gc_ptr, mem_info_gc_ptr);
-            fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
-            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut GcPtr<T>); } }
-            self.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_ptr::<T>);
-            gc
-        }
-    }
-
-    unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
-        unsafe {
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
-            let gc = Gc {
-                internal_ptr: gc_inter_ptr,
-                ptr: gc.ptr,
-            };
-            (*(*gc.internal_ptr).ptr).reset_root();
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
-            mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
-            trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            gc
-        }
-    }
-
-    unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T> where T: Sized + Trace {
-        unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<RefCell<GcPtr<T>>>();
-            let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcRefCellInternal<T>>();
-            std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
-            std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
-            let gc = GcRefCell {
-                internal_ptr: gc_cell_inter_ptr,
-                ptr: gc_ptr,
-            };
-            (*(*gc.internal_ptr).ptr).reset_root();
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
-            let mut objs = self.objs.lock().unwrap();
-            let mut fin = self.fin.lock().unwrap();
-            mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
-            trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
-            objs.insert(gc_ptr, mem_info_gc_ptr);
-            fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
-            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>); } }
-            self.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_cell_ptr::<T>);
-            gc
-        }
-    }
-
-    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T> where T: Sized + Trace {
-        unsafe {
-            let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcRefCellInternal<T>>();
-            std::ptr::write(gc_inter_ptr, GcRefCellInternal::new(gc.ptr));
-            let gc = GcRefCell {
-                internal_ptr: gc_inter_ptr,
-                ptr: gc.ptr,
-            };
-            (*(*gc.internal_ptr).ptr).reset_root();
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
-            mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
-            trs.insert(gc_inter_ptr, mem_info);
-            gc
-        }
-    }
-
-    unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
+    pub(crate) unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
         unsafe {
             let layout = Layout::new::<T>();
             let mem = alloc(layout);
@@ -544,7 +460,7 @@ impl LocalGarbageCollector {
         }
     }
 
-    unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
+    pub(crate) unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
         unsafe {
             let mut mem_to_trc = self.mem_to_trc.write().unwrap();
             let mut trs = self.trs.write().unwrap();
@@ -558,41 +474,34 @@ impl LocalGarbageCollector {
 
     pub unsafe fn collect(&self) {
         unsafe {
-            // Phase 1-5: under locks, identify what to collect
             let (tracer_deallocs, object_deallocs) = {
                 let mut mem_to_trc = self.mem_to_trc.write().unwrap();
                 let mut trs = self.trs.write().unwrap();
-                // Trace from roots
                 for (gc_info, _) in &*trs {
                     let tracer = &(**gc_info);
                     if tracer.is_root() {
                         tracer.trace();
                     }
                 }
-                // Identify unreachable tracers
                 let collected_tracers: Vec<_> = trs.iter()
                     .filter(|(gc_info, _)| !(&***gc_info).is_traceable())
                     .map(|(k, _)| *k)
                     .collect();
-                // Remove collected tracers from maps, gather dealloc info
                 let mut tracer_deallocs = Vec::new();
                 for tracer_ptr in collected_tracers {
                     let del = trs.remove(&tracer_ptr).unwrap();
                     mem_to_trc.remove(&tracer_ptr.get_thin_ptr());
                     tracer_deallocs.push(del);
                 }
-                // Identify unreachable objects
                 let mut objs = self.objs.lock().unwrap();
                 let collected_objects: Vec<_> = objs.iter()
                     .filter(|(gc_info, _)| !(&***gc_info).is_traceable())
                     .map(|(k, _)| *k)
                     .collect();
-                // Reset remaining tracers
                 for (gc_info, _) in &*trs {
                     let tracer = &(**gc_info);
                     tracer.reset();
                 }
-                // Remove collected objects from maps, gather dealloc info
                 let mut fin = self.fin.lock().unwrap();
                 let mut drop_fns = self.drop_fns.lock().unwrap();
                 let mut object_deallocs = Vec::new();
@@ -604,7 +513,6 @@ impl LocalGarbageCollector {
                 }
                 (tracer_deallocs, object_deallocs)
             };
-            // Phase 6: all locks released — safe to call drop_in_place
             for (mem, layout) in tracer_deallocs {
                 dealloc(mem, layout);
             }
@@ -621,7 +529,7 @@ impl LocalGarbageCollector {
     }
 
     #[allow(dead_code)]
-    unsafe fn collect_all(&self) {
+    pub(crate) unsafe fn collect_all(&self) {
         unsafe {
             let (tracer_deallocs, object_deallocs) = {
                 let mut mem_to_trc = self.mem_to_trc.write().unwrap();
@@ -653,6 +561,121 @@ impl LocalGarbageCollector {
                 dealloc(mem, layout);
             }
         }
+    }
+}
+
+pub struct LocalGarbageCollector {
+    pub(crate) core: GarbageCollector,
+}
+
+unsafe impl Sync for LocalGarbageCollector {}
+unsafe impl Send for LocalGarbageCollector {}
+
+impl LocalGarbageCollector {
+    fn new() -> LocalGarbageCollector {
+        LocalGarbageCollector { core: GarbageCollector::new() }
+    }
+
+    pub fn get_objs(&self) -> &Mutex<HashMap<*const dyn Trace, (*mut u8, Layout)>> {
+        self.core.get_objs()
+    }
+
+    unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
+        where T: Sized + Trace {
+        unsafe {
+            let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<GcPtr<T>>();
+            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
+            std::ptr::write(gc_ptr, GcPtr::new(t));
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
+            let gc = Gc {
+                internal_ptr: gc_inter_ptr,
+                ptr: gc_ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
+            let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
+            let mut trs = self.core.trs.write().unwrap();
+            let mut objs = self.core.objs.lock().unwrap();
+            let mut fin = self.core.fin.lock().unwrap();
+            mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+            objs.insert(gc_ptr, mem_info_gc_ptr);
+            fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
+            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut GcPtr<T>); } }
+            self.core.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_ptr::<T>);
+            gc
+        }
+    }
+
+    unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
+        unsafe {
+            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
+            let gc = Gc {
+                internal_ptr: gc_inter_ptr,
+                ptr: gc.ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
+            let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
+            let mut trs = self.core.trs.write().unwrap();
+            mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            trs.insert(gc_inter_ptr, mem_info_internal_ptr);
+            gc
+        }
+    }
+
+    unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T> where T: Sized + Trace {
+        unsafe {
+            let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<RefCell<GcPtr<T>>>();
+            let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcRefCellInternal<T>>();
+            std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
+            std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
+            let gc = GcRefCell {
+                internal_ptr: gc_cell_inter_ptr,
+                ptr: gc_ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
+            let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
+            let mut trs = self.core.trs.write().unwrap();
+            let mut objs = self.core.objs.lock().unwrap();
+            let mut fin = self.core.fin.lock().unwrap();
+            mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
+            trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
+            objs.insert(gc_ptr, mem_info_gc_ptr);
+            fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
+            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>); } }
+            self.core.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_cell_ptr::<T>);
+            gc
+        }
+    }
+
+    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T> where T: Sized + Trace {
+        unsafe {
+            let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcRefCellInternal<T>>();
+            std::ptr::write(gc_inter_ptr, GcRefCellInternal::new(gc.ptr));
+            let gc = GcRefCell {
+                internal_ptr: gc_inter_ptr,
+                ptr: gc.ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
+            let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
+            let mut trs = self.core.trs.write().unwrap();
+            mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            trs.insert(gc_inter_ptr, mem_info);
+            gc
+        }
+    }
+
+    pub unsafe fn collect(&self) {
+        unsafe { self.core.collect(); }
+    }
+
+    #[allow(dead_code)]
+    unsafe fn collect_all(&self) {
+        unsafe { self.core.collect_all(); }
+    }
+
+    pub(crate) unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
+        unsafe { self.core.remove_tracer(tracer); }
     }
 }
 
@@ -757,24 +780,24 @@ mod tests {
     #[test]
     fn one_object() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.trs.read().unwrap().len());
         let _one = Gc::new(1);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 1);
+            assert_eq!(gc.borrow().core.trs.read().unwrap().len() - baseline, 1);
         });
     }
 
     #[test]
     fn gc_collect_one_from_one() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.trs.read().unwrap().len());
         {
             let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 0);
+            assert_eq!(gc.borrow().core.trs.read().unwrap().len() - baseline, 0);
         });
     }
 
@@ -784,11 +807,11 @@ mod tests {
         // Reassigning drops the old Gc (remove_tracer removes it from trs),
         // so only 1 tracer remains for the surviving Gc.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.trs.read().unwrap().len());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| {
-            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 1);
+            assert_eq!(gc.borrow().core.trs.read().unwrap().len() - baseline, 1);
         });
         drop(one);
     }
@@ -798,12 +821,12 @@ mod tests {
     fn gc_collect_after_reassign() {
         // After reassign, one live Gc remains. collect() keeps live objects.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.trs.read().unwrap().len());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 1);
+            assert_eq!(gc.borrow().core.trs.read().unwrap().len() - baseline, 1);
         });
         drop(one);
     }
@@ -812,7 +835,7 @@ mod tests {
     #[allow(unused_assignments)]
     fn gc_collect_two_from_two() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.trs.read().unwrap().len());
         {
             let mut one = Gc::new(1);
             one = Gc::new(2);
@@ -820,29 +843,29 @@ mod tests {
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 0);
+            assert_eq!(gc.borrow().core.trs.read().unwrap().len() - baseline, 0);
         });
     }
 
     #[test]
     fn mem_to_trc_cleaned_on_collect() {
         clean_gc_state();
-        let baseline_trs = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
-        let baseline_m2t = LOCAL_GC.with(|gc| gc.borrow().mem_to_trc.read().unwrap().len());
+        let baseline_trs = LOCAL_GC.with(|gc| gc.borrow().core.trs.read().unwrap().len());
+        let baseline_m2t = LOCAL_GC.with(|gc| gc.borrow().core.mem_to_trc.read().unwrap().len());
         {
             let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline_trs, 0);
-            assert_eq!(gc.borrow().mem_to_trc.read().unwrap().len() - baseline_m2t, 0);
+            assert_eq!(gc.borrow().core.trs.read().unwrap().len() - baseline_trs, 0);
+            assert_eq!(gc.borrow().core.mem_to_trc.read().unwrap().len() - baseline_m2t, 0);
         });
     }
 
     #[test]
     fn collect_from_another_thread() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.trs.read().unwrap().len());
         let _one = Gc::new(42);
         LOCAL_GC.with(|gc| {
             let gc_ptr = gc.as_ptr();
@@ -852,7 +875,7 @@ mod tests {
                     unsafe { gc_ref.collect(); }
                 });
             });
-            assert_eq!(gc.borrow().trs.read().unwrap().len() - baseline, 1);
+            assert_eq!(gc.borrow().core.trs.read().unwrap().len() - baseline, 1);
         });
     }
 
@@ -896,12 +919,12 @@ mod tests {
     #[test]
     fn clone_from_registers_with_gc() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().trs.read().unwrap().len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.trs.read().unwrap().len());
         let source = Gc::new(42);
         let mut target = Gc::new(99);
         target.clone_from(&source);
         LOCAL_GC.with(|gc| {
-            let delta = gc.borrow().trs.read().unwrap().len() - baseline;
+            let delta = gc.borrow().core.trs.read().unwrap().len() - baseline;
             // source + target + the new clone's tracer = at least 2 alive
             assert!(delta >= 2, "clone_from should register new tracer with GC, got {delta}");
         });

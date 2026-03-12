@@ -1,12 +1,12 @@
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::Layout;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
-use crate::gc::{Finalize, Trace, ThinPtr};
+use crate::gc::{Finalize, Trace, GarbageCollector};
 use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
 
 pub type OptGc<T> = Option<Gc<T>>;
@@ -380,41 +380,27 @@ impl<T> Finalize for GcRefCell<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
-type GcObjMem = *mut u8;
-type DropFn = unsafe fn(*mut u8);
-
 pub struct GlobalGarbageCollector {
-    mem_to_trc: RwLock<HashMap<usize, *const dyn Trace>>,
-    trs: RwLock<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
-    objs: Mutex<HashMap<*const dyn Trace, (GcObjMem, Layout)>>,
-    fin: Mutex<HashMap<*const dyn Trace, *const dyn Finalize>>,
-    drop_fns: Mutex<HashMap<*const dyn Trace, DropFn>>,
+    pub(crate) core: GarbageCollector,
 }
 
 unsafe impl Sync for GlobalGarbageCollector {}
-
 unsafe impl Send for GlobalGarbageCollector {}
 
 impl GlobalGarbageCollector {
     fn new() -> GlobalGarbageCollector {
-        GlobalGarbageCollector {
-            mem_to_trc: RwLock::new(HashMap::new()),
-            trs: RwLock::new(HashMap::new()),
-            objs: Mutex::new(HashMap::new()),
-            fin: Mutex::new(HashMap::new()),
-            drop_fns: Mutex::new(HashMap::new()),
-        }
+        GlobalGarbageCollector { core: GarbageCollector::new() }
     }
 
     pub fn get_objs(&self) -> &Mutex<HashMap<*const dyn Trace, (*mut u8, Layout)>> {
-        &self.objs
+        self.core.get_objs()
     }
 
     unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
         where T: Sized + Trace {
         unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<GcPtr<T>>();
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
+            let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<GcPtr<T>>();
+            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             std::ptr::write(gc_ptr, GcPtr::new(t));
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
             let gc = Gc {
@@ -422,31 +408,31 @@ impl GlobalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
-            let mut objs = self.objs.lock().unwrap();
-            let mut fin = self.fin.lock().unwrap();
+            let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
+            let mut trs = self.core.trs.write().unwrap();
+            let mut objs = self.core.objs.lock().unwrap();
+            let mut fin = self.core.fin.lock().unwrap();
             mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             objs.insert(gc_ptr, mem_info_gc_ptr);
             fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut GcPtr<T>); } }
-            self.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_ptr::<T>);
+            self.core.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_ptr::<T>);
             gc
         }
     }
 
     unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
         unsafe {
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcInternal<T>>();
+            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
+            let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
+            let mut trs = self.core.trs.write().unwrap();
             mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             gc
@@ -455,8 +441,8 @@ impl GlobalGarbageCollector {
 
     unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T> where T: Sized + Trace {
         unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem::<RefCell<GcPtr<T>>>();
-            let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.alloc_mem::<GcRefCellInternal<T>>();
+            let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<RefCell<GcPtr<T>>>();
+            let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcRefCellInternal<T>>();
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
             std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
             let gc = GcRefCell {
@@ -464,158 +450,48 @@ impl GlobalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
-            let mut objs = self.objs.lock().unwrap();
-            let mut fin = self.fin.lock().unwrap();
+            let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
+            let mut trs = self.core.trs.write().unwrap();
+            let mut objs = self.core.objs.lock().unwrap();
+            let mut fin = self.core.fin.lock().unwrap();
             mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
             trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
             objs.insert(gc_ptr, mem_info_gc_ptr);
             fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>); } }
-            self.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_cell_ptr::<T>);
+            self.core.drop_fns.lock().unwrap().insert(gc_ptr, drop_gc_cell_ptr::<T>);
             gc
         }
     }
 
     unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T> where T: Sized + Trace {
         unsafe {
-            let (gc_inter_ptr, mem_info) = self.alloc_mem::<GcRefCellInternal<T>>();
+            let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcRefCellInternal<T>>();
             std::ptr::write(gc_inter_ptr, GcRefCellInternal::new(gc.ptr));
             let gc = GcRefCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
+            let mut mem_to_trc = self.core.mem_to_trc.write().unwrap();
+            let mut trs = self.core.trs.write().unwrap();
             mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             trs.insert(gc_inter_ptr, mem_info);
             gc
         }
     }
 
-    unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout)) where T: Sized {
-        unsafe {
-            let layout = Layout::new::<T>();
-            let mem = alloc(layout);
-            if mem.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            let type_ptr: *mut T = mem as *mut _;
-            (type_ptr, (mem, layout))
-        }
-    }
-
-    unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
-        unsafe {
-            let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-            let mut trs = self.trs.write().unwrap();
-            let tracer_thin_ptr = tracer.get_thin_ptr();
-            if let Some(tracer) = mem_to_trc.remove(&tracer_thin_ptr) {
-                if let Some(del) = trs.remove(&tracer) {
-                    dealloc(del.0, del.1);
-                }
-            }
-        }
-    }
-
     pub unsafe fn collect(&self) {
-        unsafe {
-            let (tracer_deallocs, object_deallocs) = {
-                let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-                let mut trs = self.trs.write().unwrap();
-                // Trace from roots
-                for (gc_info, _) in &*trs {
-                    let tracer = &(**gc_info);
-                    if tracer.is_root() {
-                        tracer.trace();
-                    }
-                }
-                // Identify unreachable tracers
-                let collected_tracers: Vec<_> = trs.iter()
-                    .filter(|(gc_info, _)| !(&***gc_info).is_traceable())
-                    .map(|(k, _)| *k)
-                    .collect();
-                // Remove collected tracers from maps
-                let mut tracer_deallocs = Vec::new();
-                for tracer_ptr in collected_tracers {
-                    let del = trs.remove(&tracer_ptr).unwrap();
-                    mem_to_trc.remove(&tracer_ptr.get_thin_ptr());
-                    tracer_deallocs.push(del);
-                }
-                // Identify unreachable objects
-                let mut objs = self.objs.lock().unwrap();
-                let collected_objects: Vec<_> = objs.iter()
-                    .filter(|(gc_info, _)| !(&***gc_info).is_traceable())
-                    .map(|(k, _)| *k)
-                    .collect();
-                // Reset remaining tracers
-                for (gc_info, _) in &*trs {
-                    let tracer = &(**gc_info);
-                    tracer.reset();
-                }
-                // Remove collected objects from maps
-                let mut fin = self.fin.lock().unwrap();
-                let mut drop_fns = self.drop_fns.lock().unwrap();
-                let mut object_deallocs = Vec::new();
-                for col in collected_objects {
-                    let del = objs.remove(&col).unwrap();
-                    let finalizer = fin.remove(&col);
-                    let drop_fn = drop_fns.remove(&col);
-                    object_deallocs.push((del, finalizer, drop_fn));
-                }
-                (tracer_deallocs, object_deallocs)
-            };
-            // All locks released — safe to call drop_in_place
-            for (mem, layout) in tracer_deallocs {
-                dealloc(mem, layout);
-            }
-            for ((mem, layout), finalizer, drop_fn) in object_deallocs {
-                if let Some(f) = finalizer {
-                    (*f).finalize();
-                }
-                if let Some(drop_fn) = drop_fn {
-                    (drop_fn)(mem);
-                }
-                dealloc(mem, layout);
-            }
-        }
+        unsafe { self.core.collect(); }
     }
 
     #[allow(dead_code)]
     unsafe fn collect_all(&self) {
-        unsafe {
-            let (tracer_deallocs, object_deallocs) = {
-                let mut mem_to_trc = self.mem_to_trc.write().unwrap();
-                let mut trs = self.trs.write().unwrap();
-                let mut objs = self.objs.lock().unwrap();
-                let mut fin = self.fin.lock().unwrap();
-                let mut drop_fns = self.drop_fns.lock().unwrap();
-                let tracer_deallocs: Vec<_> = trs.drain().map(|(k, v)| {
-                    mem_to_trc.remove(&k.get_thin_ptr());
-                    v
-                }).collect();
-                let object_deallocs: Vec<_> = objs.drain().map(|(k, v)| {
-                    let finalizer = fin.remove(&k);
-                    let drop_fn = drop_fns.remove(&k);
-                    (v, finalizer, drop_fn)
-                }).collect();
-                (tracer_deallocs, object_deallocs)
-            };
-            for (mem, layout) in tracer_deallocs {
-                dealloc(mem, layout);
-            }
-            for ((mem, layout), finalizer, drop_fn) in object_deallocs {
-                if let Some(f) = finalizer {
-                    (*f).finalize();
-                }
-                if let Some(drop_fn) = drop_fn {
-                    (drop_fn)(mem);
-                }
-                dealloc(mem, layout);
-            }
-        }
+        unsafe { self.core.collect_all(); }
+    }
+
+    pub(crate) unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
+        unsafe { self.core.remove_tracer(tracer); }
     }
 }
 
@@ -728,7 +604,7 @@ mod tests {
     fn setup() -> (std::sync::MutexGuard<'static, ()>, usize) {
         let guard = TEST_MUTEX.lock().unwrap();
         unsafe { (*GLOBAL_GC).collect() };
-        let baseline = (*GLOBAL_GC).trs.read().unwrap().len();
+        let baseline = (*GLOBAL_GC).core.trs.read().unwrap().len();
         (guard, baseline)
     }
 
@@ -737,7 +613,7 @@ mod tests {
         let (_guard, baseline) = setup();
         let _one = Gc::new(1);
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 1);
+        assert_eq!((*GLOBAL_GC).core.trs.read().unwrap().len() - baseline, 1);
     }
 
     #[test]
@@ -747,7 +623,7 @@ mod tests {
             let _one = Gc::new(1);
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 0);
+        assert_eq!((*GLOBAL_GC).core.trs.read().unwrap().len() - baseline, 0);
     }
 
     #[test]
@@ -758,7 +634,7 @@ mod tests {
         one = Gc::new(2);
         unsafe { (*GLOBAL_GC).collect() };
         // Reassignment drops old Gc (remove_tracer), so only 1 tracer remains
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 1);
+        assert_eq!((*GLOBAL_GC).core.trs.read().unwrap().len() - baseline, 1);
         drop(one);
     }
 
@@ -770,7 +646,7 @@ mod tests {
         one = Gc::new(2);
         unsafe { (*GLOBAL_GC).collect() };
         // one is still live, so 1 tracer remains
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 1);
+        assert_eq!((*GLOBAL_GC).core.trs.read().unwrap().len() - baseline, 1);
         drop(one);
     }
 
@@ -784,7 +660,7 @@ mod tests {
             drop(one);
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).trs.read().unwrap().len() - baseline, 0);
+        assert_eq!((*GLOBAL_GC).core.trs.read().unwrap().len() - baseline, 0);
     }
 
     #[test]
