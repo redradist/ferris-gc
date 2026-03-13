@@ -12,10 +12,12 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+default = ["std"]
+std = ["lazy_static"]
 proc-macro = ["ferris-gc-proc-macro"]
 
 [dependencies]
-lazy_static = "1.4.0"
+lazy_static = { version = "1.4.0", optional = true }
 ferris-gc-proc-macro = { path = "../ferris_gc_proc_macro", version = "0.1.2", optional = true }
 
 [dev-dependencies]

@@ -39,7 +39,7 @@ Internal type hierarchy per GC: `Gc<T>` → `GcInternal<T>` (ref counting + root
 
 ### Procedural Macros (`ferris_gc_proc_macro`)
 
-- `#[derive(Trace)]` — Auto-implements Trace; supports `#[unsafe_ignore_trace]` to skip fields. Only works on structs (panics on enums/unions).
+- `#[derive(Trace)]` — Auto-implements Trace for structs and enums; supports `#[unsafe_ignore_trace]` to skip fields. Uses span-based compile errors (not panics).
 - `#[derive(Finalize)]` — Generates empty finalize impl.
 - `#[ferris_gc_main]` — Wraps `main()` to inject `ApplicationCleanup` for graceful background-thread shutdown.
 
@@ -51,6 +51,15 @@ Background thread wakes every 500ms to call `collect()` on registered GCs. `Appl
 
 Pre-built `Trace`/`Finalize` impls for primitives, String, Box, Vec, HashMap, BTreeMap, Option, and other std collections.
 
+### Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `std` | yes | Full GC runtime (collectors, strategies, threading) |
+| `proc-macro` | no | `#[derive(Trace, Finalize)]` and `#[ferris_gc_main]` |
+
+With `--no-default-features`, only core traits (`Trace`, `Finalize`) and `generation` types are exported (`no_std` compatible).
+
 ## Known Issues
 
-Several tests are currently failing (e.g., `gc_collect_one_from_two`, `two_objects` in both local and sync modules). There are also unused import warnings across the codebase.
+Some sync tests are flaky due to shared global GC state (test ordering sensitive). Run individual tests with `cargo test -- <test_name>` if a sync test fails in batch.
