@@ -4,3 +4,6 @@ members = [
     "ferris_gc",
     "ferris_gc_proc_macro",
 ]
+exclude = [
+    "ferris_gc/fuzz",
+]

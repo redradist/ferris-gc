@@ -75,10 +75,12 @@ impl<K: SlotKey, V> SlotMap<K, V> {
         }
     }
 
+    /// Number of occupied slots.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns `true` if there are no occupied slots.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -168,6 +170,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
         }
     }
 
+    /// Look up a value by key. Returns `None` if the key is stale or invalid.
     pub fn get(&self, key: K) -> Option<&V> {
         let idx = key.index() as usize;
         if idx >= self.slots.len() {
@@ -183,6 +186,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
         }
     }
 
+    /// Mutable look up by key. Returns `None` if the key is stale or invalid.
     pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
         let idx = key.index() as usize;
         if idx >= self.slots.len() {
@@ -198,6 +202,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
         }
     }
 
+    /// Returns `true` if the key refers to a currently occupied slot.
     pub fn contains_key(&self, key: K) -> bool {
         self.get(key).is_some()
     }
@@ -270,6 +275,7 @@ impl<K: SlotKey, V> Default for SlotMap<K, V> {
 
 // --- Iterators ---
 
+/// Immutable iterator over occupied `(key, &value)` pairs in a `SlotMap`.
 pub struct Iter<'a, K: SlotKey, V> {
     slots: &'a [Slot<V>],
     idx: usize,
@@ -298,6 +304,7 @@ impl<'a, K: SlotKey, V> Iterator for Iter<'a, K, V> {
     }
 }
 
+/// Mutable iterator over occupied `(key, &mut value)` pairs in a `SlotMap`.
 pub struct IterMut<'a, K: SlotKey, V> {
     slots: &'a mut [Slot<V>],
     idx: usize,

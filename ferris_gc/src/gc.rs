@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::basic_gc_strategy::{BASIC_STRATEGY_LOCAL_GCS, basic_gc_strategy_start};
 
@@ -77,7 +78,9 @@ pub trait Finalize {
     }
 }
 
+/// Convenience alias for an optional GC-managed pointer.
 pub type OptGc<T> = Option<Gc<T>>;
+/// Convenience alias for an optional GC-managed interior-mutable cell.
 pub type OptGcCell<T> = Option<GcRefCell<T>>;
 
 struct GcInfo {
@@ -348,6 +351,8 @@ impl<T> Gc<T>
 where
     T: Sized + Trace,
 {
+    /// Allocate a new GC-managed object on the thread-local collector.
+    /// Starts the background collection strategy if not already active.
     pub fn new(t: T) -> Gc<T> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
@@ -360,6 +365,7 @@ where
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
+    /// On OOM, triggers an emergency GC collection and retries once before failing.
     pub fn try_new(t: T) -> Result<Gc<T>, GcAllocError> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
@@ -581,6 +587,8 @@ impl<T> GcRefCell<T>
 where
     T: 'static + Sized + Trace,
 {
+    /// Allocate a new GC-managed interior-mutable cell on the thread-local collector.
+    /// The contained value can be borrowed mutably via `borrow_mut()`.
     pub fn new(t: T) -> GcRefCell<T> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
@@ -593,6 +601,7 @@ where
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
+    /// On OOM, triggers an emergency GC collection and retries once before failing.
     pub fn try_new(t: T) -> Result<GcRefCell<T>, GcAllocError> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
@@ -681,6 +690,10 @@ where
     ptr: *const GcPtr<T>,
 }
 
+// SAFETY: GcWeak contains only an Arc<AtomicBool> (thread-safe) and a raw pointer
+// to the GcPtr (never written through). The pointer is only used for upgrade(),
+// which goes through the GC's Mutex-protected maps. Send/Sync bounds on T
+// ensure the underlying data is safe to share.
 unsafe impl<T> Send for GcWeak<T> where T: 'static + Sized + Trace + Send {}
 unsafe impl<T> Sync for GcWeak<T> where T: 'static + Sized + Trace + Sync {}
 
@@ -870,6 +883,9 @@ pub(crate) struct GarbageCollector {
     pub(crate) next_region_id: AtomicU32,
 }
 
+// SAFETY: All mutable state in GarbageCollector is behind Mutex or atomic types,
+// ensuring exclusive access across threads. Raw pointers stored in ObjectEntry/TracerEntry
+// are only dereferenced while holding the gc_maps Mutex lock.
 unsafe impl Sync for GarbageCollector {}
 unsafe impl Send for GarbageCollector {}
 
@@ -953,6 +969,27 @@ impl GarbageCollector {
             }
             let type_ptr: *mut T = mem as *mut _;
             Ok((type_ptr, (mem, layout)))
+        }
+    }
+
+    /// Fallible allocation with emergency GC collection on first failure.
+    /// If the initial allocation fails, runs a full GC cycle to free dead objects,
+    /// then retries once. Returns `Err(GcAllocError)` only if the retry also fails.
+    pub(crate) unsafe fn try_alloc_mem_with_gc<T>(
+        &self,
+    ) -> Result<(*mut T, (GcObjMem, Layout)), GcAllocError>
+    where
+        T: Sized,
+    {
+        unsafe {
+            match self.try_alloc_mem::<T>() {
+                Ok(result) => Ok(result),
+                Err(_) => {
+                    // Emergency collection: free dead objects and retry
+                    self.collect();
+                    self.try_alloc_mem::<T>()
+                }
+            }
         }
     }
 
@@ -1576,6 +1613,75 @@ impl GarbageCollector {
         }
     }
 
+    /// Time-budgeted incremental mark step.
+    /// Processes gray objects until `max_duration` elapses or the gray stack is empty.
+    /// Returns `true` when marking is complete.
+    ///
+    /// Unlike `mark_step` which limits by object count, this limits by wall-clock
+    /// time, making pause times predictable regardless of object graph shape.
+    pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
+        let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+        let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+
+        let deadline = Instant::now() + max_duration;
+        let mut children_buf = Vec::new();
+
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            let obj_id = match incr.gray_stack.pop() {
+                Some(id) => id,
+                None => break,
+            };
+
+            children_buf.clear();
+            if let Some(entry) = gc_maps.objects.get(obj_id) {
+                // SAFETY: entry.ptr is valid for the lifetime of the GcMaps lock.
+                unsafe {
+                    (&*entry.ptr).trace_children(&mut children_buf);
+                }
+            }
+
+            for &child_ptr in &children_buf {
+                let thin = child_ptr.get_thin_ptr();
+                if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin)
+                    && let Some(color) = incr.colors.get_mut(&child_id)
+                    && *color == MarkColor::White
+                {
+                    *color = MarkColor::Gray;
+                    incr.gray_stack.push(child_id);
+                }
+            }
+
+            incr.colors.insert(obj_id, MarkColor::Black);
+        }
+
+        incr.gray_stack.is_empty()
+    }
+
+    /// Run a complete incremental collection with time-budgeted mark steps.
+    /// Each mark step runs for at most `max_step_duration`, then releases
+    /// the STW lock to allow mutator progress.
+    pub unsafe fn collect_incremental_timed(
+        &self,
+        max_gen: Generation,
+        max_step_duration: Duration,
+    ) -> CollectionStats {
+        unsafe {
+            self.begin_collection(max_gen);
+            loop {
+                let done = self.mark_step_timed(max_step_duration);
+                if done {
+                    break;
+                }
+            }
+            self.finish_collection()
+        }
+    }
+
     // ---- Concurrent marking (Strategy 21) ----
 
     /// Begin a concurrent collection cycle.
@@ -1680,6 +1786,59 @@ impl GarbageCollector {
                 }
             }
             // finish_collection handles re-graying from remembered set + new roots
+            self.finish_collection()
+        }
+    }
+
+    /// Time-budgeted concurrent mark step. NO STW lock required.
+    /// Processes gray objects from the edge snapshot until `max_duration` elapses
+    /// or the gray stack is empty. Returns `true` when marking is complete.
+    pub fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + max_duration;
+
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            let obj_id = match incr.gray_stack.pop() {
+                Some(id) => id,
+                None => break,
+            };
+
+            if let Some(children) = incr.edges.get(&obj_id).cloned() {
+                for child_id in children {
+                    if let Some(color) = incr.colors.get_mut(&child_id)
+                        && *color == MarkColor::White
+                    {
+                        *color = MarkColor::Gray;
+                        incr.gray_stack.push(child_id);
+                    }
+                }
+            }
+
+            incr.colors.insert(obj_id, MarkColor::Black);
+        }
+
+        incr.gray_stack.is_empty()
+    }
+
+    /// Run a complete concurrent collection with time-budgeted mark steps.
+    /// Each mark step runs for at most `max_step_duration` with no STW overhead.
+    pub unsafe fn collect_concurrent_timed(
+        &self,
+        max_gen: Generation,
+        max_step_duration: Duration,
+    ) -> CollectionStats {
+        unsafe {
+            self.begin_concurrent_collection(max_gen);
+            loop {
+                let done = self.concurrent_mark_step_timed(max_step_duration);
+                if done {
+                    break;
+                }
+            }
             self.finish_collection()
         }
     }
@@ -1831,10 +1990,15 @@ impl GarbageCollector {
     }
 }
 
+/// Thread-local garbage collector wrapper.
+/// Each thread gets its own `LocalGarbageCollector` via the `LOCAL_GC` thread-local.
+/// Provides allocation (`create_gc`), collection (`collect`), and incremental/concurrent
+/// collection methods. All operations are single-threaded (no cross-thread sharing).
 pub struct LocalGarbageCollector {
     pub(crate) core: GarbageCollector,
 }
 
+// SAFETY: Delegates to GarbageCollector which protects all state with Mutex/atomics.
 unsafe impl Sync for LocalGarbageCollector {}
 unsafe impl Send for LocalGarbageCollector {}
 
@@ -2020,9 +2184,9 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem::<GcPtr<T>>()?;
+            let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem_with_gc::<GcPtr<T>>()?;
             let (gc_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem::<GcInternal<T>>() {
+                match self.core.try_alloc_mem_with_gc::<GcInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
                         dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
@@ -2078,9 +2242,10 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem::<RefCell<GcPtr<T>>>()?;
+            let (gc_ptr, mem_info_gc_ptr) =
+                self.core.try_alloc_mem_with_gc::<RefCell<GcPtr<T>>>()?;
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem::<GcRefCellInternal<T>>() {
+                match self.core.try_alloc_mem_with_gc::<GcRefCellInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
                         dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
@@ -2258,6 +2423,49 @@ impl LocalGarbageCollector {
         unsafe { self.core.collect_concurrent(max_gen, step_budget) }
     }
 
+    /// Time-budgeted incremental mark step. See [`GarbageCollector::mark_step_timed`].
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
+        unsafe { self.core.mark_step_timed(max_duration) }
+    }
+
+    /// Run a complete incremental collection with time-budgeted steps.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn collect_incremental_timed(
+        &self,
+        max_gen: Generation,
+        max_step_duration: Duration,
+    ) -> CollectionStats {
+        unsafe {
+            self.core
+                .collect_incremental_timed(max_gen, max_step_duration)
+        }
+    }
+
+    /// Time-budgeted concurrent mark step. NO STW lock — safe for concurrent use.
+    pub fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
+        self.core.concurrent_mark_step_timed(max_duration)
+    }
+
+    /// Run a complete concurrent collection with time-budgeted steps.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn collect_concurrent_timed(
+        &self,
+        max_gen: Generation,
+        max_step_duration: Duration,
+    ) -> CollectionStats {
+        unsafe {
+            self.core
+                .collect_concurrent_timed(max_gen, max_step_duration)
+        }
+    }
+
     /// Create a new region. Future allocations go into this region.
     pub fn new_region(&self) -> RegionId {
         self.core.new_region()
@@ -2291,10 +2499,16 @@ impl PartialEq for &LocalGarbageCollector {
     }
 }
 
+/// Callback to start a collection strategy. Receives the GC and an "active" flag;
+/// may spawn a background thread and return its `JoinHandle`.
 pub type StartLocalStrategyFn =
     Box<dyn FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
+/// Callback to stop a collection strategy.
 pub type StopLocalStrategyFn = Box<dyn FnMut(&'static LocalGarbageCollector)>;
 
+/// Pluggable collection strategy for the thread-local GC.
+/// Controls when and how garbage collection runs (e.g., periodic background thread,
+/// allocation-triggered, or manual). Use `change_strategy` to swap at runtime.
 pub struct LocalStrategy {
     gc: Cell<&'static LocalGarbageCollector>,
     is_active: AtomicBool,
@@ -2323,6 +2537,7 @@ impl LocalStrategy {
         }
     }
 
+    /// Replace the current collection strategy. Stops the current strategy first if active.
     pub fn change_strategy<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn)
     where
         StartFn: 'static
@@ -2336,10 +2551,12 @@ impl LocalStrategy {
         let _ = self.stop_func.replace(Box::new(stop_fn));
     }
 
+    /// Returns `true` if the strategy's background collection is currently running.
     pub fn is_active(&self) -> bool {
         self.is_active.load(Ordering::Acquire)
     }
 
+    /// Start the collection strategy (e.g., spawn a background collection thread).
     pub fn start(&'static self) {
         self.is_active.store(true, Ordering::Release);
         self.join_handle.replace((*(self.start_func.borrow_mut()))(
@@ -2348,6 +2565,7 @@ impl LocalStrategy {
         ));
     }
 
+    /// Stop the collection strategy and join any background thread.
     pub fn stop(&self) {
         self.is_active.store(false, Ordering::Release);
         if let Some(join_handle) = self.join_handle.borrow_mut().take() {
@@ -2367,7 +2585,7 @@ impl Drop for LocalStrategy {
 }
 
 thread_local! {
-    static LOCAL_GC: RefCell<LocalGarbageCollector> = RefCell::new(LocalGarbageCollector::new());
+    pub static LOCAL_GC: RefCell<LocalGarbageCollector> = RefCell::new(LocalGarbageCollector::new());
     pub static LOCAL_GC_STRATEGY: RefCell<LocalStrategy> = {
         LOCAL_GC.with(move |gc| {
             let gc = unsafe { &mut *gc.as_ptr() };
@@ -4224,5 +4442,77 @@ mod tests {
             baseline,
             "object freed after last handle dropped"
         );
+    }
+
+    #[test]
+    fn timed_incremental_collection_works() {
+        use std::time::Duration;
+        clean_gc_state();
+        // Keep objects alive during collection to verify timed marking scans them
+        let v: Vec<Gc<i32>> = (0..100).map(|i| Gc::new(i)).collect();
+
+        LOCAL_GC.with(|gc| {
+            let gc_ref = gc.borrow();
+            let objs_before = gc_ref
+                .core
+                .gc_maps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .objects
+                .len();
+            unsafe {
+                let stats = gc_ref.core.collect_incremental_timed(
+                    crate::generation::Generation::Gen2,
+                    Duration::from_secs(1),
+                );
+                // All live objects should be scanned, none collected
+                assert_eq!(stats.objects_collected, 0);
+                assert!(stats.objects_scanned > 0);
+            }
+            let objs_after = gc_ref
+                .core
+                .gc_maps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .objects
+                .len();
+            assert_eq!(objs_before, objs_after, "no objects should be collected");
+        });
+        drop(v);
+    }
+
+    #[test]
+    fn timed_concurrent_collection_works() {
+        use std::time::Duration;
+        clean_gc_state();
+        let v: Vec<Gc<i32>> = (0..100).map(|i| Gc::new(i)).collect();
+
+        LOCAL_GC.with(|gc| {
+            let gc_ref = gc.borrow();
+            let objs_before = gc_ref
+                .core
+                .gc_maps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .objects
+                .len();
+            unsafe {
+                let stats = gc_ref.core.collect_concurrent_timed(
+                    crate::generation::Generation::Gen2,
+                    Duration::from_secs(1),
+                );
+                assert_eq!(stats.objects_collected, 0);
+                assert!(stats.objects_scanned > 0);
+            }
+            let objs_after = gc_ref
+                .core
+                .gc_maps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .objects
+                .len();
+            assert_eq!(objs_before, objs_after, "no objects should be collected");
+        });
+        drop(v);
     }
 }

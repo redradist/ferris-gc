@@ -1,0 +1,34 @@
+[package]
+name = "ferris-gc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ferris-gc]
+path = ".."
+
+[[bin]]
+name = "fuzz_alloc_drop"
+path = "fuzz_targets/fuzz_alloc_drop.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_cyclic"
+path = "fuzz_targets/fuzz_cyclic.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_incremental"
+path = "fuzz_targets/fuzz_incremental.rs"
+test = false
+doc = false

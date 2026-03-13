@@ -3,13 +3,16 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::basic_gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
 use crate::gc::{Finalize, GarbageCollector, ObjectEntry, ThinPtr, Trace, TracerEntry};
 use crate::generation::Generation;
 use crate::slot_map::{ObjectId, TracerId};
 
+/// Convenience alias for an optional thread-safe GC pointer.
 pub type OptGc<T> = Option<Gc<T>>;
+/// Convenience alias for an optional thread-safe GC interior-mutable cell.
 pub type OptGcCell<T> = Option<GcRefCell<T>>;
 
 struct GcInfo {
@@ -280,6 +283,8 @@ impl<T> Gc<T>
 where
     T: Sized + Trace,
 {
+    /// Allocate a new thread-safe GC-managed object on the global collector.
+    /// Starts the background collection strategy if not already active.
     pub fn new(t: T) -> Gc<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
@@ -287,6 +292,7 @@ where
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
+    /// On OOM, triggers an emergency GC collection and retries once before failing.
     pub fn try_new(t: T) -> Result<Gc<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
@@ -462,6 +468,9 @@ where
     ptr: *const RefCell<GcPtr<T>>,
 }
 
+// SAFETY: GcRefCell uses atomic ref-counting internally. All structural mutations
+// go through the global GC's Mutex. The RefCell itself is only accessed while
+// holding the STW read lock, preventing data races.
 unsafe impl<T> Sync for GcRefCell<T> where T: 'static + Sized + Trace + Sync {}
 unsafe impl<T> Send for GcRefCell<T> where T: 'static + Sized + Trace + Send {}
 
@@ -502,6 +511,7 @@ impl<T> GcRefCell<T>
 where
     T: 'static + Sized + Trace,
 {
+    /// Allocate a new thread-safe GC-managed interior-mutable cell on the global collector.
     pub fn new(t: T) -> GcRefCell<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
@@ -509,6 +519,7 @@ where
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
+    /// On OOM, triggers an emergency GC collection and retries once before failing.
     pub fn try_new(t: T) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
@@ -594,6 +605,8 @@ where
     ptr: *const GcPtr<T>,
 }
 
+// SAFETY: GcWeak holds only an Arc<AtomicBool> (thread-safe) and a raw pointer
+// that is only dereferenced through the Mutex-protected global GC during upgrade().
 unsafe impl<T> Send for GcWeak<T> where T: 'static + Sized + Trace + Send {}
 unsafe impl<T> Sync for GcWeak<T> where T: 'static + Sized + Trace + Sync {}
 
@@ -626,6 +639,8 @@ impl<T> GcWeak<T>
 where
     T: 'static + Sized + Trace,
 {
+    /// Attempt to upgrade the weak reference to a strong `Gc<T>`.
+    /// Returns `None` if the object has been collected.
     pub fn upgrade(&self) -> Option<Gc<T>> {
         if !self.alive.load(Ordering::Acquire) {
             return None;
@@ -650,6 +665,7 @@ impl<T> Gc<T>
 where
     T: 'static + Sized + Trace,
 {
+    /// Create a weak reference that does not prevent collection.
     pub fn downgrade(this: &Gc<T>) -> GcWeak<T> {
         let alive = GLOBAL_GC
             .core
@@ -683,10 +699,15 @@ where
     fn finalize(&self) {}
 }
 
+/// Thread-safe global garbage collector.
+/// Shared across all threads via the `GLOBAL_GC` lazy_static.
+/// Internally delegates to `GarbageCollector` which protects all state
+/// with Mutex, RwLock, and atomic operations.
 pub struct GlobalGarbageCollector {
     pub(crate) core: GarbageCollector,
 }
 
+// SAFETY: Delegates to GarbageCollector which protects all state with Mutex/atomics.
 unsafe impl Sync for GlobalGarbageCollector {}
 unsafe impl Send for GlobalGarbageCollector {}
 
@@ -877,9 +898,9 @@ impl GlobalGarbageCollector {
         unsafe {
             use std::alloc::dealloc;
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem::<GcPtr<T>>()?;
+            let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem_with_gc::<GcPtr<T>>()?;
             let (gc_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem::<GcInternal<T>>() {
+                match self.core.try_alloc_mem_with_gc::<GcInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
                         dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
@@ -936,9 +957,10 @@ impl GlobalGarbageCollector {
         unsafe {
             use std::alloc::dealloc;
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem::<RefCell<GcPtr<T>>>()?;
+            let (gc_ptr, mem_info_gc_ptr) =
+                self.core.try_alloc_mem_with_gc::<RefCell<GcPtr<T>>>()?;
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem::<GcRefCellInternal<T>>() {
+                match self.core.try_alloc_mem_with_gc::<GcRefCellInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
                         dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
@@ -1110,6 +1132,49 @@ impl GlobalGarbageCollector {
         unsafe { self.core.collect_concurrent(max_gen, step_budget) }
     }
 
+    /// Time-budgeted incremental mark step. See [`GarbageCollector::mark_step_timed`].
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
+        unsafe { self.core.mark_step_timed(max_duration) }
+    }
+
+    /// Run a complete incremental collection with time-budgeted steps.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn collect_incremental_timed(
+        &self,
+        max_gen: crate::generation::Generation,
+        max_step_duration: Duration,
+    ) -> crate::generation::CollectionStats {
+        unsafe {
+            self.core
+                .collect_incremental_timed(max_gen, max_step_duration)
+        }
+    }
+
+    /// Time-budgeted concurrent mark step. NO STW lock — safe for concurrent use.
+    pub fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
+        self.core.concurrent_mark_step_timed(max_duration)
+    }
+
+    /// Run a complete concurrent collection with time-budgeted steps.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn collect_concurrent_timed(
+        &self,
+        max_gen: crate::generation::Generation,
+        max_step_duration: Duration,
+    ) -> crate::generation::CollectionStats {
+        unsafe {
+            self.core
+                .collect_concurrent_timed(max_gen, max_step_duration)
+        }
+    }
+
     /// Create a new region. Future allocations go into this region.
     pub fn new_region(&self) -> crate::generation::RegionId {
         self.core.new_region()
@@ -1137,10 +1202,14 @@ impl GlobalGarbageCollector {
     }
 }
 
+/// Callback to start a global collection strategy.
 pub type StartGlobalStrategyFn =
     Box<dyn FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
+/// Callback to stop a global collection strategy.
 pub type StopGlobalStrategyFn = Box<dyn FnMut(&'static GlobalGarbageCollector)>;
 
+/// Pluggable collection strategy for the global (thread-safe) GC.
+/// Controls when and how garbage collection runs. Use `change_strategy` to swap at runtime.
 pub struct GlobalStrategy {
     gc: Cell<&'static GlobalGarbageCollector>,
     is_active: AtomicBool,
@@ -1149,6 +1218,8 @@ pub struct GlobalStrategy {
     join_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+// SAFETY: The Cell<&'static GlobalGarbageCollector> is only written during initialization
+// (before any thread can access it). All other fields use Mutex or atomics.
 unsafe impl Sync for GlobalStrategy {}
 unsafe impl Send for GlobalStrategy {}
 
@@ -1172,6 +1243,7 @@ impl GlobalStrategy {
         }
     }
 
+    /// Replace the current collection strategy. Stops the current strategy first if active.
     pub fn change_strategy<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn)
     where
         StartFn: 'static
@@ -1187,6 +1259,7 @@ impl GlobalStrategy {
         *stop_func = Box::new(stop_fn);
     }
 
+    /// Returns `true` if the strategy's background collection is currently running.
     pub fn is_active(&self) -> bool {
         self.is_active.load(Ordering::Acquire)
     }
@@ -1204,6 +1277,7 @@ impl GlobalStrategy {
         }
     }
 
+    /// Start the collection strategy (e.g., spawn a background collection thread).
     pub fn start(&'static self) {
         self.is_active.store(true, Ordering::Release);
         let mut start_func = self.start_func.lock().unwrap_or_else(|e| e.into_inner());
@@ -1211,6 +1285,7 @@ impl GlobalStrategy {
         *join_handle = (*(start_func))(self.gc.get(), &self.is_active);
     }
 
+    /// Stop the collection strategy and join any background thread.
     pub fn stop(&self) {
         self.is_active.store(false, Ordering::Release);
         let mut join_handle = self.join_handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -1233,7 +1308,7 @@ impl Drop for GlobalStrategy {
 }
 
 lazy_static! {
-    static ref GLOBAL_GC: GlobalGarbageCollector = GlobalGarbageCollector::new();
+    pub static ref GLOBAL_GC: GlobalGarbageCollector = GlobalGarbageCollector::new();
     pub static ref GLOBAL_GC_STRATEGY: GlobalStrategy = {
         let gc = &(*GLOBAL_GC);
         GlobalStrategy::new(
