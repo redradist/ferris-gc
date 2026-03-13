@@ -86,6 +86,10 @@ impl GcInfo {
     }
 }
 
+/// Internal pointer wrapper used as the `Deref` target of `Gc<T>` and `GcRefCell<T>`.
+/// This type is `pub` because it appears in the public `Deref` interface, but users
+/// should not need to name it directly — access `T` via double-deref (`**gc`).
+#[doc(hidden)]
 pub struct GcPtr<T> where T: 'static + Sized + Trace {
     info: GcInfo,
     t: T,
@@ -188,7 +192,7 @@ impl<T> Finalize for GcPtr<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
-pub struct GcInternal<T> where T: 'static + Sized + Trace {
+pub(crate) struct GcInternal<T> where T: 'static + Sized + Trace {
     is_root: AtomicBool,
     ptr: *const GcPtr<T>,
 }
@@ -320,7 +324,7 @@ impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
 
 impl<T> Drop for Gc<T> where T: Sized + Trace {
     fn drop(&mut self) {
-        LOCAL_GC.with(move |gc| unsafe {
+        let _ = LOCAL_GC.try_with(move |gc| unsafe {
             gc.borrow_mut().remove_tracer(self.internal_ptr);
         });
     }
@@ -329,30 +333,35 @@ impl<T> Drop for Gc<T> where T: Sized + Trace {
 impl<T> Trace for Gc<T> where T: Sized + Trace {
     fn is_root(&self) -> bool {
         unsafe {
+            if self.internal_ptr.is_null() { return false; }
             (*self.internal_ptr).is_root()
         }
     }
 
     fn reset_root(&self) {
         unsafe {
+            if self.internal_ptr.is_null() { return; }
             (*self.internal_ptr).reset_root();
         }
     }
 
     fn trace(&self) {
         unsafe {
+            if self.ptr.is_null() { return; }
             (*self.ptr).trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
+            if self.ptr.is_null() { return; }
             (*self.ptr).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
         unsafe {
+            if self.ptr.is_null() { return false; }
             (*self.ptr).is_traceable()
         }
     }
@@ -366,7 +375,7 @@ impl<T> Finalize for Gc<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
-pub struct GcRefCellInternal<T> where T: 'static + Sized + Trace {
+pub(crate) struct GcRefCellInternal<T> where T: 'static + Sized + Trace {
     is_root: AtomicBool,
     ptr: *const RefCell<GcPtr<T>>,
 }
@@ -436,7 +445,7 @@ pub struct GcRefCell<T> where T: 'static + Sized + Trace {
 
 impl<T> Drop for GcRefCell<T> where T: Sized + Trace {
     fn drop(&mut self) {
-        LOCAL_GC.with(move |gc| unsafe {
+        let _ = LOCAL_GC.try_with(move |gc| unsafe {
             gc.borrow_mut().remove_tracer(self.internal_ptr);
         });
     }
@@ -589,7 +598,7 @@ impl<T> GcWeak<T> where T: 'static + Sized + Trace {
         LOCAL_GC.with(|gc| {
             // Acquire STW read lock via raw pointer to avoid RefCell borrow conflict
             let gc_ptr = gc.as_ptr();
-            let _stw = unsafe { (*gc_ptr).core.stw_lock.read().unwrap() };
+            let _stw = unsafe { (*gc_ptr).core.stw_lock.read().unwrap_or_else(|e| e.into_inner()) };
             // Re-check alive under STW protection
             if self.alive.load(Ordering::Acquire) {
                 Some(unsafe { gc.borrow_mut().upgrade_weak(self) })
@@ -727,8 +736,8 @@ impl GarbageCollector {
 
     /// Return a snapshot of current GC diagnostics.
     pub fn stats(&self) -> GcStats {
-        let tracers = self.tracers.read().unwrap();
-        let objects = self.objects.lock().unwrap();
+        let tracers = self.tracers.read().unwrap_or_else(|e| e.into_inner());
+        let objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
         let mut gen0 = 0usize;
         let mut gen1 = 0usize;
         let mut gen2 = 0usize;
@@ -748,7 +757,7 @@ impl GarbageCollector {
             gen1_objects: gen1,
             gen2_objects: gen2,
             total_collections: self.total_collections.load(Ordering::Relaxed),
-            last_collection: self.last_collection.lock().unwrap().clone(),
+            last_collection: self.last_collection.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             allocation_count: self.allocation_count.load(Ordering::Relaxed),
         }
     }
@@ -781,7 +790,7 @@ impl GarbageCollector {
     /// Register a new object in Gen0.
     #[allow(dead_code)]
     pub(crate) fn register_object(&self, obj_ptr: *const dyn Trace) {
-        let mut objects = self.objects.lock().unwrap();
+        let mut objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
         objects.obj_gen.insert(obj_ptr, Generation::Gen0);
         objects.survive_count.insert(obj_ptr, 0);
         self.allocation_count.fetch_add(1, Ordering::Relaxed);
@@ -790,12 +799,12 @@ impl GarbageCollector {
     /// Register a tracer -> object mapping.
     #[allow(dead_code)]
     pub(crate) fn register_tracer_obj(&self, tracer_ptr: *const dyn Trace, obj_ptr: *const dyn Trace) {
-        self.tracers.write().unwrap().tracer_obj.insert(tracer_ptr, obj_ptr);
+        self.tracers.write().unwrap_or_else(|e| e.into_inner()).tracer_obj.insert(tracer_ptr, obj_ptr);
     }
 
     /// Get or create the alive flag for an object (used by weak references).
     pub(crate) fn get_or_create_weak_alive(&self, obj_ptr: *const dyn Trace) -> Arc<AtomicBool> {
-        let mut objects = self.objects.lock().unwrap();
+        let mut objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
         objects.weak_alive.entry(obj_ptr)
             .or_insert_with(|| Arc::new(AtomicBool::new(true)))
             .clone()
@@ -806,17 +815,17 @@ impl GarbageCollector {
     /// During incremental marking, also re-grays Black objects to maintain
     /// the tri-color invariant (no Black→White edges).
     pub(crate) fn write_barrier(&self, obj_ptr: *const dyn Trace) {
-        let objects = self.objects.lock().unwrap();
+        let objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(g) = objects.obj_gen.get(&obj_ptr) {
             if *g > Generation::Gen0 {
-                self.remembered_set.lock().unwrap().insert(obj_ptr);
+                self.remembered_set.lock().unwrap_or_else(|e| e.into_inner()).insert(obj_ptr);
             }
         }
         drop(objects);
 
         // During incremental marking, re-gray Black objects so their
         // new children are discovered in subsequent mark steps.
-        let mut incr = self.incremental.lock().unwrap();
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
         if incr.phase == CollectionPhase::Marking {
             if let Some(color) = incr.colors.get_mut(&obj_ptr) {
                 if *color == MarkColor::Black {
@@ -829,7 +838,7 @@ impl GarbageCollector {
 
     pub(crate) unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
         unsafe {
-            let mut tracers = self.tracers.write().unwrap();
+            let mut tracers = self.tracers.write().unwrap_or_else(|e| e.into_inner());
             if let Some(tracer) = tracers.mem_to_trc.remove(&(tracer.get_thin_ptr())) {
                 tracers.tracer_obj.remove(&tracer);
                 if let Some(del) = tracers.trs.remove(&tracer) {
@@ -863,10 +872,10 @@ impl GarbageCollector {
 
             let (tracer_deallocs, object_deallocs) = {
                 // STW: block all mutator operations during mark+sweep
-                let _stw = self.stw_lock.write().unwrap();
-                let mut tracers = self.tracers.write().unwrap();
-                let mut objects = self.objects.lock().unwrap();
-                let mut remembered_set = self.remembered_set.lock().unwrap();
+                let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
+                let mut tracers = self.tracers.write().unwrap_or_else(|e| e.into_inner());
+                let mut objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
+                let mut remembered_set = self.remembered_set.lock().unwrap_or_else(|e| e.into_inner());
 
                 // Mark phase: trace from ALL roots (needed for correctness)
                 for (gc_info, _) in &tracers.trs {
@@ -995,17 +1004,21 @@ impl GarbageCollector {
             }
             for ((mem, layout), finalizer, drop_fn) in object_deallocs {
                 if let Some(f) = finalizer {
-                    (*f).finalize();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*f).finalize();
+                    }));
                 }
                 if let Some(drop_fn) = drop_fn {
-                    (drop_fn)(mem);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (drop_fn)(mem);
+                    }));
                 }
                 dealloc(mem, layout);
             }
 
             // Record diagnostics
             self.total_collections.fetch_add(1, Ordering::Relaxed);
-            *self.last_collection.lock().unwrap() = Some(stats);
+            *self.last_collection.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats);
 
             stats
         }
@@ -1016,13 +1029,13 @@ impl GarbageCollector {
         unsafe {
             let (tracer_deallocs, object_deallocs) = {
                 // STW: block all mutator operations during cleanup
-                let _stw = self.stw_lock.write().unwrap();
-                let mut tracers = self.tracers.write().unwrap();
-                let mut objects = self.objects.lock().unwrap();
+                let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
+                let mut tracers = self.tracers.write().unwrap_or_else(|e| e.into_inner());
+                let mut objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
                 tracers.tracer_obj.clear();
                 objects.obj_gen.clear();
                 objects.survive_count.clear();
-                self.remembered_set.lock().unwrap().clear();
+                self.remembered_set.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 // Invalidate all weak references
                 for (_, alive) in objects.weak_alive.drain() {
                     alive.store(false, Ordering::Release);
@@ -1060,10 +1073,10 @@ impl GarbageCollector {
     /// Short STW: snapshots roots, initializes tri-color marks (all in-scope objects White,
     /// root-reachable objects Gray), and sets phase to Marking.
     pub unsafe fn begin_collection(&self, max_gen: Generation) {
-        let _stw = self.stw_lock.write().unwrap();
-        let mut incr = self.incremental.lock().unwrap();
-        let tracers = self.tracers.read().unwrap();
-        let objects = self.objects.lock().unwrap();
+        let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+        let tracers = self.tracers.read().unwrap_or_else(|e| e.into_inner());
+        let objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
 
         incr.phase = CollectionPhase::Marking;
         incr.max_gen = max_gen;
@@ -1099,8 +1112,8 @@ impl GarbageCollector {
     /// Short STW per batch. Returns `true` when the gray stack is empty (marking complete).
     /// Each step discovers immediate children of `budget` objects via `trace_children`.
     pub unsafe fn mark_step(&self, budget: usize) -> bool {
-        let _stw = self.stw_lock.write().unwrap();
-        let mut incr = self.incremental.lock().unwrap();
+        let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut processed = 0;
         let mut children_buf = Vec::new();
@@ -1142,11 +1155,11 @@ impl GarbageCollector {
         unsafe {
             let max_gen;
             let (tracer_deallocs, object_deallocs, stats) = {
-                let _stw = self.stw_lock.write().unwrap();
-                let mut incr = self.incremental.lock().unwrap();
-                let mut tracers = self.tracers.write().unwrap();
-                let mut objects = self.objects.lock().unwrap();
-                let mut remembered_set = self.remembered_set.lock().unwrap();
+                let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
+                let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+                let mut tracers = self.tracers.write().unwrap_or_else(|e| e.into_inner());
+                let mut objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
+                let mut remembered_set = self.remembered_set.lock().unwrap_or_else(|e| e.into_inner());
 
                 max_gen = incr.max_gen;
                 incr.phase = CollectionPhase::Sweeping;
@@ -1293,17 +1306,21 @@ impl GarbageCollector {
             }
             for ((mem, layout), finalizer, drop_fn) in object_deallocs {
                 if let Some(f) = finalizer {
-                    (*f).finalize();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*f).finalize();
+                    }));
                 }
                 if let Some(drop_fn) = drop_fn {
-                    (drop_fn)(mem);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (drop_fn)(mem);
+                    }));
                 }
                 dealloc(mem, layout);
             }
 
             // Record diagnostics
             self.total_collections.fetch_add(1, Ordering::Relaxed);
-            *self.last_collection.lock().unwrap() = Some(stats);
+            *self.last_collection.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats);
 
             stats
         }
@@ -1348,8 +1365,8 @@ impl LocalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
-            let mut objects = self.core.objects.lock().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
@@ -1373,7 +1390,7 @@ impl LocalGarbageCollector {
                 ptr: gc.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
@@ -1392,8 +1409,8 @@ impl LocalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
-            let mut objects = self.core.objects.lock().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
             tracers.trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
@@ -1417,7 +1434,7 @@ impl LocalGarbageCollector {
                 ptr: gc.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info);
             tracers.tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
@@ -1444,8 +1461,8 @@ impl LocalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
-            let mut objects = self.core.objects.lock().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
@@ -1479,8 +1496,8 @@ impl LocalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
-            let mut objects = self.core.objects.lock().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
             tracers.trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
@@ -1505,7 +1522,7 @@ impl LocalGarbageCollector {
                 ptr: weak.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_inter_ptr, weak.ptr as *const dyn Trace);
@@ -1624,12 +1641,12 @@ thread_local! {
             let gc = unsafe { &mut *gc.as_ptr() };
             RefCell::new(LocalStrategy::new(gc,
             move |local_gc, _| {
-                let mut basic_strategy_local_gcs = BASIC_STRATEGY_LOCAL_GCS.write().unwrap();
+                let mut basic_strategy_local_gcs = BASIC_STRATEGY_LOCAL_GCS.write().unwrap_or_else(|e| e.into_inner());
                 basic_strategy_local_gcs.push(local_gc);
                 None
             },
             move |local_gc| {
-                let mut basic_strategy_local_gcs = BASIC_STRATEGY_LOCAL_GCS.write().unwrap();
+                let mut basic_strategy_local_gcs = BASIC_STRATEGY_LOCAL_GCS.write().unwrap_or_else(|e| e.into_inner());
                 let index = basic_strategy_local_gcs.iter().position(|&r| r == local_gc).unwrap();
                 basic_strategy_local_gcs.remove(index);
             }))
@@ -1653,24 +1670,24 @@ mod tests {
     #[test]
     fn one_object() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap().trs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len());
         let _one = Gc::new(1);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().core.tracers.read().unwrap().trs.len() - baseline, 1);
+            assert_eq!(gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
         });
     }
 
     #[test]
     fn gc_collect_one_from_one() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap().trs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len());
         {
             let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().core.tracers.read().unwrap().trs.len() - baseline, 0);
+            assert_eq!(gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
         });
     }
 
@@ -1680,11 +1697,11 @@ mod tests {
         // Reassigning drops the old Gc (remove_tracer removes it from trs),
         // so only 1 tracer remains for the surviving Gc.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap().trs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| {
-            assert_eq!(gc.borrow().core.tracers.read().unwrap().trs.len() - baseline, 1);
+            assert_eq!(gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
         });
         drop(one);
     }
@@ -1694,12 +1711,12 @@ mod tests {
     fn gc_collect_after_reassign() {
         // After reassign, one live Gc remains. collect() keeps live objects.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap().trs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().core.tracers.read().unwrap().trs.len() - baseline, 1);
+            assert_eq!(gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
         });
         drop(one);
     }
@@ -1708,7 +1725,7 @@ mod tests {
     #[allow(unused_assignments)]
     fn gc_collect_two_from_two() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap().trs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len());
         {
             let mut one = Gc::new(1);
             one = Gc::new(2);
@@ -1716,29 +1733,29 @@ mod tests {
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().core.tracers.read().unwrap().trs.len() - baseline, 0);
+            assert_eq!(gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
         });
     }
 
     #[test]
     fn mem_to_trc_cleaned_on_collect() {
         clean_gc_state();
-        let baseline_trs = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap().trs.len());
-        let baseline_m2t = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap().mem_to_trc.len());
+        let baseline_trs = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len());
+        let baseline_m2t = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).mem_to_trc.len());
         {
             let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
-            assert_eq!(gc.borrow().core.tracers.read().unwrap().trs.len() - baseline_trs, 0);
-            assert_eq!(gc.borrow().core.tracers.read().unwrap().mem_to_trc.len() - baseline_m2t, 0);
+            assert_eq!(gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline_trs, 0);
+            assert_eq!(gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).mem_to_trc.len() - baseline_m2t, 0);
         });
     }
 
     #[test]
     fn collect_from_another_thread() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap().trs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len());
         let _one = Gc::new(42);
         LOCAL_GC.with(|gc| {
             let gc_ptr = gc.as_ptr();
@@ -1748,7 +1765,7 @@ mod tests {
                     unsafe { gc_ref.collect(); }
                 });
             });
-            assert_eq!(gc.borrow().core.tracers.read().unwrap().trs.len() - baseline, 1);
+            assert_eq!(gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
         });
     }
 
@@ -1792,12 +1809,12 @@ mod tests {
     #[test]
     fn clone_from_registers_with_gc() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap().trs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len());
         let source = Gc::new(42);
         let mut target = Gc::new(99);
         target.clone_from(&source);
         LOCAL_GC.with(|gc| {
-            let delta = gc.borrow().core.tracers.read().unwrap().trs.len() - baseline;
+            let delta = gc.borrow().core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline;
             // source + target + the new clone's tracer = at least 2 alive
             assert!(delta >= 2, "clone_from should register new tracer with GC, got {delta}");
         });
@@ -1837,7 +1854,7 @@ mod tests {
         let _obj = Gc::new(42);
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objects = gc_ref.core.objects.lock().unwrap();
+            let objects = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             assert!(objects.obj_gen.values().any(|g| *g == crate::generation::Generation::Gen0),
                 "newly allocated objects should be in Gen0");
         });
@@ -1855,15 +1872,15 @@ mod tests {
             }
             // Verify object was promoted to Gen1
             {
-                let objects = gc_ref.core.objects.lock().unwrap();
+                let objects = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner());
                 assert!(objects.obj_gen.values().any(|g| *g == crate::generation::Generation::Gen1),
                     "object should be promoted to Gen1 after surviving 3 Gen0 collections");
             }
 
-            let baseline_objs = gc_ref.core.objects.lock().unwrap().objs.len();
+            let baseline_objs = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len();
             // Gen0-only collection should not touch Gen1 objects
             unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
-            let after_objs = gc_ref.core.objects.lock().unwrap().objs.len();
+            let after_objs = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len();
             assert_eq!(baseline_objs, after_objs,
                 "Gen0 collection must not collect Gen1 objects");
         });
@@ -1881,14 +1898,14 @@ mod tests {
             }
             // Still Gen0 after 2 survivals
             {
-                let objects = gc_ref.core.objects.lock().unwrap();
+                let objects = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner());
                 assert!(objects.obj_gen.values().all(|g| *g == crate::generation::Generation::Gen0),
                     "object should still be in Gen0 after 2 survivals");
             }
 
             // Third survival triggers promotion
             unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
-            let objects = gc_ref.core.objects.lock().unwrap();
+            let objects = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             assert!(objects.obj_gen.values().any(|g| *g == crate::generation::Generation::Gen1),
                 "object should be promoted to Gen1 after 3 survivals");
         });
@@ -1908,7 +1925,7 @@ mod tests {
             for _ in 0..5 {
                 unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen1); }
             }
-            let objects = gc_ref.core.objects.lock().unwrap();
+            let objects = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             assert!(objects.obj_gen.values().any(|g| *g == crate::generation::Generation::Gen2),
                 "object should be promoted to Gen2 after surviving Gen1 threshold");
         });
@@ -1922,9 +1939,9 @@ mod tests {
         }
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let baseline = gc_ref.core.objects.lock().unwrap().objs.len();
+            let baseline = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len();
             unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
-            let after = gc_ref.core.objects.lock().unwrap().objs.len();
+            let after = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len();
             assert!(after < baseline, "dead Gen0 object should be collected by Gen0 collection");
         });
     }
@@ -1952,14 +1969,14 @@ mod tests {
                 unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
             }
             // Verify it's in Gen1 (check by value to avoid fat pointer comparison issues)
-            let objects = gc_ref.core.objects.lock().unwrap();
+            let objects = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             assert!(objects.obj_gen.values().any(|g| *g == crate::generation::Generation::Gen1),
                 "cell should be promoted to Gen1 after 3 Gen0 collections");
         });
 
         // Remembered set should be empty before mutation
         LOCAL_GC.with(|gc| {
-            assert!(gc.borrow().core.remembered_set.lock().unwrap().is_empty(),
+            assert!(gc.borrow().core.remembered_set.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "remembered set should be empty before write barrier");
         });
 
@@ -1973,7 +1990,7 @@ mod tests {
         // Verify cell is now in the remembered set
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let rs = gc_ref.core.remembered_set.lock().unwrap();
+            let rs = gc_ref.core.remembered_set.lock().unwrap_or_else(|e| e.into_inner());
             assert!(!rs.is_empty(),
                 "write barrier should add old-gen object to remembered set");
         });
@@ -1998,12 +2015,12 @@ mod tests {
 
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            assert!(!gc_ref.core.remembered_set.lock().unwrap().is_empty(),
+            assert!(!gc_ref.core.remembered_set.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "remembered set should not be empty after write barrier");
 
             // Full collection (Gen2) should clear remembered set
             unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen2); }
-            assert!(gc_ref.core.remembered_set.lock().unwrap().is_empty(),
+            assert!(gc_ref.core.remembered_set.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "remembered set should be cleared after full collection");
         });
     }
@@ -2033,9 +2050,9 @@ mod tests {
         // it's referenced by an old-gen object in the remembered set
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref.core.objects.lock().unwrap().objs.len();
+            let objs_before = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len();
             unsafe { gc_ref.core.collect_generation(crate::generation::Generation::Gen0); }
-            let objs_after = gc_ref.core.objects.lock().unwrap().objs.len();
+            let objs_after = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len();
             assert_eq!(objs_before, objs_after,
                 "young object referenced from old-gen (via remembered set) must survive Gen0 collection");
         });
@@ -2051,7 +2068,7 @@ mod tests {
         **cell.borrow_mut() = Some(Gc::new(1));
 
         LOCAL_GC.with(|gc| {
-            assert!(gc.borrow().core.remembered_set.lock().unwrap().is_empty(),
+            assert!(gc.borrow().core.remembered_set.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "Gen0 objects should not be added to remembered set");
         });
     }
@@ -2123,11 +2140,11 @@ mod tests {
             let strong = Gc::new(123);
             Gc::downgrade(&strong)
         };
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap().objs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len());
         LOCAL_GC.with(|gc| unsafe {
             gc.borrow_mut().collect();
         });
-        let after = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap().objs.len());
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len());
         assert!(after < baseline, "weak reference should not prevent collection");
         assert!(weak.upgrade().is_none());
     }
@@ -2137,7 +2154,7 @@ mod tests {
     #[test]
     fn incremental_collects_dead_objects() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap().objs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len());
         {
             let _obj = Gc::new(42);
         }
@@ -2145,7 +2162,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let stats = unsafe { gc_ref.core.collect_incremental(crate::generation::Generation::Gen2, 10) };
             assert!(stats.objects_collected > 0, "incremental should collect dead objects");
-            assert_eq!(gc_ref.core.objects.lock().unwrap().objs.len(), baseline);
+            assert_eq!(gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len(), baseline);
         });
     }
 
@@ -2155,10 +2172,10 @@ mod tests {
         let _live = Gc::new(99);
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref.core.objects.lock().unwrap().objs.len();
+            let objs_before = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len();
             let stats = unsafe { gc_ref.core.collect_incremental(crate::generation::Generation::Gen2, 10) };
             assert_eq!(stats.objects_collected, 0, "incremental must not collect live objects");
-            assert_eq!(gc_ref.core.objects.lock().unwrap().objs.len(), objs_before);
+            assert_eq!(gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len(), objs_before);
         });
     }
 
@@ -2194,9 +2211,9 @@ mod tests {
 
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref.core.objects.lock().unwrap().objs.len();
+            let objs_before = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len();
             unsafe { gc_ref.core.collect_incremental(crate::generation::Generation::Gen2, 1); }
-            let objs_after = gc_ref.core.objects.lock().unwrap().objs.len();
+            let objs_after = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len();
             assert_eq!(objs_before, objs_after,
                 "child referenced from parent must survive incremental collection");
         });
@@ -2212,7 +2229,7 @@ mod tests {
             for _ in 0..3 {
                 unsafe { gc_ref.core.collect_incremental(crate::generation::Generation::Gen0, 10); }
             }
-            let objects = gc_ref.core.objects.lock().unwrap();
+            let objects = gc_ref.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             assert!(objects.obj_gen.values().any(|g| *g == crate::generation::Generation::Gen1),
                 "incremental collection should promote survivors");
         });
@@ -2225,20 +2242,20 @@ mod tests {
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
             // Idle before collection
-            assert_eq!(gc_ref.core.incremental.lock().unwrap().phase,
+            assert_eq!(gc_ref.core.incremental.lock().unwrap_or_else(|e| e.into_inner()).phase,
                 crate::generation::CollectionPhase::Idle);
 
             unsafe { gc_ref.core.begin_collection(crate::generation::Generation::Gen2); }
-            assert_eq!(gc_ref.core.incremental.lock().unwrap().phase,
+            assert_eq!(gc_ref.core.incremental.lock().unwrap_or_else(|e| e.into_inner()).phase,
                 crate::generation::CollectionPhase::Marking);
 
             while unsafe { !gc_ref.core.mark_step(1) } {}
             // Still marking until finish_collection
-            assert_eq!(gc_ref.core.incremental.lock().unwrap().phase,
+            assert_eq!(gc_ref.core.incremental.lock().unwrap_or_else(|e| e.into_inner()).phase,
                 crate::generation::CollectionPhase::Marking);
 
             unsafe { gc_ref.core.finish_collection(); }
-            assert_eq!(gc_ref.core.incremental.lock().unwrap().phase,
+            assert_eq!(gc_ref.core.incremental.lock().unwrap_or_else(|e| e.into_inner()).phase,
                 crate::generation::CollectionPhase::Idle);
         });
     }
@@ -2266,14 +2283,14 @@ mod tests {
     #[test]
     fn try_new_object_participates_in_gc() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap().objs.len());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len());
         {
             let _obj = Gc::try_new(77).unwrap();
         }
         LOCAL_GC.with(|gc| unsafe {
             gc.borrow_mut().collect();
         });
-        let after = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap().objs.len());
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.objects.lock().unwrap_or_else(|e| e.into_inner()).objs.len());
         assert_eq!(after, baseline, "try_new objects should be collected when dead");
     }
 

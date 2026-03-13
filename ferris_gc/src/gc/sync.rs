@@ -23,6 +23,10 @@ impl GcInfo {
     }
 }
 
+/// Internal pointer wrapper used as the `Deref` target of `sync::Gc<T>` and `sync::GcRefCell<T>`.
+/// This type is `pub` because it appears in the public `Deref` interface, but users
+/// should not need to name it directly — access `T` via double-deref (`**gc`).
+#[doc(hidden)]
 pub struct GcPtr<T> where T: 'static + Sized + Trace {
     info: GcInfo,
     t: T,
@@ -125,7 +129,7 @@ impl<T> Finalize for GcPtr<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
-pub struct GcInternal<T> where T: 'static + Sized + Trace {
+pub(crate) struct GcInternal<T> where T: 'static + Sized + Trace {
     is_root: AtomicBool,
     ptr: *const GcPtr<T>,
 }
@@ -203,6 +207,8 @@ unsafe impl<T> Send for Gc<T> where T: 'static + Sized + Trace + Send {}
 impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
     type Target = GcPtr<T>;
 
+    /// Safe without holding the STW lock because as long as this `Gc<T>` handle
+    /// exists, the object is reachable (root) and cannot be collected.
     fn deref(&self) -> &Self::Target {
         unsafe {
             &(*self.ptr)
@@ -254,30 +260,35 @@ impl<T> Drop for Gc<T> where T: Sized + Trace {
 impl<T> Trace for Gc<T> where T: Sized + Trace {
     fn is_root(&self) -> bool {
         unsafe {
+            if self.internal_ptr.is_null() { return false; }
             (*self.internal_ptr).is_root()
         }
     }
 
     fn reset_root(&self) {
         unsafe {
+            if self.internal_ptr.is_null() { return; }
             (*self.internal_ptr).reset_root();
         }
     }
 
     fn trace(&self) {
         unsafe {
+            if self.ptr.is_null() { return; }
             (*self.ptr).trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
+            if self.ptr.is_null() { return; }
             (*self.ptr).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
         unsafe {
+            if self.ptr.is_null() { return false; }
             (*self.ptr).is_traceable()
         }
     }
@@ -291,7 +302,7 @@ impl<T> Finalize for Gc<T> where T: Sized + Trace {
     fn finalize(&self) {}
 }
 
-pub struct GcRefCellInternal<T> where T: 'static + Sized + Trace {
+pub(crate) struct GcRefCellInternal<T> where T: 'static + Sized + Trace {
     is_root: AtomicBool,
     ptr: *const RefCell<GcPtr<T>>,
 }
@@ -405,7 +416,7 @@ impl<T> GcRefCell<T> where T: 'static + Sized + Trace {
     /// it gets added to the remembered set for young-generation collections.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
         unsafe {
-            let _stw = (*GLOBAL_GC).core.stw_lock.read().unwrap();
+            let _stw = (*GLOBAL_GC).core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             (*GLOBAL_GC).core.write_barrier(self.ptr as *const dyn Trace);
             (*self.ptr).borrow_mut()
         }
@@ -498,7 +509,7 @@ impl<T> GcWeak<T> where T: 'static + Sized + Trace {
         }
         unsafe {
             // Acquire STW read lock to prevent collection during upgrade
-            let _stw = (*GLOBAL_GC).core.stw_lock.read().unwrap();
+            let _stw = (*GLOBAL_GC).core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             if self.alive.load(Ordering::Acquire) {
                 Some((*GLOBAL_GC).upgrade_weak(self))
             } else {
@@ -549,7 +560,7 @@ impl GlobalGarbageCollector {
     unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
         where T: Sized + Trace {
         unsafe {
-            let _stw = self.core.stw_lock.read().unwrap();
+            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<GcPtr<T>>();
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             std::ptr::write(gc_ptr, GcPtr::new(t));
@@ -559,8 +570,8 @@ impl GlobalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
-            let mut objects = self.core.objects.lock().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
@@ -577,7 +588,7 @@ impl GlobalGarbageCollector {
 
     unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
         unsafe {
-            let _stw = self.core.stw_lock.read().unwrap();
+            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
             let gc = Gc {
@@ -585,7 +596,7 @@ impl GlobalGarbageCollector {
                 ptr: gc.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
@@ -595,7 +606,7 @@ impl GlobalGarbageCollector {
 
     unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T> where T: Sized + Trace {
         unsafe {
-            let _stw = self.core.stw_lock.read().unwrap();
+            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<RefCell<GcPtr<T>>>();
             let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcRefCellInternal<T>>();
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
@@ -605,8 +616,8 @@ impl GlobalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
-            let mut objects = self.core.objects.lock().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
             tracers.trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
@@ -623,7 +634,7 @@ impl GlobalGarbageCollector {
 
     unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T> where T: Sized + Trace {
         unsafe {
-            let _stw = self.core.stw_lock.read().unwrap();
+            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcRefCellInternal<T>>();
             std::ptr::write(gc_inter_ptr, GcRefCellInternal::new(gc.ptr));
             let gc = GcRefCell {
@@ -631,7 +642,7 @@ impl GlobalGarbageCollector {
                 ptr: gc.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info);
             tracers.tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
@@ -643,7 +654,7 @@ impl GlobalGarbageCollector {
         where T: Sized + Trace {
         unsafe {
             use std::alloc::dealloc;
-            let _stw = self.core.stw_lock.read().unwrap();
+            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem::<GcPtr<T>>()?;
             let (gc_inter_ptr, mem_info_internal_ptr) = match self.core.try_alloc_mem::<GcInternal<T>>() {
                 Ok(v) => v,
@@ -659,8 +670,8 @@ impl GlobalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
-            let mut objects = self.core.objects.lock().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
@@ -679,7 +690,7 @@ impl GlobalGarbageCollector {
         where T: Sized + Trace {
         unsafe {
             use std::alloc::dealloc;
-            let _stw = self.core.stw_lock.read().unwrap();
+            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem::<RefCell<GcPtr<T>>>()?;
             let (gc_cell_inter_ptr, mem_info_internal_ptr) = match self.core.try_alloc_mem::<GcRefCellInternal<T>>() {
                 Ok(v) => v,
@@ -695,8 +706,8 @@ impl GlobalGarbageCollector {
                 ptr: gc_ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
-            let mut objects = self.core.objects.lock().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
             tracers.trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
@@ -715,7 +726,7 @@ impl GlobalGarbageCollector {
     /// Caller must hold STW read lock.
     unsafe fn upgrade_weak<T>(&self, weak: &GcWeak<T>) -> Gc<T> where T: Sized + Trace {
         unsafe {
-            let _stw = self.core.stw_lock.read().unwrap();
+            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             std::ptr::write(gc_inter_ptr, GcInternal::new(weak.ptr));
             let gc = Gc {
@@ -723,7 +734,7 @@ impl GlobalGarbageCollector {
                 ptr: weak.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap();
+            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
             tracers.tracer_obj.insert(gc_inter_ptr, weak.ptr as *const dyn Trace);
@@ -799,8 +810,8 @@ impl GlobalStrategy {
         if self.is_active() {
             self.stop();
         }
-        let mut start_func = self.start_func.lock().unwrap();
-        let mut stop_func = self.stop_func.lock().unwrap();
+        let mut start_func = self.start_func.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stop_func = self.stop_func.lock().unwrap_or_else(|e| e.into_inner());
         *start_func = Box::new(start_fn);
         *stop_func = Box::new(stop_fn);
     }
@@ -812,26 +823,26 @@ impl GlobalStrategy {
     /// Atomically check if inactive and start. Safe to call from multiple threads.
     pub fn ensure_started(&'static self) {
         if self.is_active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            let mut start_func = self.start_func.lock().unwrap();
-            let mut join_handle = self.join_handle.lock().unwrap();
+            let mut start_func = self.start_func.lock().unwrap_or_else(|e| e.into_inner());
+            let mut join_handle = self.join_handle.lock().unwrap_or_else(|e| e.into_inner());
             *join_handle = (&mut *(start_func))(self.gc.get(), &self.is_active);
         }
     }
 
     pub fn start(&'static self) {
         self.is_active.store(true, Ordering::Release);
-        let mut start_func = self.start_func.lock().unwrap();
-        let mut join_handle = self.join_handle.lock().unwrap();
+        let mut start_func = self.start_func.lock().unwrap_or_else(|e| e.into_inner());
+        let mut join_handle = self.join_handle.lock().unwrap_or_else(|e| e.into_inner());
         *join_handle = (&mut *(start_func))(self.gc.get(), &self.is_active);
     }
 
     pub fn stop(&self) {
         self.is_active.store(false, Ordering::Release);
-        let mut join_handle = self.join_handle.lock().unwrap();
+        let mut join_handle = self.join_handle.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(join_handle) = join_handle.take() {
             join_handle.join().expect("GlobalStrategy::stop, GlobalStrategy Thread being joined has panicked !!");
         }
-        let mut stop_func = self.stop_func.lock().unwrap();
+        let mut stop_func = self.stop_func.lock().unwrap_or_else(|e| e.into_inner());
         (&mut *(stop_func))(self.gc.get());
     }
 }
@@ -839,7 +850,7 @@ impl GlobalStrategy {
 impl Drop for GlobalStrategy {
     fn drop(&mut self) {
         self.is_active.store(false, Ordering::Release);
-        let mut stop_func = self.stop_func.lock().unwrap();
+        let mut stop_func = self.stop_func.lock().unwrap_or_else(|e| e.into_inner());
         (&mut *(stop_func))(self.gc.get());
     }
 }
@@ -852,12 +863,12 @@ lazy_static! {
         let gc = &(*GLOBAL_GC);
         GlobalStrategy::new(gc,
             move |global_gc, _| {
-                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
+                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap_or_else(|e| e.into_inner());
                 *basic_strategy_global_gc = Some(global_gc);
                 None
             },
             move |_global_gc| {
-                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap();
+                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap_or_else(|e| e.into_inner());
                 *basic_strategy_global_gc = None;
             })
     };
@@ -873,9 +884,9 @@ mod tests {
 
     /// Clean residual state and return baseline trs count.
     fn setup() -> (std::sync::MutexGuard<'static, ()>, usize) {
-        let guard = TEST_MUTEX.lock().unwrap();
+        let guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { (*GLOBAL_GC).collect() };
-        let baseline = (*GLOBAL_GC).core.tracers.read().unwrap().trs.len();
+        let baseline = (*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len();
         (guard, baseline)
     }
 
@@ -884,7 +895,7 @@ mod tests {
         let (_guard, baseline) = setup();
         let _one = Gc::new(1);
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap().trs.len() - baseline, 1);
+        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
     }
 
     #[test]
@@ -894,7 +905,7 @@ mod tests {
             let _one = Gc::new(1);
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap().trs.len() - baseline, 0);
+        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
     }
 
     #[test]
@@ -905,7 +916,7 @@ mod tests {
         one = Gc::new(2);
         unsafe { (*GLOBAL_GC).collect() };
         // Reassignment drops old Gc (remove_tracer), so only 1 tracer remains
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap().trs.len() - baseline, 1);
+        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
         drop(one);
     }
 
@@ -917,7 +928,7 @@ mod tests {
         one = Gc::new(2);
         unsafe { (*GLOBAL_GC).collect() };
         // one is still live, so 1 tracer remains
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap().trs.len() - baseline, 1);
+        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
         drop(one);
     }
 
@@ -931,7 +942,7 @@ mod tests {
             drop(one);
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap().trs.len() - baseline, 0);
+        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
     }
 
     #[test]
@@ -944,7 +955,7 @@ mod tests {
         let collection_done = Arc::new(AtomicBool::new(false));
 
         // Hold the STW write lock to simulate an ongoing collection
-        let stw_guard = (*GLOBAL_GC).core.stw_lock.write().unwrap();
+        let stw_guard = (*GLOBAL_GC).core.stw_lock.write().unwrap_or_else(|e| e.into_inner());
         collection_started.store(true, Ordering::Release);
 
         let alloc_flag = allocated_during_stw.clone();
@@ -1013,7 +1024,7 @@ mod tests {
         }
         let stats = unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 10) };
         assert!(stats.objects_collected > 0, "incremental should collect dead objects");
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap().trs.len() - baseline, 0);
+        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
     }
 
     #[test]
@@ -1022,7 +1033,7 @@ mod tests {
         let _live = Gc::new(99);
         let stats = unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 10) };
         assert_eq!(stats.objects_collected, 0, "incremental must not collect live objects");
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap().trs.len() - baseline, 1);
+        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
     }
 
     #[test]
@@ -1055,7 +1066,7 @@ mod tests {
             let _obj = Gc::try_new(77).unwrap();
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap().trs.len() - baseline, 0);
+        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
     }
 
     // --- Diagnostics API tests ---
