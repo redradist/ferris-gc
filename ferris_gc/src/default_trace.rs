@@ -114,6 +114,11 @@ macro_rules! collection_types {
                 fn is_traceable(&self) -> bool {
                     unreachable!("is_traceable should never be called on primitive type !!");
                 }
+                fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
+                    for child in self {
+                        child.trace_children(children);
+                    }
+                }
             }
 
             impl<T> Finalize for $std<T> where T: 'static + Sized + Trace {
@@ -148,6 +153,11 @@ macro_rules! collection_types {
                 }
                 fn is_traceable(&self) -> bool {
                     unreachable!("is_traceable should never be called on primitive type !!");
+                }
+                fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
+                    for (_key, child) in self {
+                        child.trace_children(children);
+                    }
                 }
             }
 
@@ -192,6 +202,11 @@ impl<T> Trace for Option<T> where T: 'static + Sized + Trace {
     }
     fn is_traceable(&self) -> bool {
         unreachable!("is_traceable should never be called on primitive type !!");
+    }
+    fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
+        if let Some(obj) = self.as_ref() {
+            obj.trace_children(children);
+        }
     }
 }
 

@@ -10,8 +10,8 @@ fn has_ignore_trace(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-/// Generate method bodies (reset_root, trace, reset) for struct fields.
-fn struct_bodies(fields: &Fields) -> (proc_macro2::TokenStream, proc_macro2::TokenStream, proc_macro2::TokenStream) {
+/// Generate method bodies (reset_root, trace, reset, trace_children) for struct fields.
+fn struct_bodies(fields: &Fields) -> (proc_macro2::TokenStream, proc_macro2::TokenStream, proc_macro2::TokenStream, proc_macro2::TokenStream) {
     match fields {
         Fields::Named(named) => {
             let traced: Vec<_> = named.named.iter()
@@ -22,6 +22,7 @@ fn struct_bodies(fields: &Fields) -> (proc_macro2::TokenStream, proc_macro2::Tok
                 quote! { #(self.#traced.reset_root();)* },
                 quote! { #(self.#traced.trace();)* },
                 quote! { #(self.#traced.reset();)* },
+                quote! { #(self.#traced.trace_children(children);)* },
             )
         }
         Fields::Unnamed(unnamed) => {
@@ -34,9 +35,10 @@ fn struct_bodies(fields: &Fields) -> (proc_macro2::TokenStream, proc_macro2::Tok
                 quote! { #(self.#indices.reset_root();)* },
                 quote! { #(self.#indices.trace();)* },
                 quote! { #(self.#indices.reset();)* },
+                quote! { #(self.#indices.trace_children(children);)* },
             )
         }
-        Fields::Unit => (quote! {}, quote! {}, quote! {}),
+        Fields::Unit => (quote! {}, quote! {}, quote! {}, quote! {}),
     }
 }
 
@@ -99,6 +101,63 @@ fn enum_match(ident: &syn::Ident, data_enum: &syn::DataEnum, method: &str) -> pr
     }
 }
 
+/// Generate a `match self { ... }` expression for an enum, calling `trace_children(children)` on traced fields.
+fn enum_match_children(ident: &syn::Ident, data_enum: &syn::DataEnum) -> proc_macro2::TokenStream {
+    let arms: Vec<_> = data_enum.variants.iter().map(|variant| {
+        let var_ident = &variant.ident;
+        match &variant.fields {
+            Fields::Named(named) => {
+                let traced: Vec<_> = named.named.iter()
+                    .filter(|f| !has_ignore_trace(&f.attrs))
+                    .filter_map(|f| f.ident.as_ref())
+                    .collect();
+                quote! {
+                    #ident::#var_ident { #(#traced,)* .. } => {
+                        #(#traced.trace_children(children);)*
+                    }
+                }
+            }
+            Fields::Unnamed(unnamed) => {
+                let total = unnamed.unnamed.len();
+                let is_traced: Vec<bool> = unnamed.unnamed.iter()
+                    .map(|f| !has_ignore_trace(&f.attrs))
+                    .collect();
+                let binding_names: Vec<syn::Ident> = (0..total)
+                    .map(|i| syn::Ident::new(&format!("_{}", i), proc_macro2::Span::call_site()))
+                    .collect();
+                let pattern: Vec<proc_macro2::TokenStream> = (0..total)
+                    .map(|i| {
+                        if is_traced[i] {
+                            let name = &binding_names[i];
+                            quote! { #name }
+                        } else {
+                            quote! { _ }
+                        }
+                    })
+                    .collect();
+                let traced_names: Vec<&syn::Ident> = (0..total)
+                    .filter(|&i| is_traced[i])
+                    .map(|i| &binding_names[i])
+                    .collect();
+                quote! {
+                    #ident::#var_ident(#(#pattern),*) => {
+                        #(#traced_names.trace_children(children);)*
+                    }
+                }
+            }
+            Fields::Unit => {
+                quote! { #ident::#var_ident => {} }
+            }
+        }
+    }).collect();
+
+    quote! {
+        match self {
+            #(#arms)*
+        }
+    }
+}
+
 #[proc_macro_derive(Trace, attributes(unsafe_ignore_trace))]
 pub fn derive_trace(item: TokenStream) -> TokenStream {
     let derive_input = syn::parse_macro_input!(item as syn::DeriveInput);
@@ -114,14 +173,20 @@ pub fn derive_trace(item: TokenStream) -> TokenStream {
     }
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-    let (reset_root_body, trace_body, reset_body) = match &derive_input.data {
+    let (reset_root_body, trace_body, reset_body, trace_children_body) = match &derive_input.data {
         Data::Struct(data_struct) => struct_bodies(&data_struct.fields),
         Data::Enum(data_enum) => (
             enum_match(ident, data_enum, "reset_root"),
             enum_match(ident, data_enum, "trace"),
             enum_match(ident, data_enum, "reset"),
+            enum_match_children(ident, data_enum),
         ),
-        Data::Union(_) => panic!("#[derive(Trace)] is not supported for union types"),
+        Data::Union(_) => {
+            return syn::Error::new_spanned(
+                &derive_input,
+                "#[derive(Trace)] is not supported for unions. Use a struct or enum instead."
+            ).to_compile_error().into();
+        }
     };
 
     let trace_impl = quote! {
@@ -142,14 +207,16 @@ pub fn derive_trace(item: TokenStream) -> TokenStream {
                 #reset_body
             }
 
+            fn trace_children(&self, children: &mut std::vec::Vec<*const dyn Trace>) {
+                #trace_children_body
+            }
+
             fn is_traceable(&self) -> bool {
                 unreachable!("is_traceable should never be called on user-defined type !!");
             }
         }
     };
 
-    let print_tokens = Into::<TokenStream>::into(trace_impl.clone());
-    println!("Result Trace Impl is {}", print_tokens.to_string());
     trace_impl.into()
 }
 
@@ -175,8 +242,6 @@ pub fn derive_finalize(item: TokenStream) -> TokenStream {
         }
     };
 
-    let print_tokens = Into::<TokenStream>::into(finalizer_impl.clone());
-    println!("Result Finalizer Impl is {}", print_tokens.to_string());
     finalizer_impl.into()
 }
 
@@ -196,20 +261,31 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
 
     // Parse strategy attribute
     let mut strategy = String::from("basic");
+    let mut strategy_span: Option<proc_macro2::Span> = None;
     for arg in &attr_args {
         if let NestedMeta::Meta(Meta::NameValue(nv)) = arg {
             if nv.path.is_ident("strategy") {
                 if let Lit::Str(s) = &nv.lit {
                     strategy = s.value();
+                    strategy_span = Some(s.span());
                 } else {
-                    panic!("strategy value must be a string literal");
+                    return syn::Error::new_spanned(
+                        &nv.lit,
+                        "strategy value must be a string literal, e.g. strategy = \"basic\""
+                    ).to_compile_error().into();
                 }
             } else {
                 let name = nv.path.get_ident().map(|i| i.to_string()).unwrap_or_default();
-                panic!("Unknown attribute '{}'. Supported: strategy", name);
+                return syn::Error::new_spanned(
+                    &nv.path,
+                    format!("unknown attribute '{}'. Only 'strategy' is supported", name)
+                ).to_compile_error().into();
             }
         } else {
-            panic!("Expected strategy = \"...\". Supported strategies: basic, threshold, adaptive");
+            return syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "expected strategy = \"...\". Supported strategies: basic, threshold, adaptive"
+            ).to_compile_error().into();
         }
     }
 
@@ -237,17 +313,23 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
                 ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
             }
         },
-        other => panic!(
-            "Unknown GC strategy '{}'. Supported: basic, threshold, adaptive",
-            other
-        ),
+        other => {
+            let span = strategy_span.unwrap_or_else(proc_macro2::Span::call_site);
+            return syn::Error::new(
+                span,
+                format!("unknown GC strategy '{}'. Supported: basic, threshold, adaptive", other)
+            ).to_compile_error().into();
+        }
     };
 
     let _sig = &input.sig;
     let vis = input.vis;
     let name = &input.sig.ident;
     if name != "main" {
-        panic!("#[ferris_gc_main] is applied only for main function")
+        return syn::Error::new_spanned(
+            &input.sig.ident,
+            "#[ferris_gc_main] can only be applied to the main function"
+        ).to_compile_error().into();
     }
     let mut args = Vec::new();
     for arg in &input.sig.inputs {
@@ -278,7 +360,5 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    let print_tokens = Into::<TokenStream>::into(res_fun.clone());
-    println!("Result Function is {}", print_tokens.to_string());
     res_fun.into()
 }
