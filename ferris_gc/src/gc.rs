@@ -1059,10 +1059,14 @@ impl GarbageCollector {
             }
             for ((mem, layout), finalizer, drop_fn) in object_deallocs {
                 if let Some(f) = finalizer {
-                    (*f).finalize();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*f).finalize();
+                    }));
                 }
                 if let Some(drop_fn) = drop_fn {
-                    (drop_fn)(mem);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (drop_fn)(mem);
+                    }));
                 }
                 dealloc(mem, layout);
             }
