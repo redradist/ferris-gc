@@ -22,3 +22,8 @@ ferris-gc-proc-macro = { path = "../ferris_gc_proc_macro", version = "0.1.2", op
 
 [dev-dependencies]
 ferris-gc-proc-macro = { path = "../ferris_gc_proc_macro", version = "0.1.2" }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "gc_bench"
+harness = false
