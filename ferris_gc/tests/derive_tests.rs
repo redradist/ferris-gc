@@ -1,5 +1,5 @@
-use ferris_gc::{Gc, Trace, Finalize};
-use ferris_gc_proc_macro::{Trace, Finalize};
+use ferris_gc::{Finalize, Gc, Trace};
+use ferris_gc_proc_macro::{Finalize, Trace};
 
 // --- Enum support ---
 
@@ -7,7 +7,10 @@ use ferris_gc_proc_macro::{Trace, Finalize};
 enum SimpleEnum {
     Empty,
     Leaf(i32),
-    Branch { left: Gc<SimpleEnum>, right: Gc<SimpleEnum> },
+    Branch {
+        left: Gc<SimpleEnum>,
+        right: Gc<SimpleEnum>,
+    },
 }
 
 #[test]
@@ -56,7 +59,10 @@ struct Pair<T, U> {
 
 #[test]
 fn derive_trace_on_multi_generic_compiles() {
-    let p = Pair { first: 1i32, second: 2i32 };
+    let p = Pair {
+        first: 1i32,
+        second: 2i32,
+    };
     p.reset_root();
     p.trace();
     p.reset();

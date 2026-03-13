@@ -1,20 +1,30 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{ReturnType, Data, Fields, NestedMeta, Meta, Lit};
+use syn::{Data, Fields, Lit, Meta, NestedMeta, ReturnType};
 
 fn has_ignore_trace(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
-        attr.path.get_ident()
+        attr.path
+            .get_ident()
             .map(|id| id == "unsafe_ignore_trace")
             .unwrap_or(false)
     })
 }
 
 /// Generate method bodies (reset_root, trace, reset, trace_children) for struct fields.
-fn struct_bodies(fields: &Fields) -> (proc_macro2::TokenStream, proc_macro2::TokenStream, proc_macro2::TokenStream, proc_macro2::TokenStream) {
+fn struct_bodies(
+    fields: &Fields,
+) -> (
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+) {
     match fields {
         Fields::Named(named) => {
-            let traced: Vec<_> = named.named.iter()
+            let traced: Vec<_> = named
+                .named
+                .iter()
                 .filter(|f| !has_ignore_trace(&f.attrs))
                 .filter_map(|f| f.ident.as_ref())
                 .collect();
@@ -26,7 +36,9 @@ fn struct_bodies(fields: &Fields) -> (proc_macro2::TokenStream, proc_macro2::Tok
             )
         }
         Fields::Unnamed(unnamed) => {
-            let indices: Vec<syn::Index> = unnamed.unnamed.iter()
+            let indices: Vec<syn::Index> = unnamed
+                .unnamed
+                .iter()
                 .enumerate()
                 .filter(|(_, f)| !has_ignore_trace(&f.attrs))
                 .map(|(i, _)| syn::Index::from(i))
@@ -43,56 +55,70 @@ fn struct_bodies(fields: &Fields) -> (proc_macro2::TokenStream, proc_macro2::Tok
 }
 
 /// Generate a `match self { ... }` expression for an enum, calling `method` on traced fields.
-fn enum_match(ident: &syn::Ident, data_enum: &syn::DataEnum, method: &str) -> proc_macro2::TokenStream {
+fn enum_match(
+    ident: &syn::Ident,
+    data_enum: &syn::DataEnum,
+    method: &str,
+) -> proc_macro2::TokenStream {
     let method_ident = syn::Ident::new(method, proc_macro2::Span::call_site());
 
-    let arms: Vec<_> = data_enum.variants.iter().map(|variant| {
-        let var_ident = &variant.ident;
-        match &variant.fields {
-            Fields::Named(named) => {
-                let traced: Vec<_> = named.named.iter()
-                    .filter(|f| !has_ignore_trace(&f.attrs))
-                    .filter_map(|f| f.ident.as_ref())
-                    .collect();
-                quote! {
-                    #ident::#var_ident { #(#traced,)* .. } => {
-                        #(#traced.#method_ident();)*
-                    }
-                }
-            }
-            Fields::Unnamed(unnamed) => {
-                let total = unnamed.unnamed.len();
-                let is_traced: Vec<bool> = unnamed.unnamed.iter()
-                    .map(|f| !has_ignore_trace(&f.attrs))
-                    .collect();
-                let binding_names: Vec<syn::Ident> = (0..total)
-                    .map(|i| syn::Ident::new(&format!("_{}", i), proc_macro2::Span::call_site()))
-                    .collect();
-                let pattern: Vec<proc_macro2::TokenStream> = (0..total)
-                    .map(|i| {
-                        if is_traced[i] {
-                            let name = &binding_names[i];
-                            quote! { #name }
-                        } else {
-                            quote! { _ }
+    let arms: Vec<_> = data_enum
+        .variants
+        .iter()
+        .map(|variant| {
+            let var_ident = &variant.ident;
+            match &variant.fields {
+                Fields::Named(named) => {
+                    let traced: Vec<_> = named
+                        .named
+                        .iter()
+                        .filter(|f| !has_ignore_trace(&f.attrs))
+                        .filter_map(|f| f.ident.as_ref())
+                        .collect();
+                    quote! {
+                        #ident::#var_ident { #(#traced,)* .. } => {
+                            #(#traced.#method_ident();)*
                         }
-                    })
-                    .collect();
-                let traced_names: Vec<&syn::Ident> = (0..total)
-                    .filter(|&i| is_traced[i])
-                    .map(|i| &binding_names[i])
-                    .collect();
-                quote! {
-                    #ident::#var_ident(#(#pattern),*) => {
-                        #(#traced_names.#method_ident();)*
                     }
                 }
+                Fields::Unnamed(unnamed) => {
+                    let total = unnamed.unnamed.len();
+                    let is_traced: Vec<bool> = unnamed
+                        .unnamed
+                        .iter()
+                        .map(|f| !has_ignore_trace(&f.attrs))
+                        .collect();
+                    let binding_names: Vec<syn::Ident> = (0..total)
+                        .map(|i| {
+                            syn::Ident::new(&format!("_{}", i), proc_macro2::Span::call_site())
+                        })
+                        .collect();
+                    let pattern: Vec<proc_macro2::TokenStream> = (0..total)
+                        .map(|i| {
+                            if is_traced[i] {
+                                let name = &binding_names[i];
+                                quote! { #name }
+                            } else {
+                                quote! { _ }
+                            }
+                        })
+                        .collect();
+                    let traced_names: Vec<&syn::Ident> = (0..total)
+                        .filter(|&i| is_traced[i])
+                        .map(|i| &binding_names[i])
+                        .collect();
+                    quote! {
+                        #ident::#var_ident(#(#pattern),*) => {
+                            #(#traced_names.#method_ident();)*
+                        }
+                    }
+                }
+                Fields::Unit => {
+                    quote! { #ident::#var_ident => {} }
+                }
             }
-            Fields::Unit => {
-                quote! { #ident::#var_ident => {} }
-            }
-        }
-    }).collect();
+        })
+        .collect();
 
     quote! {
         match self {
@@ -103,53 +129,63 @@ fn enum_match(ident: &syn::Ident, data_enum: &syn::DataEnum, method: &str) -> pr
 
 /// Generate a `match self { ... }` expression for an enum, calling `trace_children(children)` on traced fields.
 fn enum_match_children(ident: &syn::Ident, data_enum: &syn::DataEnum) -> proc_macro2::TokenStream {
-    let arms: Vec<_> = data_enum.variants.iter().map(|variant| {
-        let var_ident = &variant.ident;
-        match &variant.fields {
-            Fields::Named(named) => {
-                let traced: Vec<_> = named.named.iter()
-                    .filter(|f| !has_ignore_trace(&f.attrs))
-                    .filter_map(|f| f.ident.as_ref())
-                    .collect();
-                quote! {
-                    #ident::#var_ident { #(#traced,)* .. } => {
-                        #(#traced.trace_children(children);)*
-                    }
-                }
-            }
-            Fields::Unnamed(unnamed) => {
-                let total = unnamed.unnamed.len();
-                let is_traced: Vec<bool> = unnamed.unnamed.iter()
-                    .map(|f| !has_ignore_trace(&f.attrs))
-                    .collect();
-                let binding_names: Vec<syn::Ident> = (0..total)
-                    .map(|i| syn::Ident::new(&format!("_{}", i), proc_macro2::Span::call_site()))
-                    .collect();
-                let pattern: Vec<proc_macro2::TokenStream> = (0..total)
-                    .map(|i| {
-                        if is_traced[i] {
-                            let name = &binding_names[i];
-                            quote! { #name }
-                        } else {
-                            quote! { _ }
+    let arms: Vec<_> = data_enum
+        .variants
+        .iter()
+        .map(|variant| {
+            let var_ident = &variant.ident;
+            match &variant.fields {
+                Fields::Named(named) => {
+                    let traced: Vec<_> = named
+                        .named
+                        .iter()
+                        .filter(|f| !has_ignore_trace(&f.attrs))
+                        .filter_map(|f| f.ident.as_ref())
+                        .collect();
+                    quote! {
+                        #ident::#var_ident { #(#traced,)* .. } => {
+                            #(#traced.trace_children(children);)*
                         }
-                    })
-                    .collect();
-                let traced_names: Vec<&syn::Ident> = (0..total)
-                    .filter(|&i| is_traced[i])
-                    .map(|i| &binding_names[i])
-                    .collect();
-                quote! {
-                    #ident::#var_ident(#(#pattern),*) => {
-                        #(#traced_names.trace_children(children);)*
                     }
                 }
+                Fields::Unnamed(unnamed) => {
+                    let total = unnamed.unnamed.len();
+                    let is_traced: Vec<bool> = unnamed
+                        .unnamed
+                        .iter()
+                        .map(|f| !has_ignore_trace(&f.attrs))
+                        .collect();
+                    let binding_names: Vec<syn::Ident> = (0..total)
+                        .map(|i| {
+                            syn::Ident::new(&format!("_{}", i), proc_macro2::Span::call_site())
+                        })
+                        .collect();
+                    let pattern: Vec<proc_macro2::TokenStream> = (0..total)
+                        .map(|i| {
+                            if is_traced[i] {
+                                let name = &binding_names[i];
+                                quote! { #name }
+                            } else {
+                                quote! { _ }
+                            }
+                        })
+                        .collect();
+                    let traced_names: Vec<&syn::Ident> = (0..total)
+                        .filter(|&i| is_traced[i])
+                        .map(|i| &binding_names[i])
+                        .collect();
+                    quote! {
+                        #ident::#var_ident(#(#pattern),*) => {
+                            #(#traced_names.trace_children(children);)*
+                        }
+                    }
+                }
+                Fields::Unit => {
+                    quote! { #ident::#var_ident => {} }
+                }
             }
-            Fields::Unit => {
-                quote! { #ident::#var_ident => {} }
-            }
-        }
-    }).collect();
+        })
+        .collect();
 
     quote! {
         match self {
@@ -184,8 +220,10 @@ pub fn derive_trace(item: TokenStream) -> TokenStream {
         Data::Union(_) => {
             return syn::Error::new_spanned(
                 &derive_input,
-                "#[derive(Trace)] is not supported for unions. Use a struct or enum instead."
-            ).to_compile_error().into();
+                "#[derive(Trace)] is not supported for unions. Use a struct or enum instead.",
+            )
+            .to_compile_error()
+            .into();
         }
     };
 
@@ -271,21 +309,31 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
                 } else {
                     return syn::Error::new_spanned(
                         &nv.lit,
-                        "strategy value must be a string literal, e.g. strategy = \"basic\""
-                    ).to_compile_error().into();
+                        "strategy value must be a string literal, e.g. strategy = \"basic\"",
+                    )
+                    .to_compile_error()
+                    .into();
                 }
             } else {
-                let name = nv.path.get_ident().map(|i| i.to_string()).unwrap_or_default();
+                let name = nv
+                    .path
+                    .get_ident()
+                    .map(|i| i.to_string())
+                    .unwrap_or_default();
                 return syn::Error::new_spanned(
                     &nv.path,
-                    format!("unknown attribute '{}'. Only 'strategy' is supported", name)
-                ).to_compile_error().into();
+                    format!("unknown attribute '{}'. Only 'strategy' is supported", name),
+                )
+                .to_compile_error()
+                .into();
             }
         } else {
             return syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "expected strategy = \"...\". Supported strategies: basic, threshold, adaptive"
-            ).to_compile_error().into();
+                "expected strategy = \"...\". Supported strategies: basic, threshold, adaptive",
+            )
+            .to_compile_error()
+            .into();
         }
     }
 
@@ -317,8 +365,13 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
             let span = strategy_span.unwrap_or_else(proc_macro2::Span::call_site);
             return syn::Error::new(
                 span,
-                format!("unknown GC strategy '{}'. Supported: basic, threshold, adaptive", other)
-            ).to_compile_error().into();
+                format!(
+                    "unknown GC strategy '{}'. Supported: basic, threshold, adaptive",
+                    other
+                ),
+            )
+            .to_compile_error()
+            .into();
         }
     };
 
@@ -328,8 +381,10 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
     if name != "main" {
         return syn::Error::new_spanned(
             &input.sig.ident,
-            "#[ferris_gc_main] can only be applied to the main function"
-        ).to_compile_error().into();
+            "#[ferris_gc_main] can only be applied to the main function",
+        )
+        .to_compile_error()
+        .into();
     }
     let mut args = Vec::new();
     for arg in &input.sig.inputs {
@@ -337,9 +392,8 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
     }
     let ret = match &input.sig.output {
         ReturnType::Default => {
-            quote! {
-            }
-        },
+            quote! {}
+        }
         ReturnType::Type(_arrow, box_type) => {
             quote! {
                 -> #box_type

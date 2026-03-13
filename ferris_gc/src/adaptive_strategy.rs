@@ -48,7 +48,12 @@ impl Default for AdaptiveConfig {
     }
 }
 
-fn adapt_threshold(config: &AdaptiveConfig, current: usize, collected: usize, scanned: usize) -> usize {
+fn adapt_threshold(
+    config: &AdaptiveConfig,
+    current: usize,
+    collected: usize,
+    scanned: usize,
+) -> usize {
     if scanned == 0 {
         return current;
     }
@@ -66,6 +71,7 @@ fn adapt_threshold(config: &AdaptiveConfig, current: usize, collected: usize, sc
 }
 
 /// Creates start/stop closures for a local adaptive strategy.
+#[allow(clippy::type_complexity)]
 pub fn adaptive_local_start(
     config: AdaptiveConfig,
 ) -> (
@@ -74,7 +80,9 @@ pub fn adaptive_local_start(
 ) {
     let config = std::sync::Arc::new(config);
     let config_start = config.clone();
-    let start_fn = move |gc: &'static LocalGarbageCollector, is_active: &'static AtomicBool| -> Option<JoinHandle<()>> {
+    let start_fn = move |gc: &'static LocalGarbageCollector,
+                         is_active: &'static AtomicBool|
+          -> Option<JoinHandle<()>> {
         let config = config_start.clone();
         Some(thread::spawn(move || {
             let mut threshold = config.initial_gen0_threshold;
@@ -85,21 +93,32 @@ pub fn adaptive_local_start(
                 let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
                 if allocs >= threshold {
                     let stats = unsafe { gc.core.collect_generation(Generation::Gen0) };
-                    threshold = adapt_threshold(&config, threshold, stats.objects_collected, stats.objects_scanned);
+                    threshold = adapt_threshold(
+                        &config,
+                        threshold,
+                        stats.objects_collected,
+                        stats.objects_scanned,
+                    );
                     gen0_count += 1;
                     if gen0_count >= config.gen0_collections_per_gen1 {
                         gen0_count = 0;
-                        unsafe { gc.core.collect_generation(Generation::Gen1); }
+                        unsafe {
+                            gc.core.collect_generation(Generation::Gen1);
+                        }
                         gen1_count += 1;
                         if gen1_count >= config.gen1_collections_per_gen2 {
                             gen1_count = 0;
-                            unsafe { gc.core.collect_generation(Generation::Gen2); }
+                            unsafe {
+                                gc.core.collect_generation(Generation::Gen2);
+                            }
                         }
                     }
                 }
             }
             // Final full collection on shutdown
-            unsafe { gc.core.collect_generation(Generation::Gen2); }
+            unsafe {
+                gc.core.collect_generation(Generation::Gen2);
+            }
         }))
     };
     let stop_fn = move |_gc: &'static LocalGarbageCollector| {};
@@ -107,6 +126,7 @@ pub fn adaptive_local_start(
 }
 
 /// Creates start/stop closures for a global adaptive strategy.
+#[allow(clippy::type_complexity)]
 pub fn adaptive_global_start(
     config: AdaptiveConfig,
 ) -> (
@@ -115,7 +135,9 @@ pub fn adaptive_global_start(
 ) {
     let config = std::sync::Arc::new(config);
     let config_start = config.clone();
-    let start_fn = move |gc: &'static GlobalGarbageCollector, is_active: &'static AtomicBool| -> Option<JoinHandle<()>> {
+    let start_fn = move |gc: &'static GlobalGarbageCollector,
+                         is_active: &'static AtomicBool|
+          -> Option<JoinHandle<()>> {
         let config = config_start.clone();
         Some(thread::spawn(move || {
             let mut threshold = config.initial_gen0_threshold;
@@ -126,21 +148,32 @@ pub fn adaptive_global_start(
                 let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
                 if allocs >= threshold {
                     let stats = unsafe { gc.core.collect_generation(Generation::Gen0) };
-                    threshold = adapt_threshold(&config, threshold, stats.objects_collected, stats.objects_scanned);
+                    threshold = adapt_threshold(
+                        &config,
+                        threshold,
+                        stats.objects_collected,
+                        stats.objects_scanned,
+                    );
                     gen0_count += 1;
                     if gen0_count >= config.gen0_collections_per_gen1 {
                         gen0_count = 0;
-                        unsafe { gc.core.collect_generation(Generation::Gen1); }
+                        unsafe {
+                            gc.core.collect_generation(Generation::Gen1);
+                        }
                         gen1_count += 1;
                         if gen1_count >= config.gen1_collections_per_gen2 {
                             gen1_count = 0;
-                            unsafe { gc.core.collect_generation(Generation::Gen2); }
+                            unsafe {
+                                gc.core.collect_generation(Generation::Gen2);
+                            }
                         }
                     }
                 }
             }
             // Final full collection on shutdown
-            unsafe { gc.core.collect_generation(Generation::Gen2); }
+            unsafe {
+                gc.core.collect_generation(Generation::Gen2);
+            }
         }))
     };
     let stop_fn = move |_gc: &'static GlobalGarbageCollector| {};
@@ -156,7 +189,10 @@ mod tests {
         let config = AdaptiveConfig::default();
         // 80% collected → should decrease
         let new = adapt_threshold(&config, 100, 80, 100);
-        assert!(new < 100, "high collection ratio should decrease threshold, got {new}");
+        assert!(
+            new < 100,
+            "high collection ratio should decrease threshold, got {new}"
+        );
         assert!(new >= config.min_threshold);
     }
 
@@ -165,7 +201,10 @@ mod tests {
         let config = AdaptiveConfig::default();
         // 5% collected → should increase
         let new = adapt_threshold(&config, 100, 5, 100);
-        assert!(new > 100, "low collection ratio should increase threshold, got {new}");
+        assert!(
+            new > 100,
+            "low collection ratio should increase threshold, got {new}"
+        );
         assert!(new <= config.max_threshold);
     }
 
@@ -179,7 +218,10 @@ mod tests {
 
     #[test]
     fn adapt_threshold_respects_min() {
-        let config = AdaptiveConfig { min_threshold: 50, ..Default::default() };
+        let config = AdaptiveConfig {
+            min_threshold: 50,
+            ..Default::default()
+        };
         // Start at min, high ratio would try to decrease further
         let new = adapt_threshold(&config, 50, 50, 50);
         assert_eq!(new, 50, "threshold should not go below min_threshold");
@@ -187,7 +229,10 @@ mod tests {
 
     #[test]
     fn adapt_threshold_respects_max() {
-        let config = AdaptiveConfig { max_threshold: 200, ..Default::default() };
+        let config = AdaptiveConfig {
+            max_threshold: 200,
+            ..Default::default()
+        };
         // Start at max, low ratio would try to increase further
         let new = adapt_threshold(&config, 200, 0, 100);
         assert_eq!(new, 200, "threshold should not exceed max_threshold");

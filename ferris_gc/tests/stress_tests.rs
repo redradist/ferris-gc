@@ -77,7 +77,8 @@ fn stress_concurrent_sync_alloc() {
         .collect();
 
     for h in handles {
-        h.join().expect("thread panicked during concurrent alloc stress test");
+        h.join()
+            .expect("thread panicked during concurrent alloc stress test");
     }
 }
 
@@ -112,16 +113,15 @@ fn stress_concurrent_create_drop() {
         .collect();
 
     for h in handles {
-        h.join().expect("thread panicked during concurrent create/drop stress test");
+        h.join()
+            .expect("thread panicked during concurrent create/drop stress test");
     }
 }
 
 #[test]
 fn stress_shared_across_threads() {
     // Create objects on one thread, share across many reader threads
-    let objects: Vec<sync::Gc<i32>> = (0..1_000i32)
-        .map(|i| sync::Gc::new(i))
-        .collect();
+    let objects: Vec<sync::Gc<i32>> = (0..1_000i32).map(|i| sync::Gc::new(i)).collect();
 
     let handles: Vec<_> = (0..8)
         .map(|_| {
@@ -135,6 +135,7 @@ fn stress_shared_across_threads() {
         .collect();
 
     for h in handles {
-        h.join().expect("thread panicked during shared read stress test");
+        h.join()
+            .expect("thread panicked during shared read stress test");
     }
 }

@@ -22,30 +22,32 @@ extern crate alloc;
 extern crate lazy_static;
 
 #[cfg(feature = "std")]
-mod gc;
+mod adaptive_strategy;
+#[cfg(feature = "std")]
+mod basic_gc_strategy;
 #[cfg(feature = "std")]
 mod default_trace;
 #[cfg(feature = "std")]
-mod basic_gc_strategy;
+mod gc;
 mod generation;
 #[cfg(feature = "std")]
 mod threshold_strategy;
-#[cfg(feature = "std")]
-mod adaptive_strategy;
 
 #[cfg(feature = "std")]
-pub use gc::*;
+pub use adaptive_strategy::{AdaptiveConfig, adaptive_global_start, adaptive_local_start};
 #[cfg(feature = "std")]
-pub use gc::sync;
+pub use basic_gc_strategy::{
+    ApplicationCleanup, BASIC_STRATEGY_DISABLED, BASIC_STRATEGY_GLOBAL_GC, BASIC_STRATEGY_LOCAL_GCS,
+};
 #[cfg(feature = "std")]
 #[allow(unused_imports)]
 pub use default_trace::*;
 #[cfg(feature = "std")]
-pub use basic_gc_strategy::{BASIC_STRATEGY_LOCAL_GCS, BASIC_STRATEGY_GLOBAL_GC, BASIC_STRATEGY_DISABLED, ApplicationCleanup};
+pub use gc::sync;
 #[cfg(feature = "std")]
-pub use threshold_strategy::{ThresholdConfig, threshold_local_start, threshold_global_start};
+pub use gc::*;
 #[cfg(feature = "std")]
-pub use adaptive_strategy::{AdaptiveConfig, adaptive_local_start, adaptive_global_start};
+pub use threshold_strategy::{ThresholdConfig, threshold_global_start, threshold_local_start};
 
 pub use generation::*;
 
@@ -56,4 +58,4 @@ mod no_std_traits;
 pub use no_std_traits::*;
 
 #[cfg(feature = "proc-macro")]
-pub use ferris_gc_proc_macro::{Trace, Finalize, ferris_gc_main};
+pub use ferris_gc_proc_macro::{Finalize, Trace, ferris_gc_main};

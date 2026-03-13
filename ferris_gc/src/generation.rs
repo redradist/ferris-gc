@@ -1,3 +1,9 @@
+/// Region identifier for region-based collection.
+/// Objects are assigned to a region on allocation. Individual regions can be
+/// collected independently, reducing pause times by limiting the scope of each collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegionId(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Generation {

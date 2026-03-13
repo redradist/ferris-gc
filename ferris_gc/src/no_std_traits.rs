@@ -23,7 +23,9 @@ pub trait Trace: Finalize {
 pub trait Finalize {
     fn finalize(&self);
     fn as_finalize(&self) -> &dyn Finalize
-        where Self: Sized {
+    where
+        Self: Sized,
+    {
         self
     }
 }

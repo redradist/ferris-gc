@@ -30,6 +30,7 @@ impl Default for ThresholdConfig {
 }
 
 /// Creates start/stop closures for a local threshold strategy.
+#[allow(clippy::type_complexity)]
 pub fn threshold_local_start(
     config: ThresholdConfig,
 ) -> (
@@ -38,7 +39,9 @@ pub fn threshold_local_start(
 ) {
     let config = std::sync::Arc::new(config);
     let config_start = config.clone();
-    let start_fn = move |gc: &'static LocalGarbageCollector, is_active: &'static AtomicBool| -> Option<JoinHandle<()>> {
+    let start_fn = move |gc: &'static LocalGarbageCollector,
+                         is_active: &'static AtomicBool|
+          -> Option<JoinHandle<()>> {
         let config = config_start.clone();
         Some(thread::spawn(move || {
             let mut gen0_count: u32 = 0;
@@ -47,21 +50,29 @@ pub fn threshold_local_start(
                 thread::sleep(config.poll_interval);
                 let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
                 if allocs >= config.gen0_threshold {
-                    unsafe { gc.core.collect_generation(Generation::Gen0); }
+                    unsafe {
+                        gc.core.collect_generation(Generation::Gen0);
+                    }
                     gen0_count += 1;
                     if gen0_count >= config.gen0_collections_per_gen1 {
                         gen0_count = 0;
-                        unsafe { gc.core.collect_generation(Generation::Gen1); }
+                        unsafe {
+                            gc.core.collect_generation(Generation::Gen1);
+                        }
                         gen1_count += 1;
                         if gen1_count >= config.gen1_collections_per_gen2 {
                             gen1_count = 0;
-                            unsafe { gc.core.collect_generation(Generation::Gen2); }
+                            unsafe {
+                                gc.core.collect_generation(Generation::Gen2);
+                            }
                         }
                     }
                 }
             }
             // Final full collection on shutdown
-            unsafe { gc.core.collect_generation(Generation::Gen2); }
+            unsafe {
+                gc.core.collect_generation(Generation::Gen2);
+            }
         }))
     };
     let stop_fn = move |_gc: &'static LocalGarbageCollector| {};
@@ -69,6 +80,7 @@ pub fn threshold_local_start(
 }
 
 /// Creates start/stop closures for a global threshold strategy.
+#[allow(clippy::type_complexity)]
 pub fn threshold_global_start(
     config: ThresholdConfig,
 ) -> (
@@ -77,7 +89,9 @@ pub fn threshold_global_start(
 ) {
     let config = std::sync::Arc::new(config);
     let config_start = config.clone();
-    let start_fn = move |gc: &'static GlobalGarbageCollector, is_active: &'static AtomicBool| -> Option<JoinHandle<()>> {
+    let start_fn = move |gc: &'static GlobalGarbageCollector,
+                         is_active: &'static AtomicBool|
+          -> Option<JoinHandle<()>> {
         let config = config_start.clone();
         Some(thread::spawn(move || {
             let mut gen0_count: u32 = 0;
@@ -86,21 +100,29 @@ pub fn threshold_global_start(
                 thread::sleep(config.poll_interval);
                 let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
                 if allocs >= config.gen0_threshold {
-                    unsafe { gc.core.collect_generation(Generation::Gen0); }
+                    unsafe {
+                        gc.core.collect_generation(Generation::Gen0);
+                    }
                     gen0_count += 1;
                     if gen0_count >= config.gen0_collections_per_gen1 {
                         gen0_count = 0;
-                        unsafe { gc.core.collect_generation(Generation::Gen1); }
+                        unsafe {
+                            gc.core.collect_generation(Generation::Gen1);
+                        }
                         gen1_count += 1;
                         if gen1_count >= config.gen1_collections_per_gen2 {
                             gen1_count = 0;
-                            unsafe { gc.core.collect_generation(Generation::Gen2); }
+                            unsafe {
+                                gc.core.collect_generation(Generation::Gen2);
+                            }
                         }
                     }
                 }
             }
             // Final full collection on shutdown
-            unsafe { gc.core.collect_generation(Generation::Gen2); }
+            unsafe {
+                gc.core.collect_generation(Generation::Gen2);
+            }
         }))
     };
     let stop_fn = move |_gc: &'static GlobalGarbageCollector| {};

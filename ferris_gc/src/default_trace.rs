@@ -1,5 +1,5 @@
 use crate::gc::{Finalize, Trace};
-use std::collections::{BinaryHeap, BTreeSet, HashMap, BTreeMap, HashSet, LinkedList, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
 
 macro_rules! trivial_types {
     ($($prm:ident),*) => {
@@ -74,20 +74,12 @@ macro_rules! trivial_types {
 }
 
 trivial_types!(
-    u8, i8, u16, i16, u32, i32, u64, i64, u128, i128,
-    usize, isize,
-    f32, f64,
-    bool,
-    String
+    u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, usize, isize, f32, f64, bool, String
 );
 
-trivial_types!(
-    &str, &String
-);
+trivial_types!(&str, &String);
 
-trivial_types!(
-    Box<T>
-);
+trivial_types!(Box<T>);
 
 macro_rules! collection_types {
     ($($std:ident<T>),*) => {
@@ -173,15 +165,22 @@ macro_rules! collection_types {
 }
 
 collection_types!(
-    Vec<T>, VecDeque<T>, LinkedList<T>,
-    HashSet<T>, BTreeSet<T>, BinaryHeap<T>
+    Vec<T>,
+    VecDeque<T>,
+    LinkedList<T>,
+    HashSet<T>,
+    BTreeSet<T>,
+    BinaryHeap<T>
 );
 
 collection_types!(
     HashMap<K, T>, BTreeMap<K, T>
 );
 
-impl<T> Trace for Option<T> where T: 'static + Sized + Trace {
+impl<T> Trace for Option<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn is_root(&self) -> bool {
         unreachable!("is_root should never be called on primitive type !!");
     }
@@ -210,7 +209,10 @@ impl<T> Trace for Option<T> where T: 'static + Sized + Trace {
     }
 }
 
-impl<T> Finalize for Option<T> where T: 'static + Sized + Trace {
+impl<T> Finalize for Option<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn finalize(&self) {
         if let Some(obj) = self.as_ref() {
             obj.finalize();

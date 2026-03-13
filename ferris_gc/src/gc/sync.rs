@@ -4,9 +4,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
-use crate::gc::{Finalize, Trace, GarbageCollector};
+use crate::basic_gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
+use crate::gc::{Finalize, GarbageCollector, Trace};
 use crate::generation::Generation;
-use crate::basic_gc_strategy::{basic_gc_strategy_start, BASIC_STRATEGY_GLOBAL_GC};
 
 pub type OptGc<T> = Option<Gc<T>>;
 pub type OptGcCell<T> = Option<GcRefCell<T>>;
@@ -27,21 +27,30 @@ impl GcInfo {
 /// This type is `pub` because it appears in the public `Deref` interface, but users
 /// should not need to name it directly — access `T` via double-deref (`**gc`).
 #[doc(hidden)]
-pub struct GcPtr<T> where T: 'static + Sized + Trace {
+pub struct GcPtr<T>
+where
+    T: 'static + Sized + Trace,
+{
     info: GcInfo,
     t: T,
 }
 
-impl<T> GcPtr<T> where T: 'static + Sized + Trace {
+impl<T> GcPtr<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn new(t: T) -> GcPtr<T> {
         GcPtr {
             info: GcInfo::new(),
-            t: t,
+            t,
         }
     }
 }
 
-impl<T> Deref for GcPtr<T> where T: 'static + Sized + Trace {
+impl<T> Deref for GcPtr<T>
+where
+    T: 'static + Sized + Trace,
+{
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -49,13 +58,19 @@ impl<T> Deref for GcPtr<T> where T: 'static + Sized + Trace {
     }
 }
 
-impl<T> DerefMut for GcPtr<T> where T: 'static + Sized + Trace {
+impl<T> DerefMut for GcPtr<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.t
     }
 }
 
-impl<T> Trace for GcPtr<T> where T: Sized + Trace {
+impl<T> Trace for GcPtr<T>
+where
+    T: Sized + Trace,
+{
     fn is_root(&self) -> bool {
         unreachable!("is_root on GcPtr is unreachable !!");
     }
@@ -89,7 +104,10 @@ impl<T> Trace for GcPtr<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
+impl<T> Trace for RefCell<GcPtr<T>>
+where
+    T: Sized + Trace,
+{
     fn is_root(&self) -> bool {
         unreachable!("is_root on GcPtr is unreachable !!");
     }
@@ -99,14 +117,22 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
     }
 
     fn trace(&self) {
-        let prev = self.borrow().info.root_ref_count.fetch_add(1, Ordering::AcqRel);
+        let prev = self
+            .borrow()
+            .info
+            .root_ref_count
+            .fetch_add(1, Ordering::AcqRel);
         if prev == 0 {
             self.borrow().t.trace();
         }
     }
 
     fn reset(&self) {
-        let prev = self.borrow().info.root_ref_count.fetch_sub(1, Ordering::AcqRel);
+        let prev = self
+            .borrow()
+            .info
+            .root_ref_count
+            .fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             self.borrow().t.reset();
         }
@@ -121,29 +147,44 @@ impl<T> Trace for RefCell<GcPtr<T>> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalize for RefCell<GcPtr<T>> where T: Sized + Trace {
+impl<T> Finalize for RefCell<GcPtr<T>>
+where
+    T: Sized + Trace,
+{
     fn finalize(&self) {}
 }
 
-impl<T> Finalize for GcPtr<T> where T: Sized + Trace {
+impl<T> Finalize for GcPtr<T>
+where
+    T: Sized + Trace,
+{
     fn finalize(&self) {}
 }
 
-pub(crate) struct GcInternal<T> where T: 'static + Sized + Trace {
+pub(crate) struct GcInternal<T>
+where
+    T: 'static + Sized + Trace,
+{
     is_root: AtomicBool,
     ptr: *const GcPtr<T>,
 }
 
-impl<T> GcInternal<T> where T: 'static + Sized + Trace {
+impl<T> GcInternal<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn new(ptr: *const GcPtr<T>) -> GcInternal<T> {
         GcInternal {
             is_root: AtomicBool::new(true),
-            ptr: ptr,
+            ptr,
         }
     }
 }
 
-impl<T> Trace for GcInternal<T> where T: Sized + Trace {
+impl<T> Trace for GcInternal<T>
+where
+    T: Sized + Trace,
+{
     fn is_root(&self) -> bool {
         self.is_root.load(Ordering::Acquire)
     }
@@ -170,9 +211,7 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
     }
 
     fn is_traceable(&self) -> bool {
-        unsafe {
-            (*self.ptr).is_traceable()
-        }
+        unsafe { (*self.ptr).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -180,7 +219,10 @@ impl<T> Trace for GcInternal<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalize for GcInternal<T> where T: Sized + Trace {
+impl<T> Finalize for GcInternal<T>
+where
+    T: Sized + Trace,
+{
     fn finalize(&self) {}
 }
 
@@ -192,7 +234,10 @@ impl<T> Finalize for GcInternal<T> where T: Sized + Trace {
 /// the collector acquires a write lock for mark-and-sweep.
 ///
 /// Dereferences to `T` (via `GcPtr<T>`).
-pub struct Gc<T> where T: 'static + Sized + Trace {
+pub struct Gc<T>
+where
+    T: 'static + Sized + Trace,
+{
     internal_ptr: *mut GcInternal<T>,
     ptr: *const GcPtr<T>,
 }
@@ -204,52 +249,59 @@ pub struct Gc<T> where T: 'static + Sized + Trace {
 unsafe impl<T> Sync for Gc<T> where T: 'static + Sized + Trace + Sync {}
 unsafe impl<T> Send for Gc<T> where T: 'static + Sized + Trace + Send {}
 
-impl<T> Deref for Gc<T> where T: 'static + Sized + Trace {
+impl<T> Deref for Gc<T>
+where
+    T: 'static + Sized + Trace,
+{
     type Target = GcPtr<T>;
 
     /// Safe without holding the STW lock because as long as this `Gc<T>` handle
     /// exists, the object is reachable (root) and cannot be collected.
     fn deref(&self) -> &Self::Target {
-        unsafe {
-            &(*self.ptr)
-        }
+        unsafe { &(*self.ptr) }
     }
 }
 
-impl<T> std::fmt::Debug for Gc<T> where T: 'static + Sized + Trace + std::fmt::Debug {
+impl<T> std::fmt::Debug for Gc<T>
+where
+    T: 'static + Sized + Trace + std::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("Gc").field(&***self).finish()
     }
 }
 
-impl<T> Gc<T> where T: Sized + Trace {
+impl<T> Gc<T>
+where
+    T: Sized + Trace,
+{
     pub fn new(t: T) -> Gc<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        unsafe {
-            (*GLOBAL_GC).create_gc(t)
-        }
+        unsafe { (*GLOBAL_GC).create_gc(t) }
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     pub fn try_new(t: T) -> Result<Gc<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        unsafe {
-            (*GLOBAL_GC).try_create_gc(t)
-        }
+        unsafe { (*GLOBAL_GC).try_create_gc(t) }
     }
 }
 
-impl<T> Clone for Gc<T> where T: 'static + Sized + Trace {
+impl<T> Clone for Gc<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn clone(&self) -> Self {
-        unsafe {
-            (*GLOBAL_GC).clone_from_gc(self)
-        }
+        unsafe { (*GLOBAL_GC).clone_from_gc(self) }
     }
 }
 
-impl<T> Drop for Gc<T> where T: Sized + Trace {
+impl<T> Drop for Gc<T>
+where
+    T: Sized + Trace,
+{
     fn drop(&mut self) {
         unsafe {
             (*GLOBAL_GC).remove_tracer(self.internal_ptr);
@@ -257,38 +309,51 @@ impl<T> Drop for Gc<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Trace for Gc<T> where T: Sized + Trace {
+impl<T> Trace for Gc<T>
+where
+    T: Sized + Trace,
+{
     fn is_root(&self) -> bool {
         unsafe {
-            if self.internal_ptr.is_null() { return false; }
+            if self.internal_ptr.is_null() {
+                return false;
+            }
             (*self.internal_ptr).is_root()
         }
     }
 
     fn reset_root(&self) {
         unsafe {
-            if self.internal_ptr.is_null() { return; }
+            if self.internal_ptr.is_null() {
+                return;
+            }
             (*self.internal_ptr).reset_root();
         }
     }
 
     fn trace(&self) {
         unsafe {
-            if self.ptr.is_null() { return; }
+            if self.ptr.is_null() {
+                return;
+            }
             (*self.ptr).trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
-            if self.ptr.is_null() { return; }
+            if self.ptr.is_null() {
+                return;
+            }
             (*self.ptr).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
         unsafe {
-            if self.ptr.is_null() { return false; }
+            if self.ptr.is_null() {
+                return false;
+            }
             (*self.ptr).is_traceable()
         }
     }
@@ -298,25 +363,37 @@ impl<T> Trace for Gc<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalize for Gc<T> where T: Sized + Trace {
+impl<T> Finalize for Gc<T>
+where
+    T: Sized + Trace,
+{
     fn finalize(&self) {}
 }
 
-pub(crate) struct GcRefCellInternal<T> where T: 'static + Sized + Trace {
+pub(crate) struct GcRefCellInternal<T>
+where
+    T: 'static + Sized + Trace,
+{
     is_root: AtomicBool,
     ptr: *const RefCell<GcPtr<T>>,
 }
 
-impl<T> GcRefCellInternal<T> where T: 'static + Sized + Trace {
+impl<T> GcRefCellInternal<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn new(ptr: *const RefCell<GcPtr<T>>) -> GcRefCellInternal<T> {
         GcRefCellInternal {
             is_root: AtomicBool::new(true),
-            ptr: ptr,
+            ptr,
         }
     }
 }
 
-impl<T> Trace for GcRefCellInternal<T> where T: Sized + Trace {
+impl<T> Trace for GcRefCellInternal<T>
+where
+    T: Sized + Trace,
+{
     fn is_root(&self) -> bool {
         self.is_root.load(Ordering::Acquire)
     }
@@ -343,9 +420,7 @@ impl<T> Trace for GcRefCellInternal<T> where T: Sized + Trace {
     }
 
     fn is_traceable(&self) -> bool {
-        unsafe {
-            (*self.ptr).borrow().is_traceable()
-        }
+        unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -353,7 +428,10 @@ impl<T> Trace for GcRefCellInternal<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalize for GcRefCellInternal<T> where T: Sized + Trace {
+impl<T> Finalize for GcRefCellInternal<T>
+where
+    T: Sized + Trace,
+{
     fn finalize(&self) {}
 }
 
@@ -361,7 +439,10 @@ impl<T> Finalize for GcRefCellInternal<T> where T: Sized + Trace {
 ///
 /// The thread-safe counterpart of the local `GcRefCell<T>`. `borrow_mut()`
 /// triggers the write barrier for generational collection.
-pub struct GcRefCell<T> where T: 'static + Sized + Trace {
+pub struct GcRefCell<T>
+where
+    T: 'static + Sized + Trace,
+{
     internal_ptr: *mut GcRefCellInternal<T>,
     ptr: *const RefCell<GcPtr<T>>,
 }
@@ -369,7 +450,10 @@ pub struct GcRefCell<T> where T: 'static + Sized + Trace {
 unsafe impl<T> Sync for GcRefCell<T> where T: 'static + Sized + Trace + Sync {}
 unsafe impl<T> Send for GcRefCell<T> where T: 'static + Sized + Trace + Send {}
 
-impl<T> Drop for GcRefCell<T> where T: Sized + Trace {
+impl<T> Drop for GcRefCell<T>
+where
+    T: Sized + Trace,
+{
     fn drop(&mut self) {
         unsafe {
             (*GLOBAL_GC).remove_tracer(self.internal_ptr);
@@ -377,38 +461,41 @@ impl<T> Drop for GcRefCell<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Deref for GcRefCell<T> where T: 'static + Sized + Trace {
+impl<T> Deref for GcRefCell<T>
+where
+    T: 'static + Sized + Trace,
+{
     type Target = RefCell<GcPtr<T>>;
 
     fn deref(&self) -> &Self::Target {
-        unsafe {
-            &(*self.ptr)
-        }
+        unsafe { &(*self.ptr) }
     }
 }
 
-impl<T> std::fmt::Debug for GcRefCell<T> where T: 'static + Sized + Trace + std::fmt::Debug {
+impl<T> std::fmt::Debug for GcRefCell<T>
+where
+    T: 'static + Sized + Trace + std::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("GcRefCell").field(&**self.borrow()).finish()
     }
 }
 
-impl<T> GcRefCell<T> where T: 'static + Sized + Trace {
+impl<T> GcRefCell<T>
+where
+    T: 'static + Sized + Trace,
+{
     pub fn new(t: T) -> GcRefCell<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        unsafe {
-            (*GLOBAL_GC).create_gc_cell(t)
-        }
+        unsafe { (*GLOBAL_GC).create_gc_cell(t) }
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     pub fn try_new(t: T) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        unsafe {
-            (*GLOBAL_GC).try_create_gc_cell(t)
-        }
+        unsafe { (*GLOBAL_GC).try_create_gc_cell(t) }
     }
 
     /// Mutable borrow with write barrier.
@@ -416,26 +503,32 @@ impl<T> GcRefCell<T> where T: 'static + Sized + Trace {
     /// it gets added to the remembered set for young-generation collections.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
         unsafe {
-            let _stw = (*GLOBAL_GC).core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            (*GLOBAL_GC).core.write_barrier(self.ptr as *const dyn Trace);
+            let _stw = GLOBAL_GC
+                .core
+                .stw_lock
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            GLOBAL_GC.core.write_barrier(self.ptr as *const dyn Trace);
             (*self.ptr).borrow_mut()
         }
     }
 }
 
-impl<T> Clone for GcRefCell<T> where T: 'static + Sized + Trace {
+impl<T> Clone for GcRefCell<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn clone(&self) -> Self {
-        unsafe {
-            (*GLOBAL_GC).clone_from_gc_cell(self)
-        }
+        unsafe { (*GLOBAL_GC).clone_from_gc_cell(self) }
     }
 }
 
-impl<T> Trace for GcRefCell<T> where T: Sized + Trace {
+impl<T> Trace for GcRefCell<T>
+where
+    T: Sized + Trace,
+{
     fn is_root(&self) -> bool {
-        unsafe {
-            (*self.internal_ptr).is_root()
-        }
+        unsafe { (*self.internal_ptr).is_root() }
     }
 
     fn reset_root(&self) {
@@ -457,9 +550,7 @@ impl<T> Trace for GcRefCell<T> where T: Sized + Trace {
     }
 
     fn is_traceable(&self) -> bool {
-        unsafe {
-            (*self.ptr).borrow().is_traceable()
-        }
+        unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -467,7 +558,10 @@ impl<T> Trace for GcRefCell<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalize for GcRefCell<T> where T: Sized + Trace {
+impl<T> Finalize for GcRefCell<T>
+where
+    T: Sized + Trace,
+{
     fn finalize(&self) {}
 }
 
@@ -475,7 +569,10 @@ impl<T> Finalize for GcRefCell<T> where T: Sized + Trace {
 ///
 /// Does not prevent collection. `upgrade()` acquires the STW read lock
 /// to safely check liveness before returning a strong `Gc<T>`.
-pub struct GcWeak<T> where T: 'static + Sized + Trace {
+pub struct GcWeak<T>
+where
+    T: 'static + Sized + Trace,
+{
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ptr: *const GcPtr<T>,
 }
@@ -483,7 +580,10 @@ pub struct GcWeak<T> where T: 'static + Sized + Trace {
 unsafe impl<T> Send for GcWeak<T> where T: 'static + Sized + Trace + Send {}
 unsafe impl<T> Sync for GcWeak<T> where T: 'static + Sized + Trace + Sync {}
 
-impl<T> Clone for GcWeak<T> where T: 'static + Sized + Trace {
+impl<T> Clone for GcWeak<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn clone(&self) -> Self {
         GcWeak {
             alive: self.alive.clone(),
@@ -492,7 +592,10 @@ impl<T> Clone for GcWeak<T> where T: 'static + Sized + Trace {
     }
 }
 
-impl<T> std::fmt::Debug for GcWeak<T> where T: 'static + Sized + Trace {
+impl<T> std::fmt::Debug for GcWeak<T>
+where
+    T: 'static + Sized + Trace,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.alive.load(std::sync::atomic::Ordering::Relaxed) {
             f.write_str("GcWeak(alive)")
@@ -502,14 +605,21 @@ impl<T> std::fmt::Debug for GcWeak<T> where T: 'static + Sized + Trace {
     }
 }
 
-impl<T> GcWeak<T> where T: 'static + Sized + Trace {
+impl<T> GcWeak<T>
+where
+    T: 'static + Sized + Trace,
+{
     pub fn upgrade(&self) -> Option<Gc<T>> {
         if !self.alive.load(Ordering::Acquire) {
             return None;
         }
         unsafe {
             // Acquire STW read lock to prevent collection during upgrade
-            let _stw = (*GLOBAL_GC).core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
+            let _stw = GLOBAL_GC
+                .core
+                .stw_lock
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if self.alive.load(Ordering::Acquire) {
                 Some((*GLOBAL_GC).upgrade_weak(self))
             } else {
@@ -519,9 +629,14 @@ impl<T> GcWeak<T> where T: 'static + Sized + Trace {
     }
 }
 
-impl<T> Gc<T> where T: 'static + Sized + Trace {
+impl<T> Gc<T>
+where
+    T: 'static + Sized + Trace,
+{
     pub fn downgrade(this: &Gc<T>) -> GcWeak<T> {
-        let alive = (*GLOBAL_GC).core.get_or_create_weak_alive(this.ptr as *const dyn Trace);
+        let alive = GLOBAL_GC
+            .core
+            .get_or_create_weak_alive(this.ptr as *const dyn Trace);
         GcWeak {
             alive,
             ptr: this.ptr,
@@ -529,7 +644,10 @@ impl<T> Gc<T> where T: 'static + Sized + Trace {
     }
 }
 
-impl<T> Trace for GcWeak<T> where T: Sized + Trace {
+impl<T> Trace for GcWeak<T>
+where
+    T: Sized + Trace,
+{
     fn is_root(&self) -> bool {
         unreachable!("is_root should never be called on GcWeak !!");
     }
@@ -541,7 +659,10 @@ impl<T> Trace for GcWeak<T> where T: Sized + Trace {
     }
 }
 
-impl<T> Finalize for GcWeak<T> where T: Sized + Trace {
+impl<T> Finalize for GcWeak<T>
+where
+    T: Sized + Trace,
+{
     fn finalize(&self) {}
 }
 
@@ -554,11 +675,15 @@ unsafe impl Send for GlobalGarbageCollector {}
 
 impl GlobalGarbageCollector {
     fn new() -> GlobalGarbageCollector {
-        GlobalGarbageCollector { core: GarbageCollector::new() }
+        GlobalGarbageCollector {
+            core: GarbageCollector::new(),
+        }
     }
 
     unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
-        where T: Sized + Trace {
+    where
+        T: Sized + Trace,
+    {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<GcPtr<T>>();
@@ -572,21 +697,36 @@ impl GlobalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            tracers
+                .mem_to_trc
+                .insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            tracers.tracer_obj.insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
+            tracers
+                .tracer_obj
+                .insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
             objects.objs.insert(gc_ptr, mem_info_gc_ptr);
             objects.obj_gen.insert(gc_ptr, Generation::Gen0);
             objects.survive_count.insert(gc_ptr, 0);
+            objects.ref_counts.insert(gc_ptr, 1);
+            objects
+                .obj_region
+                .insert(gc_ptr, self.core.current_region());
             objects.fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
-            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut GcPtr<T>); } }
+            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
+                unsafe {
+                    std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
+                }
+            }
             objects.drop_fns.insert(gc_ptr, drop_gc_ptr::<T>);
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
     }
 
-    unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T> where T: Sized + Trace {
+    unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T>
+    where
+        T: Sized + Trace,
+    {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
@@ -597,18 +737,31 @@ impl GlobalGarbageCollector {
             };
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            tracers
+                .mem_to_trc
+                .insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            tracers.tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
+            tracers
+                .tracer_obj
+                .insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
+            // RC hybrid: increment ref count
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rc) = objects.ref_counts.get_mut(&(gc.ptr as *const dyn Trace)) {
+                *rc += 1;
+            }
             gc
         }
     }
 
-    unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T> where T: Sized + Trace {
+    unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T>
+    where
+        T: Sized + Trace,
+    {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<RefCell<GcPtr<T>>>();
-            let (gc_cell_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcRefCellInternal<T>>();
+            let (gc_cell_inter_ptr, mem_info_internal_ptr) =
+                self.core.alloc_mem::<GcRefCellInternal<T>>();
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
             std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
             let gc = GcRefCell {
@@ -618,21 +771,38 @@ impl GlobalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            tracers.mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
+            tracers
+                .mem_to_trc
+                .insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
             tracers.trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
-            tracers.tracer_obj.insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
+            tracers
+                .tracer_obj
+                .insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
             objects.objs.insert(gc_ptr, mem_info_gc_ptr);
             objects.obj_gen.insert(gc_ptr, Generation::Gen0);
             objects.survive_count.insert(gc_ptr, 0);
-            objects.fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
-            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>); } }
+            objects.ref_counts.insert(gc_ptr, 1);
+            objects
+                .obj_region
+                .insert(gc_ptr, self.core.current_region());
+            objects
+                .fin
+                .insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
+            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
+                unsafe {
+                    std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
+                }
+            }
             objects.drop_fns.insert(gc_ptr, drop_gc_cell_ptr::<T>);
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
     }
 
-    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T> where T: Sized + Trace {
+    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T>
+    where
+        T: Sized + Trace,
+    {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcRefCellInternal<T>>();
@@ -643,26 +813,38 @@ impl GlobalGarbageCollector {
             };
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            tracers
+                .mem_to_trc
+                .insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info);
-            tracers.tracer_obj.insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
+            tracers
+                .tracer_obj
+                .insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
+            // RC hybrid: increment ref count
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rc) = objects.ref_counts.get_mut(&(gc.ptr as *const dyn Trace)) {
+                *rc += 1;
+            }
             gc
         }
     }
 
     unsafe fn try_create_gc<T>(&self, t: T) -> Result<Gc<T>, crate::gc::GcAllocError>
-        where T: Sized + Trace {
+    where
+        T: Sized + Trace,
+    {
         unsafe {
             use std::alloc::dealloc;
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem::<GcPtr<T>>()?;
-            let (gc_inter_ptr, mem_info_internal_ptr) = match self.core.try_alloc_mem::<GcInternal<T>>() {
-                Ok(v) => v,
-                Err(e) => {
-                    dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
-                    return Err(e);
-                }
-            };
+            let (gc_inter_ptr, mem_info_internal_ptr) =
+                match self.core.try_alloc_mem::<GcInternal<T>>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
+                        return Err(e);
+                    }
+                };
             std::ptr::write(gc_ptr, GcPtr::new(t));
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
             let gc = Gc {
@@ -672,14 +854,26 @@ impl GlobalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            tracers
+                .mem_to_trc
+                .insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            tracers.tracer_obj.insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
+            tracers
+                .tracer_obj
+                .insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
             objects.objs.insert(gc_ptr, mem_info_gc_ptr);
             objects.obj_gen.insert(gc_ptr, Generation::Gen0);
             objects.survive_count.insert(gc_ptr, 0);
+            objects.ref_counts.insert(gc_ptr, 1);
+            objects
+                .obj_region
+                .insert(gc_ptr, self.core.current_region());
             objects.fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
-            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut GcPtr<T>); } }
+            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
+                unsafe {
+                    std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
+                }
+            }
             objects.drop_fns.insert(gc_ptr, drop_gc_ptr::<T>);
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
@@ -687,18 +881,21 @@ impl GlobalGarbageCollector {
     }
 
     unsafe fn try_create_gc_cell<T>(&self, t: T) -> Result<GcRefCell<T>, crate::gc::GcAllocError>
-        where T: Sized + Trace {
+    where
+        T: Sized + Trace,
+    {
         unsafe {
             use std::alloc::dealloc;
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem::<RefCell<GcPtr<T>>>()?;
-            let (gc_cell_inter_ptr, mem_info_internal_ptr) = match self.core.try_alloc_mem::<GcRefCellInternal<T>>() {
-                Ok(v) => v,
-                Err(e) => {
-                    dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
-                    return Err(e);
-                }
-            };
+            let (gc_cell_inter_ptr, mem_info_internal_ptr) =
+                match self.core.try_alloc_mem::<GcRefCellInternal<T>>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
+                        return Err(e);
+                    }
+                };
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
             std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
             let gc = GcRefCell {
@@ -708,14 +905,28 @@ impl GlobalGarbageCollector {
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
             let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            tracers.mem_to_trc.insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
+            tracers
+                .mem_to_trc
+                .insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
             tracers.trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
-            tracers.tracer_obj.insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
+            tracers
+                .tracer_obj
+                .insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
             objects.objs.insert(gc_ptr, mem_info_gc_ptr);
             objects.obj_gen.insert(gc_ptr, Generation::Gen0);
             objects.survive_count.insert(gc_ptr, 0);
-            objects.fin.insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
-            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) { unsafe { std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>); } }
+            objects.ref_counts.insert(gc_ptr, 1);
+            objects
+                .obj_region
+                .insert(gc_ptr, self.core.current_region());
+            objects
+                .fin
+                .insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
+            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
+                unsafe {
+                    std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
+                }
+            }
             objects.drop_fns.insert(gc_ptr, drop_gc_cell_ptr::<T>);
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
@@ -724,7 +935,10 @@ impl GlobalGarbageCollector {
 
     /// Create a new strong Gc<T> from a weak reference (for upgrade).
     /// Caller must hold STW read lock.
-    unsafe fn upgrade_weak<T>(&self, weak: &GcWeak<T>) -> Gc<T> where T: Sized + Trace {
+    unsafe fn upgrade_weak<T>(&self, weak: &GcWeak<T>) -> Gc<T>
+    where
+        T: Sized + Trace,
+    {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
@@ -735,40 +949,119 @@ impl GlobalGarbageCollector {
             };
             (*(*gc.internal_ptr).ptr).reset_root();
             let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            tracers.mem_to_trc.insert(gc_inter_ptr as usize, gc_inter_ptr);
+            tracers
+                .mem_to_trc
+                .insert(gc_inter_ptr as usize, gc_inter_ptr);
             tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            tracers.tracer_obj.insert(gc_inter_ptr, weak.ptr as *const dyn Trace);
+            tracers
+                .tracer_obj
+                .insert(gc_inter_ptr, weak.ptr as *const dyn Trace);
+            // RC hybrid: increment ref count
+            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rc) = objects.ref_counts.get_mut(&(weak.ptr as *const dyn Trace)) {
+                *rc += 1;
+            }
             gc
         }
     }
 
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn collect(&self) {
-        unsafe { self.core.collect(); }
+        unsafe {
+            self.core.collect();
+        }
     }
 
     #[allow(dead_code)]
     unsafe fn collect_all(&self) {
-        unsafe { self.core.collect_all(); }
+        unsafe {
+            self.core.collect_all();
+        }
     }
 
     pub(crate) unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
-        unsafe { self.core.remove_tracer(tracer); }
+        unsafe {
+            self.core.remove_tracer(tracer);
+        }
     }
 
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn begin_collection(&self, max_gen: crate::generation::Generation) {
-        unsafe { self.core.begin_collection(max_gen); }
+        unsafe {
+            self.core.begin_collection(max_gen);
+        }
     }
 
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn mark_step(&self, budget: usize) -> bool {
         unsafe { self.core.mark_step(budget) }
     }
 
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn finish_collection(&self) -> crate::generation::CollectionStats {
         unsafe { self.core.finish_collection() }
     }
 
-    pub unsafe fn collect_incremental(&self, max_gen: crate::generation::Generation, step_budget: usize) -> crate::generation::CollectionStats {
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn collect_incremental(
+        &self,
+        max_gen: crate::generation::Generation,
+        step_budget: usize,
+    ) -> crate::generation::CollectionStats {
         unsafe { self.core.collect_incremental(max_gen, step_budget) }
+    }
+
+    /// Begin concurrent collection: short STW to snapshot roots + edges.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn begin_concurrent_collection(&self, max_gen: crate::generation::Generation) {
+        unsafe {
+            self.core.begin_concurrent_collection(max_gen);
+        }
+    }
+
+    /// Process gray objects using edge snapshot. NO STW lock — safe for concurrent use.
+    pub fn concurrent_mark_step(&self, budget: usize) -> bool {
+        self.core.concurrent_mark_step(budget)
+    }
+
+    /// Run a complete concurrent collection.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn collect_concurrent(
+        &self,
+        max_gen: crate::generation::Generation,
+        step_budget: usize,
+    ) -> crate::generation::CollectionStats {
+        unsafe { self.core.collect_concurrent(max_gen, step_budget) }
+    }
+
+    /// Create a new region. Future allocations go into this region.
+    pub fn new_region(&self) -> crate::generation::RegionId {
+        self.core.new_region()
+    }
+
+    /// Get the current allocation region.
+    pub fn current_region(&self) -> crate::generation::RegionId {
+        self.core.current_region()
+    }
+
+    /// Collect only objects in the specified region.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub unsafe fn collect_region(
+        &self,
+        region: crate::generation::RegionId,
+    ) -> crate::generation::CollectionStats {
+        unsafe { self.core.collect_region(region) }
     }
 
     /// Return a snapshot of current GC diagnostics.
@@ -777,7 +1070,8 @@ impl GlobalGarbageCollector {
     }
 }
 
-pub type StartGlobalStrategyFn = Box<dyn FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
+pub type StartGlobalStrategyFn =
+    Box<dyn FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
 pub type StopGlobalStrategyFn = Box<dyn FnMut(&'static GlobalGarbageCollector)>;
 
 pub struct GlobalStrategy {
@@ -792,9 +1086,16 @@ unsafe impl Sync for GlobalStrategy {}
 unsafe impl Send for GlobalStrategy {}
 
 impl GlobalStrategy {
-    fn new<StartFn, StopFn>(gc: &'static GlobalGarbageCollector, start_fn: StartFn, stop_fn: StopFn) -> GlobalStrategy
-        where StartFn: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
-              StopFn: 'static + FnMut(&'static GlobalGarbageCollector) {
+    fn new<StartFn, StopFn>(
+        gc: &'static GlobalGarbageCollector,
+        start_fn: StartFn,
+        stop_fn: StopFn,
+    ) -> GlobalStrategy
+    where
+        StartFn: 'static
+            + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
+        StopFn: 'static + FnMut(&'static GlobalGarbageCollector),
+    {
         GlobalStrategy {
             gc: Cell::new(gc),
             is_active: AtomicBool::new(false),
@@ -805,8 +1106,11 @@ impl GlobalStrategy {
     }
 
     pub fn change_strategy<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn)
-        where StartFn: 'static + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
-              StopFn: 'static + FnMut(&'static GlobalGarbageCollector) {
+    where
+        StartFn: 'static
+            + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
+        StopFn: 'static + FnMut(&'static GlobalGarbageCollector),
+    {
         if self.is_active() {
             self.stop();
         }
@@ -822,10 +1126,14 @@ impl GlobalStrategy {
 
     /// Atomically check if inactive and start. Safe to call from multiple threads.
     pub fn ensure_started(&'static self) {
-        if self.is_active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if self
+            .is_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             let mut start_func = self.start_func.lock().unwrap_or_else(|e| e.into_inner());
             let mut join_handle = self.join_handle.lock().unwrap_or_else(|e| e.into_inner());
-            *join_handle = (&mut *(start_func))(self.gc.get(), &self.is_active);
+            *join_handle = (*(start_func))(self.gc.get(), &self.is_active);
         }
     }
 
@@ -833,17 +1141,19 @@ impl GlobalStrategy {
         self.is_active.store(true, Ordering::Release);
         let mut start_func = self.start_func.lock().unwrap_or_else(|e| e.into_inner());
         let mut join_handle = self.join_handle.lock().unwrap_or_else(|e| e.into_inner());
-        *join_handle = (&mut *(start_func))(self.gc.get(), &self.is_active);
+        *join_handle = (*(start_func))(self.gc.get(), &self.is_active);
     }
 
     pub fn stop(&self) {
         self.is_active.store(false, Ordering::Release);
         let mut join_handle = self.join_handle.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(join_handle) = join_handle.take() {
-            join_handle.join().expect("GlobalStrategy::stop, GlobalStrategy Thread being joined has panicked !!");
+            join_handle
+                .join()
+                .expect("GlobalStrategy::stop, GlobalStrategy Thread being joined has panicked !!");
         }
         let mut stop_func = self.stop_func.lock().unwrap_or_else(|e| e.into_inner());
-        (&mut *(stop_func))(self.gc.get());
+        (*(stop_func))(self.gc.get());
     }
 }
 
@@ -851,32 +1161,36 @@ impl Drop for GlobalStrategy {
     fn drop(&mut self) {
         self.is_active.store(false, Ordering::Release);
         let mut stop_func = self.stop_func.lock().unwrap_or_else(|e| e.into_inner());
-        (&mut *(stop_func))(self.gc.get());
+        (*(stop_func))(self.gc.get());
     }
 }
 
 lazy_static! {
-    static ref GLOBAL_GC: GlobalGarbageCollector = {
-        GlobalGarbageCollector::new()
-    };
+    static ref GLOBAL_GC: GlobalGarbageCollector = { GlobalGarbageCollector::new() };
     pub static ref GLOBAL_GC_STRATEGY: GlobalStrategy = {
         let gc = &(*GLOBAL_GC);
-        GlobalStrategy::new(gc,
+        GlobalStrategy::new(
+            gc,
             move |global_gc, _| {
-                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap_or_else(|e| e.into_inner());
+                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
                 *basic_strategy_global_gc = Some(global_gc);
                 None
             },
             move |_global_gc| {
-                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC.write().unwrap_or_else(|e| e.into_inner());
+                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
                 *basic_strategy_global_gc = None;
-            })
+            },
+        )
     };
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::gc::sync::{Gc, GLOBAL_GC};
+    use crate::gc::sync::{GLOBAL_GC, Gc};
     use std::sync::Mutex;
 
     // Serialize sync GC tests since they share GLOBAL_GC.
@@ -886,7 +1200,13 @@ mod tests {
     fn setup() -> (std::sync::MutexGuard<'static, ()>, usize) {
         let guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { (*GLOBAL_GC).collect() };
-        let baseline = (*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len();
+        let baseline = (*GLOBAL_GC)
+            .core
+            .tracers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .trs
+            .len();
         (guard, baseline)
     }
 
@@ -895,7 +1215,17 @@ mod tests {
         let (_guard, baseline) = setup();
         let _one = Gc::new(1);
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len()
+                - baseline,
+            1
+        );
     }
 
     #[test]
@@ -905,7 +1235,17 @@ mod tests {
             let _one = Gc::new(1);
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len()
+                - baseline,
+            0
+        );
     }
 
     #[test]
@@ -916,7 +1256,17 @@ mod tests {
         one = Gc::new(2);
         unsafe { (*GLOBAL_GC).collect() };
         // Reassignment drops old Gc (remove_tracer), so only 1 tracer remains
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len()
+                - baseline,
+            1
+        );
         drop(one);
     }
 
@@ -928,7 +1278,17 @@ mod tests {
         one = Gc::new(2);
         unsafe { (*GLOBAL_GC).collect() };
         // one is still live, so 1 tracer remains
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len()
+                - baseline,
+            1
+        );
         drop(one);
     }
 
@@ -942,12 +1302,25 @@ mod tests {
             drop(one);
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len()
+                - baseline,
+            0
+        );
     }
 
     #[test]
     fn stw_blocks_allocation_during_collection() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         let (_guard, _) = setup();
 
         let allocated_during_stw = Arc::new(AtomicBool::new(false));
@@ -955,7 +1328,11 @@ mod tests {
         let collection_done = Arc::new(AtomicBool::new(false));
 
         // Hold the STW write lock to simulate an ongoing collection
-        let stw_guard = (*GLOBAL_GC).core.stw_lock.write().unwrap_or_else(|e| e.into_inner());
+        let stw_guard = (*GLOBAL_GC)
+            .core
+            .stw_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         collection_started.store(true, Ordering::Release);
 
         let alloc_flag = allocated_during_stw.clone();
@@ -973,27 +1350,33 @@ mod tests {
         // Give the allocator thread time to block
         std::thread::sleep(std::time::Duration::from_millis(50));
         // Allocation should NOT have completed while we hold the write lock
-        assert!(!allocated_during_stw.load(Ordering::Acquire),
-            "allocation must block while STW write lock is held");
+        assert!(
+            !allocated_during_stw.load(Ordering::Acquire),
+            "allocation must block while STW write lock is held"
+        );
 
         // Release the STW lock — simulates end of collection
         drop(stw_guard);
         collection_done.store(true, Ordering::Release);
 
         handle.join().expect("allocator thread panicked");
-        assert!(allocated_during_stw.load(Ordering::Acquire),
-            "allocation should complete after STW lock is released");
+        assert!(
+            allocated_during_stw.load(Ordering::Acquire),
+            "allocation should complete after STW lock is released"
+        );
     }
 
     #[test]
     fn stw_allows_concurrent_allocations() {
         let (_guard, _) = setup();
         // Multiple threads allocating concurrently should all succeed (read locks are shared)
-        let handles: Vec<_> = (0..4).map(|i| {
-            std::thread::spawn(move || {
-                let _obj = Gc::new(i);
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let _obj = Gc::new(i);
+                })
             })
-        }).collect();
+            .collect();
         for h in handles {
             h.join().expect("concurrent allocation thread panicked");
         }
@@ -1006,10 +1389,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use crate::gc::sync::GLOBAL_GC_STRATEGY;
-            GLOBAL_GC_STRATEGY.change_strategy(
-                |_gc, _| None,
-                |_gc| {},
-            );
+            GLOBAL_GC_STRATEGY.change_strategy(|_gc, _| None, |_gc| {});
             tx.send(()).unwrap();
         });
         rx.recv_timeout(std::time::Duration::from_secs(3))
@@ -1018,36 +1398,64 @@ mod tests {
 
     #[test]
     fn incremental_collects_dead_objects() {
+        // RC hybrid frees non-cyclic objects immediately. Verify object is gone.
         let (_guard, baseline) = setup();
         {
             let _obj = Gc::new(42);
         }
-        let stats = unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 10) };
-        assert!(stats.objects_collected > 0, "incremental should collect dead objects");
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
+        // Object already freed by RC
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len()
+                - baseline,
+            0
+        );
+        // Incremental still works correctly
+        let _stats =
+            unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 10) };
     }
 
     #[test]
     fn incremental_preserves_live_objects() {
         let (_guard, baseline) = setup();
         let _live = Gc::new(99);
-        let stats = unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 10) };
-        assert_eq!(stats.objects_collected, 0, "incremental must not collect live objects");
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 1);
+        let stats =
+            unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 10) };
+        assert_eq!(
+            stats.objects_collected, 0,
+            "incremental must not collect live objects"
+        );
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len()
+                - baseline,
+            1
+        );
     }
 
     #[test]
     fn incremental_step_by_step_sync() {
+        // With RC hybrid, dead objects are already freed. Test with live object.
         let (_guard, _) = setup();
-        {
-            let _dead = Gc::new(1);
-        }
         let _live = Gc::new(2);
         unsafe {
             (*GLOBAL_GC).begin_collection(crate::generation::Generation::Gen2);
             while !(*GLOBAL_GC).mark_step(1) {}
             let stats = (*GLOBAL_GC).finish_collection();
-            assert!(stats.objects_collected >= 1, "should collect dead object");
+            assert_eq!(
+                stats.objects_collected, 0,
+                "live object must not be collected"
+            );
         }
     }
 
@@ -1055,7 +1463,10 @@ mod tests {
     fn try_new_succeeds() {
         let (_guard, _) = setup();
         let result = Gc::try_new(42);
-        assert!(result.is_ok(), "try_new should succeed for normal allocation");
+        assert!(
+            result.is_ok(),
+            "try_new should succeed for normal allocation"
+        );
         assert_eq!(**result.unwrap(), 42);
     }
 
@@ -1066,7 +1477,17 @@ mod tests {
             let _obj = Gc::try_new(77).unwrap();
         }
         unsafe { (*GLOBAL_GC).collect() };
-        assert_eq!((*GLOBAL_GC).core.tracers.read().unwrap_or_else(|e| e.into_inner()).trs.len() - baseline, 0);
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len()
+                - baseline,
+            0
+        );
     }
 
     // --- Diagnostics API tests ---
@@ -1103,13 +1524,13 @@ mod tests {
     #[test]
     fn sync_stats_tracks_last_collection() {
         let (_guard, _) = setup();
-        {
-            let _obj = Gc::new(99);
-        }
+        // With RC hybrid, dead objects are already freed. Just verify stats recording.
         unsafe { (*GLOBAL_GC).collect() };
         let stats = (*GLOBAL_GC).stats();
-        let last = stats.last_collection.expect("last_collection should be Some");
-        assert!(last.objects_collected >= 1);
+        assert!(
+            stats.last_collection.is_some(),
+            "last_collection should be Some after collect"
+        );
     }
 
     #[test]
@@ -1147,28 +1568,44 @@ mod tests {
     unsafe impl Send for SyncCyclicNode {}
     unsafe impl Sync for SyncCyclicNode {}
     impl crate::gc::Trace for SyncCyclicNode {
-        fn is_root(&self) -> bool { false }
+        fn is_root(&self) -> bool {
+            false
+        }
         fn reset_root(&self) {
-            if let Some(ref gc) = *self.next.borrow() { gc.reset_root(); }
+            if let Some(ref gc) = *self.next.borrow() {
+                gc.reset_root();
+            }
         }
         fn trace(&self) {
-            if let Some(ref gc) = *self.next.borrow() { gc.trace(); }
+            if let Some(ref gc) = *self.next.borrow() {
+                gc.trace();
+            }
         }
         fn reset(&self) {
-            if let Some(ref gc) = *self.next.borrow() { gc.reset(); }
+            if let Some(ref gc) = *self.next.borrow() {
+                gc.reset();
+            }
         }
-        fn is_traceable(&self) -> bool { false }
+        fn is_traceable(&self) -> bool {
+            false
+        }
         fn trace_children(&self, children: &mut Vec<*const dyn crate::gc::Trace>) {
-            if let Some(ref gc) = *self.next.borrow() { gc.trace_children(children); }
+            if let Some(ref gc) = *self.next.borrow() {
+                gc.trace_children(children);
+            }
         }
     }
-    impl crate::gc::Finalize for SyncCyclicNode { fn finalize(&self) {} }
+    impl crate::gc::Finalize for SyncCyclicNode {
+        fn finalize(&self) {}
+    }
 
     #[test]
     fn sync_self_cycle_collected() {
         let (_guard, _) = setup();
         {
-            let a = Gc::new(SyncCyclicNode { next: std::cell::RefCell::new(None) });
+            let a = Gc::new(SyncCyclicNode {
+                next: std::cell::RefCell::new(None),
+            });
             *a.next.borrow_mut() = Some(a.clone());
             drop(a);
         }
@@ -1179,9 +1616,15 @@ mod tests {
     fn sync_three_node_cycle_collected() {
         let (_guard, _) = setup();
         {
-            let a = Gc::new(SyncCyclicNode { next: std::cell::RefCell::new(None) });
-            let b = Gc::new(SyncCyclicNode { next: std::cell::RefCell::new(None) });
-            let c = Gc::new(SyncCyclicNode { next: std::cell::RefCell::new(None) });
+            let a = Gc::new(SyncCyclicNode {
+                next: std::cell::RefCell::new(None),
+            });
+            let b = Gc::new(SyncCyclicNode {
+                next: std::cell::RefCell::new(None),
+            });
+            let c = Gc::new(SyncCyclicNode {
+                next: std::cell::RefCell::new(None),
+            });
             *a.next.borrow_mut() = Some(b.clone());
             *b.next.borrow_mut() = Some(c.clone());
             *c.next.borrow_mut() = Some(a.clone());
@@ -1190,5 +1633,149 @@ mod tests {
             drop(c);
         }
         unsafe { (*GLOBAL_GC).collect() };
+    }
+
+    // --- Concurrent marking tests (Strategy 21) ---
+
+    #[test]
+    fn sync_concurrent_preserves_live_objects() {
+        let (_guard, baseline) = setup();
+        let _live = Gc::new(42);
+        let stats =
+            unsafe { (*GLOBAL_GC).collect_concurrent(crate::generation::Generation::Gen2, 10) };
+        assert_eq!(
+            stats.objects_collected, 0,
+            "concurrent must not collect live objects"
+        );
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len()
+                - baseline,
+            1
+        );
+    }
+
+    #[test]
+    fn sync_concurrent_step_by_step() {
+        let (_guard, _) = setup();
+        let _live = Gc::new(99);
+        unsafe {
+            (*GLOBAL_GC).begin_concurrent_collection(crate::generation::Generation::Gen2);
+            while !(*GLOBAL_GC).concurrent_mark_step(1) {}
+            let stats = (*GLOBAL_GC).finish_collection();
+            assert_eq!(stats.objects_collected, 0, "live objects must survive");
+        }
+    }
+
+    // --- Region-based collection tests (Strategy 22) ---
+
+    #[test]
+    fn sync_region_assignment() {
+        let (_guard, _) = setup();
+        let _obj = Gc::new(1);
+        let region = (*GLOBAL_GC).current_region();
+        let objects = (*GLOBAL_GC)
+            .core
+            .objects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            objects.obj_region.values().any(|r| *r == region),
+            "object should be assigned to current region"
+        );
+    }
+
+    #[test]
+    fn sync_collect_region() {
+        let (_guard, _) = setup();
+        // Create cycle in a new region
+        let region = (*GLOBAL_GC).new_region();
+        {
+            let a = Gc::new(SyncCyclicNode {
+                next: std::cell::RefCell::new(None),
+            });
+            let b = Gc::new(SyncCyclicNode {
+                next: std::cell::RefCell::new(None),
+            });
+            *a.next.borrow_mut() = Some(b.clone());
+            *b.next.borrow_mut() = Some(a.clone());
+            drop(a);
+            drop(b);
+        }
+        let stats = unsafe { (*GLOBAL_GC).collect_region(region) };
+        assert!(
+            stats.objects_collected >= 2,
+            "should collect cycle in target region"
+        );
+    }
+
+    // --- RC hybrid tests (Strategy 23) ---
+
+    #[test]
+    fn sync_rc_immediate_dealloc() {
+        let (_guard, baseline) = setup();
+        {
+            let _obj = Gc::new(42);
+        }
+        // RC should have freed it
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .objects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .objs
+                .len(),
+            baseline
+                - (*GLOBAL_GC)
+                    .core
+                    .tracers
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .trs
+                    .len()
+                + baseline,
+            // Just check tracers are back to baseline (simpler check)
+        );
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .tracers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .trs
+                .len(),
+            baseline,
+            "RC should free object immediately"
+        );
+    }
+
+    #[test]
+    fn sync_rc_clone_keeps_alive() {
+        let (_guard, _) = setup();
+        let a = Gc::new(99);
+        let b = a.clone();
+        let baseline = (*GLOBAL_GC)
+            .core
+            .objects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .objs
+            .len();
+        drop(a);
+        let after = (*GLOBAL_GC)
+            .core
+            .objects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .objs
+            .len();
+        assert_eq!(after, baseline, "object should survive when clone exists");
+        assert_eq!(**b, 99);
     }
 }
