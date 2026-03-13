@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use crate::basic_gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
-use crate::gc::{Finalize, GarbageCollector, Trace};
+use crate::gc::{Finalize, GarbageCollector, ObjectEntry, ThinPtr, Trace, TracerEntry};
 use crate::generation::Generation;
+use crate::slot_map::{ObjectId, TracerId};
 
 pub type OptGc<T> = Option<Gc<T>>;
 pub type OptGcCell<T> = Option<GcRefCell<T>>;
@@ -167,16 +168,20 @@ where
 {
     is_root: AtomicBool,
     ptr: *const GcPtr<T>,
+    pub(crate) tracer_id: TracerId,
+    pub(crate) object_id: ObjectId,
 }
 
 impl<T> GcInternal<T>
 where
     T: 'static + Sized + Trace,
 {
-    fn new(ptr: *const GcPtr<T>) -> GcInternal<T> {
+    fn new(ptr: *const GcPtr<T>, tracer_id: TracerId, object_id: ObjectId) -> GcInternal<T> {
         GcInternal {
             is_root: AtomicBool::new(true),
             ptr,
+            tracer_id,
+            object_id,
         }
     }
 }
@@ -304,7 +309,9 @@ where
 {
     fn drop(&mut self) {
         unsafe {
-            (*GLOBAL_GC).remove_tracer(self.internal_ptr);
+            let tracer_id = (*self.internal_ptr).tracer_id;
+            let object_id = (*self.internal_ptr).object_id;
+            (*GLOBAL_GC).remove_tracer(tracer_id, object_id);
         }
     }
 }
@@ -376,16 +383,24 @@ where
 {
     is_root: AtomicBool,
     ptr: *const RefCell<GcPtr<T>>,
+    pub(crate) tracer_id: TracerId,
+    pub(crate) object_id: ObjectId,
 }
 
 impl<T> GcRefCellInternal<T>
 where
     T: 'static + Sized + Trace,
 {
-    fn new(ptr: *const RefCell<GcPtr<T>>) -> GcRefCellInternal<T> {
+    fn new(
+        ptr: *const RefCell<GcPtr<T>>,
+        tracer_id: TracerId,
+        object_id: ObjectId,
+    ) -> GcRefCellInternal<T> {
         GcRefCellInternal {
             is_root: AtomicBool::new(true),
             ptr,
+            tracer_id,
+            object_id,
         }
     }
 }
@@ -456,7 +471,9 @@ where
 {
     fn drop(&mut self) {
         unsafe {
-            (*GLOBAL_GC).remove_tracer(self.internal_ptr);
+            let tracer_id = (*self.internal_ptr).tracer_id;
+            let object_id = (*self.internal_ptr).object_id;
+            (*GLOBAL_GC).remove_tracer(tracer_id, object_id);
         }
     }
 }
@@ -689,35 +706,43 @@ impl GlobalGarbageCollector {
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<GcPtr<T>>();
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             std::ptr::write(gc_ptr, GcPtr::new(t));
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
-            let gc = Gc {
-                internal_ptr: gc_inter_ptr,
-                ptr: gc_ptr,
-            };
-            (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            tracers
-                .mem_to_trc
-                .insert(gc_inter_ptr as usize, gc_inter_ptr);
-            tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            tracers
-                .tracer_obj
-                .insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
-            objects.objs.insert(gc_ptr, mem_info_gc_ptr);
-            objects.obj_gen.insert(gc_ptr, Generation::Gen0);
-            objects.survive_count.insert(gc_ptr, 0);
-            objects.ref_counts.insert(gc_ptr, 1);
-            objects
-                .obj_region
-                .insert(gc_ptr, self.core.current_region());
-            objects.fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
+
+            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
-            objects.drop_fns.insert(gc_ptr, drop_gc_ptr::<T>);
+            let obj_id = gc_maps.objects.insert(ObjectEntry {
+                ptr: gc_ptr as *const dyn Trace,
+                mem: mem_info_gc_ptr.0,
+                layout: mem_info_gc_ptr.1,
+                generation: Generation::Gen0,
+                survive_count: 0,
+                finalizer: (*gc_ptr).t.as_finalize(),
+                drop_fn: drop_gc_ptr::<T>,
+                weak_alive: None,
+                ref_count: 1,
+                region: self.core.current_region(),
+            });
+            gc_maps
+                .ptr_to_object
+                .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+
+            let tracer_id = gc_maps.tracers.insert(TracerEntry {
+                tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                mem: mem_info_internal_ptr.0,
+                layout: mem_info_internal_ptr.1,
+                object_id: obj_id,
+            });
+            drop(gc_maps);
+
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
+            let gc = Gc {
+                internal_ptr: gc_inter_ptr,
+                ptr: gc_ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
@@ -730,25 +755,27 @@ impl GlobalGarbageCollector {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr));
+            let object_id = (*gc.internal_ptr).object_id;
+
+            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let tracer_id = gc_maps.tracers.insert(TracerEntry {
+                tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                mem: mem_info_internal_ptr.0,
+                layout: mem_info_internal_ptr.1,
+                object_id,
+            });
+            // RC hybrid: increment ref count for the cloned object
+            if let Some(entry) = gc_maps.objects.get_mut(object_id) {
+                entry.ref_count += 1;
+            }
+            drop(gc_maps);
+
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, tracer_id, object_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            tracers
-                .mem_to_trc
-                .insert(gc_inter_ptr as usize, gc_inter_ptr);
-            tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            tracers
-                .tracer_obj
-                .insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
-            // RC hybrid: increment ref count
-            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(rc) = objects.ref_counts.get_mut(&(gc.ptr as *const dyn Trace)) {
-                *rc += 1;
-            }
             gc
         }
     }
@@ -763,37 +790,46 @@ impl GlobalGarbageCollector {
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
                 self.core.alloc_mem::<GcRefCellInternal<T>>();
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
-            std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
-            let gc = GcRefCell {
-                internal_ptr: gc_cell_inter_ptr,
-                ptr: gc_ptr,
-            };
-            (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            tracers
-                .mem_to_trc
-                .insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
-            tracers.trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
-            tracers
-                .tracer_obj
-                .insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
-            objects.objs.insert(gc_ptr, mem_info_gc_ptr);
-            objects.obj_gen.insert(gc_ptr, Generation::Gen0);
-            objects.survive_count.insert(gc_ptr, 0);
-            objects.ref_counts.insert(gc_ptr, 1);
-            objects
-                .obj_region
-                .insert(gc_ptr, self.core.current_region());
-            objects
-                .fin
-                .insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
+
+            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
-            objects.drop_fns.insert(gc_ptr, drop_gc_cell_ptr::<T>);
+            let obj_id = gc_maps.objects.insert(ObjectEntry {
+                ptr: gc_ptr as *const dyn Trace,
+                mem: mem_info_gc_ptr.0,
+                layout: mem_info_gc_ptr.1,
+                generation: Generation::Gen0,
+                survive_count: 0,
+                finalizer: (*(*gc_ptr).as_ptr()).t.as_finalize(),
+                drop_fn: drop_gc_cell_ptr::<T>,
+                weak_alive: None,
+                ref_count: 1,
+                region: self.core.current_region(),
+            });
+            gc_maps
+                .ptr_to_object
+                .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+
+            let tracer_id = gc_maps.tracers.insert(TracerEntry {
+                tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
+                mem: mem_info_internal_ptr.0,
+                layout: mem_info_internal_ptr.1,
+                object_id: obj_id,
+            });
+            drop(gc_maps);
+
+            std::ptr::write(
+                gc_cell_inter_ptr,
+                GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
+            );
+            let gc = GcRefCell {
+                internal_ptr: gc_cell_inter_ptr,
+                ptr: gc_ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
@@ -806,25 +842,30 @@ impl GlobalGarbageCollector {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcRefCellInternal<T>>();
-            std::ptr::write(gc_inter_ptr, GcRefCellInternal::new(gc.ptr));
+            let object_id = (*gc.internal_ptr).object_id;
+
+            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let tracer_id = gc_maps.tracers.insert(TracerEntry {
+                tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                mem: mem_info.0,
+                layout: mem_info.1,
+                object_id,
+            });
+            // RC hybrid: increment ref count for the cloned object
+            if let Some(entry) = gc_maps.objects.get_mut(object_id) {
+                entry.ref_count += 1;
+            }
+            drop(gc_maps);
+
+            std::ptr::write(
+                gc_inter_ptr,
+                GcRefCellInternal::new(gc.ptr, tracer_id, object_id),
+            );
             let gc = GcRefCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            tracers
-                .mem_to_trc
-                .insert(gc_inter_ptr as usize, gc_inter_ptr);
-            tracers.trs.insert(gc_inter_ptr, mem_info);
-            tracers
-                .tracer_obj
-                .insert(gc_inter_ptr, gc.ptr as *const dyn Trace);
-            // RC hybrid: increment ref count
-            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(rc) = objects.ref_counts.get_mut(&(gc.ptr as *const dyn Trace)) {
-                *rc += 1;
-            }
             gc
         }
     }
@@ -846,35 +887,43 @@ impl GlobalGarbageCollector {
                     }
                 };
             std::ptr::write(gc_ptr, GcPtr::new(t));
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr));
-            let gc = Gc {
-                internal_ptr: gc_inter_ptr,
-                ptr: gc_ptr,
-            };
-            (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            tracers
-                .mem_to_trc
-                .insert(gc_inter_ptr as usize, gc_inter_ptr);
-            tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            tracers
-                .tracer_obj
-                .insert(gc_inter_ptr, gc_ptr as *const dyn Trace);
-            objects.objs.insert(gc_ptr, mem_info_gc_ptr);
-            objects.obj_gen.insert(gc_ptr, Generation::Gen0);
-            objects.survive_count.insert(gc_ptr, 0);
-            objects.ref_counts.insert(gc_ptr, 1);
-            objects
-                .obj_region
-                .insert(gc_ptr, self.core.current_region());
-            objects.fin.insert(gc_ptr, (*gc_ptr).t.as_finalize());
+
+            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
-            objects.drop_fns.insert(gc_ptr, drop_gc_ptr::<T>);
+            let obj_id = gc_maps.objects.insert(ObjectEntry {
+                ptr: gc_ptr as *const dyn Trace,
+                mem: mem_info_gc_ptr.0,
+                layout: mem_info_gc_ptr.1,
+                generation: Generation::Gen0,
+                survive_count: 0,
+                finalizer: (*gc_ptr).t.as_finalize(),
+                drop_fn: drop_gc_ptr::<T>,
+                weak_alive: None,
+                ref_count: 1,
+                region: self.core.current_region(),
+            });
+            gc_maps
+                .ptr_to_object
+                .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+
+            let tracer_id = gc_maps.tracers.insert(TracerEntry {
+                tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                mem: mem_info_internal_ptr.0,
+                layout: mem_info_internal_ptr.1,
+                object_id: obj_id,
+            });
+            drop(gc_maps);
+
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
+            let gc = Gc {
+                internal_ptr: gc_inter_ptr,
+                ptr: gc_ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
         }
@@ -897,37 +946,46 @@ impl GlobalGarbageCollector {
                     }
                 };
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
-            std::ptr::write(gc_cell_inter_ptr, GcRefCellInternal::new(gc_ptr));
-            let gc = GcRefCell {
-                internal_ptr: gc_cell_inter_ptr,
-                ptr: gc_ptr,
-            };
-            (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            tracers
-                .mem_to_trc
-                .insert(gc_cell_inter_ptr as usize, gc_cell_inter_ptr);
-            tracers.trs.insert(gc_cell_inter_ptr, mem_info_internal_ptr);
-            tracers
-                .tracer_obj
-                .insert(gc_cell_inter_ptr, gc_ptr as *const dyn Trace);
-            objects.objs.insert(gc_ptr, mem_info_gc_ptr);
-            objects.obj_gen.insert(gc_ptr, Generation::Gen0);
-            objects.survive_count.insert(gc_ptr, 0);
-            objects.ref_counts.insert(gc_ptr, 1);
-            objects
-                .obj_region
-                .insert(gc_ptr, self.core.current_region());
-            objects
-                .fin
-                .insert(gc_ptr, (*(*gc_ptr).as_ptr()).t.as_finalize());
+
+            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
-            objects.drop_fns.insert(gc_ptr, drop_gc_cell_ptr::<T>);
+            let obj_id = gc_maps.objects.insert(ObjectEntry {
+                ptr: gc_ptr as *const dyn Trace,
+                mem: mem_info_gc_ptr.0,
+                layout: mem_info_gc_ptr.1,
+                generation: Generation::Gen0,
+                survive_count: 0,
+                finalizer: (*(*gc_ptr).as_ptr()).t.as_finalize(),
+                drop_fn: drop_gc_cell_ptr::<T>,
+                weak_alive: None,
+                ref_count: 1,
+                region: self.core.current_region(),
+            });
+            gc_maps
+                .ptr_to_object
+                .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+
+            let tracer_id = gc_maps.tracers.insert(TracerEntry {
+                tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
+                mem: mem_info_internal_ptr.0,
+                layout: mem_info_internal_ptr.1,
+                object_id: obj_id,
+            });
+            drop(gc_maps);
+
+            std::ptr::write(
+                gc_cell_inter_ptr,
+                GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
+            );
+            let gc = GcRefCell {
+                internal_ptr: gc_cell_inter_ptr,
+                ptr: gc_ptr,
+            };
+            (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
         }
@@ -942,25 +1000,34 @@ impl GlobalGarbageCollector {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
-            std::ptr::write(gc_inter_ptr, GcInternal::new(weak.ptr));
+            let thin = (weak.ptr as *const dyn Trace).get_thin_ptr();
+
+            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let object_id = *gc_maps
+                .ptr_to_object
+                .get(&thin)
+                .expect("upgrade_weak: object not found");
+            let tracer_id = gc_maps.tracers.insert(TracerEntry {
+                tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                mem: mem_info_internal_ptr.0,
+                layout: mem_info_internal_ptr.1,
+                object_id,
+            });
+            // RC hybrid: increment ref count for upgraded object
+            if let Some(entry) = gc_maps.objects.get_mut(object_id) {
+                entry.ref_count += 1;
+            }
+            drop(gc_maps);
+
+            std::ptr::write(
+                gc_inter_ptr,
+                GcInternal::new(weak.ptr, tracer_id, object_id),
+            );
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: weak.ptr,
             };
             (*(*gc.internal_ptr).ptr).reset_root();
-            let mut tracers = self.core.tracers.write().unwrap_or_else(|e| e.into_inner());
-            tracers
-                .mem_to_trc
-                .insert(gc_inter_ptr as usize, gc_inter_ptr);
-            tracers.trs.insert(gc_inter_ptr, mem_info_internal_ptr);
-            tracers
-                .tracer_obj
-                .insert(gc_inter_ptr, weak.ptr as *const dyn Trace);
-            // RC hybrid: increment ref count
-            let mut objects = self.core.objects.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(rc) = objects.ref_counts.get_mut(&(weak.ptr as *const dyn Trace)) {
-                *rc += 1;
-            }
             gc
         }
     }
@@ -980,9 +1047,9 @@ impl GlobalGarbageCollector {
         }
     }
 
-    pub(crate) unsafe fn remove_tracer(&self, tracer: *const dyn Trace) {
+    pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
         unsafe {
-            self.core.remove_tracer(tracer);
+            self.core.remove_tracer(tracer_id, object_id);
         }
     }
 
@@ -1166,7 +1233,7 @@ impl Drop for GlobalStrategy {
 }
 
 lazy_static! {
-    static ref GLOBAL_GC: GlobalGarbageCollector = { GlobalGarbageCollector::new() };
+    static ref GLOBAL_GC: GlobalGarbageCollector = GlobalGarbageCollector::new();
     pub static ref GLOBAL_GC_STRATEGY: GlobalStrategy = {
         let gc = &(*GLOBAL_GC);
         GlobalStrategy::new(
@@ -1202,10 +1269,10 @@ mod tests {
         unsafe { (*GLOBAL_GC).collect() };
         let baseline = (*GLOBAL_GC)
             .core
-            .tracers
-            .read()
+            .gc_maps
+            .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .trs
+            .tracers
             .len();
         (guard, baseline)
     }
@@ -1218,10 +1285,10 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .tracers
-                .read()
+                .gc_maps
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .trs
+                .tracers
                 .len()
                 - baseline,
             1
@@ -1238,10 +1305,10 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .tracers
-                .read()
+                .gc_maps
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .trs
+                .tracers
                 .len()
                 - baseline,
             0
@@ -1259,10 +1326,10 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .tracers
-                .read()
+                .gc_maps
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .trs
+                .tracers
                 .len()
                 - baseline,
             1
@@ -1281,10 +1348,10 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .tracers
-                .read()
+                .gc_maps
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .trs
+                .tracers
                 .len()
                 - baseline,
             1
@@ -1305,10 +1372,10 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .tracers
-                .read()
+                .gc_maps
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .trs
+                .tracers
                 .len()
                 - baseline,
             0
@@ -1407,10 +1474,10 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .tracers
-                .read()
+                .gc_maps
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .trs
+                .tracers
                 .len()
                 - baseline,
             0
@@ -1433,10 +1500,10 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .tracers
-                .read()
+                .gc_maps
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .trs
+                .tracers
                 .len()
                 - baseline,
             1
@@ -1480,10 +1547,10 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .tracers
-                .read()
+                .gc_maps
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .trs
+                .tracers
                 .len()
                 - baseline,
             0
@@ -1650,10 +1717,10 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .tracers
-                .read()
+                .gc_maps
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .trs
+                .tracers
                 .len()
                 - baseline,
             1
@@ -1679,13 +1746,13 @@ mod tests {
         let (_guard, _) = setup();
         let _obj = Gc::new(1);
         let region = (*GLOBAL_GC).current_region();
-        let objects = (*GLOBAL_GC)
+        let gc_maps = (*GLOBAL_GC)
             .core
-            .objects
+            .gc_maps
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert!(
-            objects.obj_region.values().any(|r| *r == region),
+            gc_maps.objects.values().any(|e| e.region == region),
             "object should be assigned to current region"
         );
     }
@@ -1722,34 +1789,14 @@ mod tests {
         {
             let _obj = Gc::new(42);
         }
-        // RC should have freed it
+        // RC should have freed it — check tracers are back to baseline
+        let gc_maps = (*GLOBAL_GC)
+            .core
+            .gc_maps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(
-            (*GLOBAL_GC)
-                .core
-                .objects
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .objs
-                .len(),
-            baseline
-                - (*GLOBAL_GC)
-                    .core
-                    .tracers
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .trs
-                    .len()
-                + baseline,
-            // Just check tracers are back to baseline (simpler check)
-        );
-        assert_eq!(
-            (*GLOBAL_GC)
-                .core
-                .tracers
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .trs
-                .len(),
+            gc_maps.tracers.len(),
             baseline,
             "RC should free object immediately"
         );
@@ -1762,18 +1809,18 @@ mod tests {
         let b = a.clone();
         let baseline = (*GLOBAL_GC)
             .core
-            .objects
+            .gc_maps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .objs
+            .objects
             .len();
         drop(a);
         let after = (*GLOBAL_GC)
             .core
-            .objects
+            .gc_maps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .objs
+            .objects
             .len();
         assert_eq!(after, baseline, "object should survive when clone exists");
         assert_eq!(**b, 99);

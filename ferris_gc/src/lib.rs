@@ -31,6 +31,8 @@ mod default_trace;
 mod gc;
 mod generation;
 #[cfg(feature = "std")]
+pub(crate) mod slot_map;
+#[cfg(feature = "std")]
 mod threshold_strategy;
 
 #[cfg(feature = "std")]

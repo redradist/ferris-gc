@@ -14,11 +14,11 @@ pub static BASIC_STRATEGY_DISABLED: AtomicBool = AtomicBool::new(false);
 
 lazy_static! {
     pub static ref BASIC_STRATEGY_LOCAL_GCS: RwLock<Vec<&'static LocalGarbageCollector>> =
-        { RwLock::new(Vec::new()) };
+        RwLock::new(Vec::new());
     pub static ref BASIC_STRATEGY_GLOBAL_GC: RwLock<Option<&'static GlobalGarbageCollector>> =
-        { RwLock::new(None) };
-    pub static ref APPLICATION_ACTIVE: AtomicBool = { AtomicBool::new(true) };
-    pub static ref BACKGROUND_THREADS: RwLock<Vec<JoinHandle<()>>> = { RwLock::new(Vec::new()) };
+        RwLock::new(None);
+    pub static ref APPLICATION_ACTIVE: AtomicBool = AtomicBool::new(true);
+    pub static ref BACKGROUND_THREADS: RwLock<Vec<JoinHandle<()>>> = RwLock::new(Vec::new());
 }
 static START_BASIC_GC_STRATEGY: Once = Once::new();
 
