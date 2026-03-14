@@ -1090,16 +1090,15 @@ impl GarbageCollector {
     pub(crate) fn get_or_create_weak_alive(&self, obj_ptr: *const dyn Trace) -> Arc<AtomicBool> {
         let thin = obj_ptr.get_thin_ptr();
         let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&obj_id) = gc_maps.ptr_to_object.get(&thin)
-            && let Some(entry) = gc_maps.objects.get_mut(obj_id)
-        {
-            entry
-                .weak_alive
-                .get_or_insert_with(|| Arc::new(AtomicBool::new(true)))
-                .clone()
-        } else {
-            Arc::new(AtomicBool::new(false))
+        if let Some(&obj_id) = gc_maps.ptr_to_object.get(&thin) {
+            if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
+                return entry
+                    .weak_alive
+                    .get_or_insert_with(|| Arc::new(AtomicBool::new(true)))
+                    .clone();
+            }
         }
+        Arc::new(AtomicBool::new(false))
     }
 
     /// Write barrier: if the object is in Gen1+, add it to the remembered set
@@ -1109,14 +1108,15 @@ impl GarbageCollector {
     pub(crate) fn write_barrier(&self, obj_ptr: *const dyn Trace) {
         let thin = obj_ptr.get_thin_ptr();
         let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&obj_id) = gc_maps.ptr_to_object.get(&thin)
-            && let Some(entry) = gc_maps.objects.get(obj_id)
-            && entry.generation > Generation::Gen0
-        {
-            self.remembered_set
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(obj_id);
+        if let Some(&obj_id) = gc_maps.ptr_to_object.get(&thin) {
+            if let Some(entry) = gc_maps.objects.get(obj_id) {
+                if entry.generation > Generation::Gen0 {
+                    self.remembered_set
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(obj_id);
+                }
+            }
         }
         let obj_id_opt = gc_maps.ptr_to_object.get(&thin).copied();
         drop(gc_maps);
@@ -1125,12 +1125,13 @@ impl GarbageCollector {
         // new children are discovered in subsequent mark steps.
         if let Some(obj_id) = obj_id_opt {
             let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-            if incr.phase == CollectionPhase::Marking
-                && let Some(color) = incr.colors.get_mut(&obj_id)
-                && *color == MarkColor::Black
-            {
-                *color = MarkColor::Gray;
-                incr.gray_stack.push(obj_id);
+            if incr.phase == CollectionPhase::Marking {
+                if let Some(color) = incr.colors.get_mut(&obj_id) {
+                    if *color == MarkColor::Black {
+                        *color = MarkColor::Gray;
+                        incr.gray_stack.push(obj_id);
+                    }
+                }
             }
         }
     }
@@ -1472,12 +1473,13 @@ impl GarbageCollector {
             unsafe {
                 // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                 let tracer = &(*tracer_entry.tracer_ptr);
-                if tracer.is_root()
-                    && let Some(color) = incr.colors.get_mut(&tracer_entry.object_id)
-                    && *color == MarkColor::White
-                {
-                    *color = MarkColor::Gray;
-                    incr.gray_stack.push(tracer_entry.object_id);
+                if tracer.is_root() {
+                    if let Some(color) = incr.colors.get_mut(&tracer_entry.object_id) {
+                        if *color == MarkColor::White {
+                            *color = MarkColor::Gray;
+                            incr.gray_stack.push(tracer_entry.object_id);
+                        }
+                    }
                 }
             }
         }
@@ -1512,12 +1514,13 @@ impl GarbageCollector {
             // Convert child raw ptrs to ObjectIds and gray any White children
             for &child_ptr in &children_buf {
                 let thin = child_ptr.get_thin_ptr();
-                if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin)
-                    && let Some(color) = incr.colors.get_mut(&child_id)
-                    && *color == MarkColor::White
-                {
-                    *color = MarkColor::Gray;
-                    incr.gray_stack.push(child_id);
+                if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin) {
+                    if let Some(color) = incr.colors.get_mut(&child_id) {
+                        if *color == MarkColor::White {
+                            *color = MarkColor::Gray;
+                            incr.gray_stack.push(child_id);
+                        }
+                    }
                 }
             }
 
@@ -1567,12 +1570,13 @@ impl GarbageCollector {
                 for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
                     // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                     let tracer = &(*tracer_entry.tracer_ptr);
-                    if tracer.is_root()
-                        && let Some(color) = incr.colors.get_mut(&tracer_entry.object_id)
-                        && *color == MarkColor::White
-                    {
-                        *color = MarkColor::Gray;
-                        incr.gray_stack.push(tracer_entry.object_id);
+                    if tracer.is_root() {
+                        if let Some(color) = incr.colors.get_mut(&tracer_entry.object_id) {
+                            if *color == MarkColor::White {
+                                *color = MarkColor::Gray;
+                                incr.gray_stack.push(tracer_entry.object_id);
+                            }
+                        }
                     }
                 }
 
@@ -1586,12 +1590,13 @@ impl GarbageCollector {
                     }
                     for &child_ptr in &children_buf {
                         let thin = child_ptr.get_thin_ptr();
-                        if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin)
-                            && let Some(color) = incr.colors.get_mut(&child_id)
-                            && *color == MarkColor::White
-                        {
-                            *color = MarkColor::Gray;
-                            incr.gray_stack.push(child_id);
+                        if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin) {
+                            if let Some(color) = incr.colors.get_mut(&child_id) {
+                                if *color == MarkColor::White {
+                                    *color = MarkColor::Gray;
+                                    incr.gray_stack.push(child_id);
+                                }
+                            }
                         }
                     }
                     incr.colors.insert(obj_id, MarkColor::Black);
@@ -1775,12 +1780,13 @@ impl GarbageCollector {
 
             for &child_ptr in &children_buf {
                 let thin = child_ptr.get_thin_ptr();
-                if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin)
-                    && let Some(color) = incr.colors.get_mut(&child_id)
-                    && *color == MarkColor::White
-                {
-                    *color = MarkColor::Gray;
-                    incr.gray_stack.push(child_id);
+                if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin) {
+                    if let Some(color) = incr.colors.get_mut(&child_id) {
+                        if *color == MarkColor::White {
+                            *color = MarkColor::Gray;
+                            incr.gray_stack.push(child_id);
+                        }
+                    }
                 }
             }
 
@@ -1859,12 +1865,13 @@ impl GarbageCollector {
             unsafe {
                 // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                 let tracer = &(*tracer_entry.tracer_ptr);
-                if tracer.is_root()
-                    && let Some(color) = incr.colors.get_mut(&tracer_entry.object_id)
-                    && *color == MarkColor::White
-                {
-                    *color = MarkColor::Gray;
-                    incr.gray_stack.push(tracer_entry.object_id);
+                if tracer.is_root() {
+                    if let Some(color) = incr.colors.get_mut(&tracer_entry.object_id) {
+                        if *color == MarkColor::White {
+                            *color = MarkColor::Gray;
+                            incr.gray_stack.push(tracer_entry.object_id);
+                        }
+                    }
                 }
             }
         }
