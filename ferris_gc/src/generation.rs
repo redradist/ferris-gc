@@ -38,6 +38,39 @@ impl Generation {
     }
 }
 
+/// Configurable promotion thresholds for each generation.
+/// Controls how many collections an object must survive before being
+/// promoted to the next generation. Tune these based on your workload:
+/// - Lower values → more frequent promotion → less Gen0 work, more Gen1/Gen2 data
+/// - Higher values → less promotion → more Gen0 pressure, better for short-lived objects
+#[derive(Debug, Clone, Copy)]
+pub struct PromotionConfig {
+    /// Survivals needed in Gen0 before promotion to Gen1. Default: 3.
+    pub gen0_threshold: u32,
+    /// Survivals needed in Gen1 before promotion to Gen2. Default: 5.
+    pub gen1_threshold: u32,
+}
+
+impl Default for PromotionConfig {
+    fn default() -> Self {
+        PromotionConfig {
+            gen0_threshold: 3,
+            gen1_threshold: 5,
+        }
+    }
+}
+
+impl PromotionConfig {
+    /// Return the promotion threshold for a given generation.
+    pub fn threshold_for(&self, generation: Generation) -> u32 {
+        match generation {
+            Generation::Gen0 => self.gen0_threshold,
+            Generation::Gen1 => self.gen1_threshold,
+            Generation::Gen2 => u32::MAX, // never promote from Gen2
+        }
+    }
+}
+
 /// Tri-color marking state for incremental/concurrent collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkColor {

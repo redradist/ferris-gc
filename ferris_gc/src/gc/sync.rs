@@ -201,6 +201,7 @@ where
         if self.is_root.load(Ordering::Acquire) {
             self.is_root.store(false, Ordering::Release);
             unsafe {
+                // SAFETY: Pointer is valid for the lifetime of this GcInternal handle; the GC guarantees the allocation is not freed while any handle exists.
                 (*self.ptr).reset_root();
             }
         }
@@ -208,17 +209,20 @@ where
 
     fn trace(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcInternal handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcInternal handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
+        // SAFETY: Pointer is valid for the lifetime of this GcInternal handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).is_traceable() }
     }
 
@@ -266,6 +270,7 @@ where
     /// Safe without holding the STW lock because as long as this `Gc<T>` handle
     /// exists, the object is reachable (root) and cannot be collected.
     fn deref(&self) -> &Self::Target {
+        // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { &(*self.ptr) }
     }
 }
@@ -288,6 +293,7 @@ where
     pub fn new(t: T) -> Gc<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).create_gc(t) }
     }
 
@@ -296,6 +302,7 @@ where
     pub fn try_new(t: T) -> Result<Gc<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).try_create_gc(t) }
     }
 }
@@ -305,6 +312,7 @@ where
     T: 'static + Sized + Trace,
 {
     fn clone(&self) -> Self {
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).clone_from_gc(self) }
     }
 }
@@ -315,8 +323,10 @@ where
 {
     fn drop(&mut self) {
         unsafe {
+            // SAFETY: internal_ptr is valid; the Gc handle owns this allocation until drop.
             let tracer_id = (*self.internal_ptr).tracer_id;
             let object_id = (*self.internal_ptr).object_id;
+            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
             (*GLOBAL_GC).remove_tracer(tracer_id, object_id);
         }
     }
@@ -331,6 +341,7 @@ where
             if self.internal_ptr.is_null() {
                 return false;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.internal_ptr).is_root()
         }
     }
@@ -340,6 +351,7 @@ where
             if self.internal_ptr.is_null() {
                 return;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.internal_ptr).reset_root();
         }
     }
@@ -349,6 +361,7 @@ where
             if self.ptr.is_null() {
                 return;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.ptr).trace();
         }
     }
@@ -358,6 +371,7 @@ where
             if self.ptr.is_null() {
                 return;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.ptr).reset();
         }
     }
@@ -367,6 +381,7 @@ where
             if self.ptr.is_null() {
                 return false;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.ptr).is_traceable()
         }
     }
@@ -423,6 +438,7 @@ where
         if self.is_root.load(Ordering::Acquire) {
             self.is_root.store(false, Ordering::Release);
             unsafe {
+                // SAFETY: Pointer is valid for the lifetime of this GcRefCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
                 (*self.ptr).borrow().reset_root();
             }
         }
@@ -430,17 +446,20 @@ where
 
     fn trace(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcRefCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcRefCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
+        // SAFETY: Pointer is valid for the lifetime of this GcRefCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
@@ -480,8 +499,10 @@ where
 {
     fn drop(&mut self) {
         unsafe {
+            // SAFETY: internal_ptr is valid; the GcRefCell handle owns this allocation until drop.
             let tracer_id = (*self.internal_ptr).tracer_id;
             let object_id = (*self.internal_ptr).object_id;
+            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
             (*GLOBAL_GC).remove_tracer(tracer_id, object_id);
         }
     }
@@ -494,6 +515,7 @@ where
     type Target = RefCell<GcPtr<T>>;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { &(*self.ptr) }
     }
 }
@@ -515,6 +537,7 @@ where
     pub fn new(t: T) -> GcRefCell<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).create_gc_cell(t) }
     }
 
@@ -523,6 +546,7 @@ where
     pub fn try_new(t: T) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).try_create_gc_cell(t) }
     }
 
@@ -531,6 +555,8 @@ where
     /// it gets added to the remembered set for young-generation collections.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
         unsafe {
+            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
+            // self.ptr is valid for the lifetime of this GcRefCell handle.
             let _stw = GLOBAL_GC
                 .core
                 .stw_lock
@@ -547,6 +573,7 @@ where
     T: 'static + Sized + Trace,
 {
     fn clone(&self) -> Self {
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).clone_from_gc_cell(self) }
     }
 }
@@ -556,28 +583,33 @@ where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
+        // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle.
         unsafe { (*self.internal_ptr).is_root() }
     }
 
     fn reset_root(&self) {
         unsafe {
+            // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle.
             (*self.internal_ptr).reset_root();
         }
     }
 
     fn trace(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
+        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
@@ -646,6 +678,7 @@ where
             return None;
         }
         unsafe {
+            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
             // Acquire STW read lock to prevent collection during upgrade
             let _stw = GLOBAL_GC
                 .core
@@ -726,11 +759,13 @@ impl GlobalGarbageCollector {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<GcPtr<T>>();
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
+                    // SAFETY: ptr was originally allocated as a GcPtr<T> and has not been dropped yet.
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
@@ -740,6 +775,7 @@ impl GlobalGarbageCollector {
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
+                // SAFETY: gc_ptr was just written above and is valid.
                 finalizer: (*gc_ptr).t.as_finalize(),
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
@@ -758,11 +794,13 @@ impl GlobalGarbageCollector {
             });
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
             };
+            // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
@@ -776,6 +814,7 @@ impl GlobalGarbageCollector {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
+            // SAFETY: internal_ptr is valid; the source Gc handle is alive during clone.
             let object_id = (*gc.internal_ptr).object_id;
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
@@ -791,11 +830,13 @@ impl GlobalGarbageCollector {
             }
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, tracer_id, object_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
             };
+            // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             gc
         }
@@ -810,11 +851,13 @@ impl GlobalGarbageCollector {
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<RefCell<GcPtr<T>>>();
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
                 self.core.alloc_mem::<GcRefCellInternal<T>>();
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
+                    // SAFETY: ptr was originally allocated as a RefCell<GcPtr<T>> and has not been dropped yet.
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
@@ -824,6 +867,7 @@ impl GlobalGarbageCollector {
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
+                // SAFETY: gc_ptr was just written above; as_ptr() returns a raw pointer to the RefCell contents.
                 finalizer: (*(*gc_ptr).as_ptr()).t.as_finalize(),
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
@@ -842,6 +886,7 @@ impl GlobalGarbageCollector {
             });
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcRefCellInternal<T>.
             std::ptr::write(
                 gc_cell_inter_ptr,
                 GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
@@ -850,6 +895,7 @@ impl GlobalGarbageCollector {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
             };
+            // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
@@ -863,6 +909,7 @@ impl GlobalGarbageCollector {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcRefCellInternal<T>>();
+            // SAFETY: internal_ptr is valid; the source GcRefCell handle is alive during clone.
             let object_id = (*gc.internal_ptr).object_id;
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
@@ -878,6 +925,7 @@ impl GlobalGarbageCollector {
             }
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcRefCellInternal<T>.
             std::ptr::write(
                 gc_inter_ptr,
                 GcRefCellInternal::new(gc.ptr, tracer_id, object_id),
@@ -886,6 +934,7 @@ impl GlobalGarbageCollector {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
             };
+            // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             gc
         }
@@ -903,15 +952,18 @@ impl GlobalGarbageCollector {
                 match self.core.try_alloc_mem_with_gc::<GcInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
+                        // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
                         dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
+            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
+                    // SAFETY: ptr was originally allocated as a GcPtr<T> and has not been dropped yet.
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
@@ -921,6 +973,7 @@ impl GlobalGarbageCollector {
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
+                // SAFETY: gc_ptr was just written above and is valid.
                 finalizer: (*gc_ptr).t.as_finalize(),
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
@@ -939,11 +992,13 @@ impl GlobalGarbageCollector {
             });
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcInternal<T>.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
             };
+            // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
@@ -963,15 +1018,18 @@ impl GlobalGarbageCollector {
                 match self.core.try_alloc_mem_with_gc::<GcRefCellInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
+                        // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
                         dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
+            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
+                    // SAFETY: ptr was originally allocated as a RefCell<GcPtr<T>> and has not been dropped yet.
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
@@ -981,6 +1039,7 @@ impl GlobalGarbageCollector {
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
+                // SAFETY: gc_ptr was just written above; as_ptr() returns a raw pointer to the RefCell contents.
                 finalizer: (*(*gc_ptr).as_ptr()).t.as_finalize(),
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
@@ -999,6 +1058,7 @@ impl GlobalGarbageCollector {
             });
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcRefCellInternal<T>.
             std::ptr::write(
                 gc_cell_inter_ptr,
                 GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
@@ -1007,6 +1067,7 @@ impl GlobalGarbageCollector {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
             };
+            // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
@@ -1041,6 +1102,7 @@ impl GlobalGarbageCollector {
             }
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
             std::ptr::write(
                 gc_inter_ptr,
                 GcInternal::new(weak.ptr, tracer_id, object_id),
@@ -1049,6 +1111,7 @@ impl GlobalGarbageCollector {
                 internal_ptr: gc_inter_ptr,
                 ptr: weak.ptr,
             };
+            // SAFETY: internal_ptr was just written above; weak.ptr is valid because alive check passed.
             (*(*gc.internal_ptr).ptr).reset_root();
             gc
         }
@@ -1058,6 +1121,7 @@ impl GlobalGarbageCollector {
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn collect(&self) {
         unsafe {
+            // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core.collect();
         }
     }
@@ -1065,12 +1129,14 @@ impl GlobalGarbageCollector {
     #[allow(dead_code)]
     unsafe fn collect_all(&self) {
         unsafe {
+            // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core.collect_all();
         }
     }
 
     pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
         unsafe {
+            // SAFETY: Caller provides valid tracer_id and object_id from a live Gc/GcRefCell handle.
             self.core.remove_tracer(tracer_id, object_id);
         }
     }
@@ -1079,6 +1145,7 @@ impl GlobalGarbageCollector {
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn begin_collection(&self, max_gen: crate::generation::Generation) {
         unsafe {
+            // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core.begin_collection(max_gen);
         }
     }
@@ -1086,12 +1153,14 @@ impl GlobalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn mark_step(&self, budget: usize) -> bool {
+        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.mark_step(budget) }
     }
 
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn finish_collection(&self) -> crate::generation::CollectionStats {
+        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.finish_collection() }
     }
 
@@ -1102,6 +1171,7 @@ impl GlobalGarbageCollector {
         max_gen: crate::generation::Generation,
         step_budget: usize,
     ) -> crate::generation::CollectionStats {
+        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.collect_incremental(max_gen, step_budget) }
     }
 
@@ -1111,6 +1181,7 @@ impl GlobalGarbageCollector {
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn begin_concurrent_collection(&self, max_gen: crate::generation::Generation) {
         unsafe {
+            // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core.begin_concurrent_collection(max_gen);
         }
     }
@@ -1129,6 +1200,7 @@ impl GlobalGarbageCollector {
         max_gen: crate::generation::Generation,
         step_budget: usize,
     ) -> crate::generation::CollectionStats {
+        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.collect_concurrent(max_gen, step_budget) }
     }
 
@@ -1137,6 +1209,7 @@ impl GlobalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
+        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.mark_step_timed(max_duration) }
     }
 
@@ -1150,6 +1223,7 @@ impl GlobalGarbageCollector {
         max_step_duration: Duration,
     ) -> crate::generation::CollectionStats {
         unsafe {
+            // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core
                 .collect_incremental_timed(max_gen, max_step_duration)
         }
@@ -1170,6 +1244,7 @@ impl GlobalGarbageCollector {
         max_step_duration: Duration,
     ) -> crate::generation::CollectionStats {
         unsafe {
+            // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core
                 .collect_concurrent_timed(max_gen, max_step_duration)
         }
@@ -1193,12 +1268,23 @@ impl GlobalGarbageCollector {
         &self,
         region: crate::generation::RegionId,
     ) -> crate::generation::CollectionStats {
+        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.collect_region(region) }
     }
 
     /// Return a snapshot of current GC diagnostics.
     pub fn stats(&self) -> crate::generation::GcStats {
         self.core.stats()
+    }
+
+    /// Set custom promotion thresholds.
+    pub fn set_promotion_config(&self, config: crate::generation::PromotionConfig) {
+        self.core.set_promotion_config(config);
+    }
+
+    /// Get the current promotion config.
+    pub fn promotion_config(&self) -> crate::generation::PromotionConfig {
+        self.core.promotion_config()
     }
 }
 
@@ -1341,6 +1427,8 @@ mod tests {
     /// Clean residual state and return baseline trs count.
     fn setup() -> (std::sync::MutexGuard<'static, ()>, usize) {
         let guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         let baseline = (*GLOBAL_GC)
             .core
@@ -1356,6 +1444,7 @@ mod tests {
     fn one_object() {
         let (_guard, baseline) = setup();
         let _one = Gc::new(1);
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         assert_eq!(
             (*GLOBAL_GC)
@@ -1376,6 +1465,7 @@ mod tests {
         {
             let _one = Gc::new(1);
         }
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         assert_eq!(
             (*GLOBAL_GC)
@@ -1396,6 +1486,7 @@ mod tests {
         let (_guard, baseline) = setup();
         let mut one = Gc::new(1);
         one = Gc::new(2);
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         // Reassignment drops old Gc (remove_tracer), so only 1 tracer remains
         assert_eq!(
@@ -1418,6 +1509,7 @@ mod tests {
         let (_guard, baseline) = setup();
         let mut one = Gc::new(1);
         one = Gc::new(2);
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         // one is still live, so 1 tracer remains
         assert_eq!(
@@ -1443,6 +1535,7 @@ mod tests {
             one = Gc::new(2);
             drop(one);
         }
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         assert_eq!(
             (*GLOBAL_GC)
@@ -1559,6 +1652,7 @@ mod tests {
         );
         // Incremental still works correctly
         let _stats =
+            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
             unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 10) };
     }
 
@@ -1567,6 +1661,7 @@ mod tests {
         let (_guard, baseline) = setup();
         let _live = Gc::new(99);
         let stats =
+            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
             unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 10) };
         assert_eq!(
             stats.objects_collected, 0,
@@ -1590,6 +1685,7 @@ mod tests {
         // With RC hybrid, dead objects are already freed. Test with live object.
         let (_guard, _) = setup();
         let _live = Gc::new(2);
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe {
             (*GLOBAL_GC).begin_collection(crate::generation::Generation::Gen2);
             while !(*GLOBAL_GC).mark_step(1) {}
@@ -1618,6 +1714,7 @@ mod tests {
         {
             let _obj = Gc::try_new(77).unwrap();
         }
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         assert_eq!(
             (*GLOBAL_GC)
@@ -1657,7 +1754,9 @@ mod tests {
     fn sync_stats_tracks_total_collections() {
         let (_guard, _) = setup();
         let before = (*GLOBAL_GC).stats().total_collections;
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         let after = (*GLOBAL_GC).stats().total_collections;
         assert_eq!(after - before, 2);
@@ -1667,6 +1766,7 @@ mod tests {
     fn sync_stats_tracks_last_collection() {
         let (_guard, _) = setup();
         // With RC hybrid, dead objects are already freed. Just verify stats recording.
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         let stats = (*GLOBAL_GC).stats();
         assert!(
@@ -1751,6 +1851,7 @@ mod tests {
             *a.next.borrow_mut() = Some(a.clone());
             drop(a);
         }
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
     }
 
@@ -1774,6 +1875,7 @@ mod tests {
             drop(b);
             drop(c);
         }
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
     }
 
@@ -1784,6 +1886,7 @@ mod tests {
         let (_guard, baseline) = setup();
         let _live = Gc::new(42);
         let stats =
+            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
             unsafe { (*GLOBAL_GC).collect_concurrent(crate::generation::Generation::Gen2, 10) };
         assert_eq!(
             stats.objects_collected, 0,
@@ -1806,6 +1909,7 @@ mod tests {
     fn sync_concurrent_step_by_step() {
         let (_guard, _) = setup();
         let _live = Gc::new(99);
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe {
             (*GLOBAL_GC).begin_concurrent_collection(crate::generation::Generation::Gen2);
             while !(*GLOBAL_GC).concurrent_mark_step(1) {}
@@ -1849,6 +1953,7 @@ mod tests {
             drop(a);
             drop(b);
         }
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         let stats = unsafe { (*GLOBAL_GC).collect_region(region) };
         assert!(
             stats.objects_collected >= 2,

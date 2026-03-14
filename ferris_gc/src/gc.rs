@@ -1,5 +1,5 @@
 use crate::generation::{
-    CollectionPhase, CollectionStats, GcStats, Generation, MarkColor, RegionId,
+    CollectionPhase, CollectionStats, GcStats, Generation, MarkColor, PromotionConfig, RegionId,
 };
 use crate::slot_map::{ObjectId, SlotMap, TracerId};
 use std::alloc::{Layout, alloc, dealloc};
@@ -269,6 +269,7 @@ where
         if self.is_root.load(Ordering::Acquire) {
             self.is_root.store(false, Ordering::Release);
             unsafe {
+                // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
                 (*self.ptr).reset_root();
             }
         }
@@ -276,17 +277,20 @@ where
 
     fn trace(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
+        // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).is_traceable() }
     }
 
@@ -334,6 +338,7 @@ where
     type Target = GcPtr<T>;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { &(*self.ptr) }
     }
 }
@@ -357,10 +362,12 @@ where
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
+                // SAFETY: Single-threaded access via thread_local ensures no aliasing.
                 let strategy = unsafe { &mut *strategy.as_ptr() };
                 strategy.start();
             }
         });
+        // SAFETY: Thread-local access ensures single-threaded borrow.
         LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc(t) })
     }
 
@@ -370,10 +377,12 @@ where
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
+                // SAFETY: Single-threaded access via thread_local ensures no aliasing.
                 let strategy = unsafe { &mut *strategy.as_ptr() };
                 strategy.start();
             }
         });
+        // SAFETY: Thread-local access ensures single-threaded borrow.
         LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc(t) })
     }
 }
@@ -383,6 +392,7 @@ where
     T: 'static + Sized + Trace,
 {
     fn clone(&self) -> Self {
+        // SAFETY: Thread-local access ensures single-threaded borrow.
         LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().clone_from_gc(self) })
     }
 }
@@ -393,6 +403,7 @@ where
 {
     fn drop(&mut self) {
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
+            // SAFETY: internal_ptr is valid for the lifetime of this Gc handle; reading tracer_id/object_id before removal.
             let tracer_id = (*self.internal_ptr).tracer_id;
             let object_id = (*self.internal_ptr).object_id;
             gc.borrow_mut().remove_tracer(tracer_id, object_id);
@@ -409,6 +420,7 @@ where
             if self.internal_ptr.is_null() {
                 return false;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.internal_ptr).is_root()
         }
     }
@@ -418,6 +430,7 @@ where
             if self.internal_ptr.is_null() {
                 return;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.internal_ptr).reset_root();
         }
     }
@@ -427,6 +440,7 @@ where
             if self.ptr.is_null() {
                 return;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.ptr).trace();
         }
     }
@@ -436,6 +450,7 @@ where
             if self.ptr.is_null() {
                 return;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.ptr).reset();
         }
     }
@@ -445,6 +460,7 @@ where
             if self.ptr.is_null() {
                 return false;
             }
+            // SAFETY: Null check above ensures the pointer is valid.
             (*self.ptr).is_traceable()
         }
     }
@@ -501,6 +517,7 @@ where
         if self.is_root.load(Ordering::Acquire) {
             self.is_root.store(false, Ordering::Release);
             unsafe {
+                // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
                 (*self.ptr).borrow().reset_root();
             }
         }
@@ -508,17 +525,20 @@ where
 
     fn trace(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
+        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
@@ -556,6 +576,7 @@ where
 {
     fn drop(&mut self) {
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
+            // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle; reading tracer_id/object_id before removal.
             let tracer_id = (*self.internal_ptr).tracer_id;
             let object_id = (*self.internal_ptr).object_id;
             gc.borrow_mut().remove_tracer(tracer_id, object_id);
@@ -570,6 +591,7 @@ where
     type Target = RefCell<GcPtr<T>>;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { &(*self.ptr) }
     }
 }
@@ -593,10 +615,12 @@ where
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
+                // SAFETY: Single-threaded access via thread_local ensures no aliasing.
                 let strategy = unsafe { &mut *strategy.as_ptr() };
                 strategy.start();
             }
         });
+        // SAFETY: Thread-local access ensures single-threaded borrow.
         LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc_cell(t) })
     }
 
@@ -606,10 +630,12 @@ where
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
+                // SAFETY: Single-threaded access via thread_local ensures no aliasing.
                 let strategy = unsafe { &mut *strategy.as_ptr() };
                 strategy.start();
             }
         });
+        // SAFETY: Thread-local access ensures single-threaded borrow.
         LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc_cell(t) })
     }
 
@@ -620,6 +646,7 @@ where
         LOCAL_GC.with(|gc| {
             gc.borrow().core.write_barrier(self.ptr as *const dyn Trace);
         });
+        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow_mut() }
     }
 }
@@ -629,6 +656,7 @@ where
     T: 'static + Sized + Trace,
 {
     fn clone(&self) -> Self {
+        // SAFETY: Thread-local access ensures single-threaded borrow.
         LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().clone_from_gc_cell(self) })
     }
 }
@@ -638,28 +666,33 @@ where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
+        // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.internal_ptr).is_root() }
     }
 
     fn reset_root(&self) {
         unsafe {
+            // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.internal_ptr).reset_root();
         }
     }
 
     fn trace(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
+            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
+        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
@@ -736,6 +769,7 @@ where
             // Acquire STW read lock via raw pointer to avoid RefCell borrow conflict
             let gc_ptr = gc.as_ptr();
             let _stw = unsafe {
+                // SAFETY: gc_ptr is valid for the duration of this thread_local closure; raw pointer avoids RefCell borrow conflict with the subsequent borrow_mut.
                 (*gc_ptr)
                     .core
                     .stw_lock
@@ -744,6 +778,7 @@ where
             };
             // Re-check alive under STW protection
             if self.alive.load(Ordering::Acquire) {
+                // SAFETY: Thread-local access ensures single-threaded borrow; alive check above guarantees the object has not been collected.
                 Some(unsafe { gc.borrow_mut().upgrade_weak(self) })
             } else {
                 None
@@ -881,6 +916,8 @@ pub(crate) struct GarbageCollector {
     pub(crate) current_region: AtomicU32,
     /// Next region ID to assign.
     pub(crate) next_region_id: AtomicU32,
+    /// Configurable promotion thresholds per generation.
+    pub(crate) promotion_config: Mutex<PromotionConfig>,
 }
 
 // SAFETY: All mutable state in GarbageCollector is behind Mutex or atomic types,
@@ -905,7 +942,24 @@ impl GarbageCollector {
             last_collection: Mutex::new(None),
             current_region: AtomicU32::new(0),
             next_region_id: AtomicU32::new(1),
+            promotion_config: Mutex::new(PromotionConfig::default()),
         }
+    }
+
+    /// Set custom promotion thresholds.
+    pub fn set_promotion_config(&self, config: PromotionConfig) {
+        *self
+            .promotion_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = config;
+    }
+
+    /// Get the current promotion config.
+    pub fn promotion_config(&self) -> PromotionConfig {
+        *self
+            .promotion_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Return a snapshot of current GC diagnostics.
@@ -945,10 +999,12 @@ impl GarbageCollector {
     {
         unsafe {
             let layout = Layout::new::<T>();
+            // SAFETY: Layout is non-zero-sized and properly aligned for T; alloc returns a valid pointer or null.
             let mem = alloc(layout);
             if mem.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
+            // SAFETY: Null check above ensures the pointer is valid; layout guarantees proper alignment for T.
             let type_ptr: *mut T = mem as *mut _;
             (type_ptr, (mem, layout))
         }
@@ -963,10 +1019,12 @@ impl GarbageCollector {
     {
         unsafe {
             let layout = Layout::new::<T>();
+            // SAFETY: Layout is non-zero-sized and properly aligned for T; alloc returns a valid pointer or null.
             let mem = alloc(layout);
             if mem.is_null() {
                 return Err(GcAllocError);
             }
+            // SAFETY: Null check above ensures the pointer is valid; layout guarantees proper alignment for T.
             let type_ptr: *mut T = mem as *mut _;
             Ok((type_ptr, (mem, layout)))
         }
@@ -982,6 +1040,7 @@ impl GarbageCollector {
         T: Sized,
     {
         unsafe {
+            // SAFETY: Delegates to try_alloc_mem and collect, both of which uphold their own safety invariants.
             match self.try_alloc_mem::<T>() {
                 Ok(result) => Ok(result),
                 Err(_) => {
@@ -1075,17 +1134,21 @@ impl GarbageCollector {
 
             // Dealloc tracer outside lock scope
             if let Some((mem, layout)) = tracer_dealloc {
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(mem, layout);
             }
 
             // RC hybrid: dealloc object outside lock scope (prevents re-entrant deadlock)
             if let Some(obj_entry) = object_dealloc {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
                     (*obj_entry.finalizer).finalize();
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
                     (obj_entry.drop_fn)(obj_entry.mem);
                 }));
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(obj_entry.mem, obj_entry.layout);
             }
         }
@@ -1093,6 +1156,7 @@ impl GarbageCollector {
 
     /// Full collection (all generations). Backwards-compatible with existing callers.
     pub unsafe fn collect(&self) {
+        // SAFETY: Caller upholds the safety contract; delegates to collect_generation with Gen2.
         unsafe {
             self.collect_generation(Generation::Gen2);
         }
@@ -1126,11 +1190,13 @@ impl GarbageCollector {
                 // fields. This marks Gc handles stored *inside* GC-managed objects as
                 // non-root (is_root = false), while stack-owned handles remain root.
                 for entry in gc_maps.objects.values() {
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
                     (&*entry.ptr).reset_root();
                 }
 
                 // Mark phase: trace from ALL roots (needed for correctness)
                 for entry in gc_maps.tracers.values() {
+                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                     let tracer = &(*entry.tracer_ptr);
                     if tracer.is_root() {
                         tracer.trace();
@@ -1141,6 +1207,7 @@ impl GarbageCollector {
                 if max_gen < Generation::Gen2 {
                     for &obj_id in remembered_set.iter() {
                         if let Some(entry) = gc_maps.objects.get(obj_id) {
+                            // SAFETY: Object pointer is valid while gc_maps lock is held.
                             (&*entry.ptr).trace();
                         }
                     }
@@ -1168,6 +1235,7 @@ impl GarbageCollector {
                     .tracers
                     .iter()
                     .filter(|(id, e)| {
+                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                         in_scope_tracers.contains(id) && !(&*e.tracer_ptr).is_traceable()
                     })
                     .map(|(id, _)| id)
@@ -1185,6 +1253,7 @@ impl GarbageCollector {
                 let collected_objects: Vec<ObjectId> = gc_maps
                     .objects
                     .iter()
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
                     .filter(|(id, e)| in_scope_objs.contains(id) && !(&*e.ptr).is_traceable())
                     .map(|(id, _)| id)
                     .collect();
@@ -1192,6 +1261,7 @@ impl GarbageCollector {
 
                 // Reset ALL remaining tracers (not just in-scope)
                 for entry in gc_maps.tracers.values() {
+                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                     let tracer = &(*entry.tracer_ptr);
                     tracer.reset();
                 }
@@ -1200,6 +1270,7 @@ impl GarbageCollector {
                 if max_gen < Generation::Gen2 {
                     for &obj_id in remembered_set.iter() {
                         if let Some(entry) = gc_maps.objects.get(obj_id) {
+                            // SAFETY: Object pointer is valid while gc_maps lock is held.
                             (&*entry.ptr).reset();
                         }
                     }
@@ -1236,7 +1307,9 @@ impl GarbageCollector {
                     {
                         let cur_gen = entry.generation;
                         entry.survive_count += 1;
-                        let should_promote = entry.survive_count >= cur_gen.promotion_threshold();
+                        let promo_cfg = self.promotion_config();
+                        let should_promote =
+                            entry.survive_count >= promo_cfg.threshold_for(cur_gen);
                         if should_promote {
                             entry.survive_count = 0;
                             if let Some(next_gen) = cur_gen.next() {
@@ -1257,15 +1330,19 @@ impl GarbageCollector {
 
             // Dealloc phase: all locks released
             for (mem, layout) in tracer_deallocs {
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(mem, layout);
             }
             for entry in object_deallocs {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
                     (*entry.finalizer).finalize();
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
                     (entry.drop_fn)(entry.mem);
                 }));
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(entry.mem, entry.layout);
             }
 
@@ -1313,15 +1390,19 @@ impl GarbageCollector {
             };
             self.allocation_count.store(0, Ordering::Relaxed);
             for (mem, layout) in tracer_deallocs {
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(mem, layout);
             }
             for entry in object_deallocs {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
                     (*entry.finalizer).finalize();
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
                     (entry.drop_fn)(entry.mem);
                 }));
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(entry.mem, entry.layout);
             }
         }
@@ -1343,6 +1424,7 @@ impl GarbageCollector {
         // Root discovery: cascade reset_root to mark internal Gc handles as non-root.
         for entry in gc_maps.objects.values() {
             unsafe {
+                // SAFETY: Object pointer is valid while gc_maps lock is held.
                 (&*entry.ptr).reset_root();
             }
         }
@@ -1357,6 +1439,7 @@ impl GarbageCollector {
         // Gray objects reachable from root tracers
         for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
             unsafe {
+                // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                 let tracer = &(*tracer_entry.tracer_ptr);
                 if tracer.is_root()
                     && let Some(color) = incr.colors.get_mut(&tracer_entry.object_id)
@@ -1390,6 +1473,7 @@ impl GarbageCollector {
             children_buf.clear();
             if let Some(entry) = gc_maps.objects.get(obj_id) {
                 unsafe {
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
                     (&*entry.ptr).trace_children(&mut children_buf);
                 }
             }
@@ -1434,6 +1518,7 @@ impl GarbageCollector {
 
                 // Root discovery for objects allocated during concurrent marking.
                 for entry in gc_maps.objects.values() {
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
                     (&*entry.ptr).reset_root();
                 }
 
@@ -1449,6 +1534,7 @@ impl GarbageCollector {
 
                 // Also gray objects reachable from NEW root tracers (allocated during marking).
                 for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
+                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                     let tracer = &(*tracer_entry.tracer_ptr);
                     if tracer.is_root()
                         && let Some(color) = incr.colors.get_mut(&tracer_entry.object_id)
@@ -1464,6 +1550,7 @@ impl GarbageCollector {
                 while let Some(obj_id) = incr.gray_stack.pop() {
                     children_buf.clear();
                     if let Some(entry) = gc_maps.objects.get(obj_id) {
+                        // SAFETY: Object pointer is valid while gc_maps lock is held.
                         (&*entry.ptr).trace_children(&mut children_buf);
                     }
                     for &child_ptr in &children_buf {
@@ -1544,7 +1631,9 @@ impl GarbageCollector {
                     {
                         let cur_gen = entry.generation;
                         entry.survive_count += 1;
-                        let should_promote = entry.survive_count >= cur_gen.promotion_threshold();
+                        let promo_cfg = self.promotion_config();
+                        let should_promote =
+                            entry.survive_count >= promo_cfg.threshold_for(cur_gen);
                         if should_promote {
                             entry.survive_count = 0;
                             if let Some(next_gen) = cur_gen.next() {
@@ -1570,15 +1659,19 @@ impl GarbageCollector {
 
             // Dealloc phase: all locks released
             for (mem, layout) in tracer_deallocs {
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(mem, layout);
             }
             for entry in object_deallocs {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
                     (*entry.finalizer).finalize();
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
                     (entry.drop_fn)(entry.mem);
                 }));
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(entry.mem, entry.layout);
             }
 
@@ -1601,6 +1694,7 @@ impl GarbageCollector {
         max_gen: Generation,
         step_budget: usize,
     ) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to begin_collection, mark_step, finish_collection.
         unsafe {
             self.begin_collection(max_gen);
             loop {
@@ -1670,6 +1764,7 @@ impl GarbageCollector {
         max_gen: Generation,
         max_step_duration: Duration,
     ) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to begin_collection, mark_step_timed, finish_collection.
         unsafe {
             self.begin_collection(max_gen);
             loop {
@@ -1702,6 +1797,7 @@ impl GarbageCollector {
         // Gc handles as non-root (enables cycle collection).
         for entry in gc_maps.objects.values() {
             unsafe {
+                // SAFETY: Object pointer is valid while gc_maps lock is held.
                 (&*entry.ptr).reset_root();
             }
         }
@@ -1713,6 +1809,7 @@ impl GarbageCollector {
                 incr.colors.insert(obj_id, MarkColor::White);
                 children_buf.clear();
                 unsafe {
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
                     (&*entry.ptr).trace_children(&mut children_buf);
                 }
                 let child_ids: Vec<ObjectId> = children_buf
@@ -1726,6 +1823,7 @@ impl GarbageCollector {
         // Gray objects reachable from root tracers
         for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
             unsafe {
+                // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                 let tracer = &(*tracer_entry.tracer_ptr);
                 if tracer.is_root()
                     && let Some(color) = incr.colors.get_mut(&tracer_entry.object_id)
@@ -1777,6 +1875,7 @@ impl GarbageCollector {
         max_gen: Generation,
         step_budget: usize,
     ) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to begin_concurrent_collection, concurrent_mark_step, finish_collection.
         unsafe {
             self.begin_concurrent_collection(max_gen);
             loop {
@@ -1831,6 +1930,7 @@ impl GarbageCollector {
         max_gen: Generation,
         max_step_duration: Duration,
     ) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to begin_concurrent_collection, concurrent_mark_step_timed, finish_collection.
         unsafe {
             self.begin_concurrent_collection(max_gen);
             loop {
@@ -1879,11 +1979,13 @@ impl GarbageCollector {
 
                 // Root discovery
                 for entry in gc_maps.objects.values() {
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
                     (&*entry.ptr).reset_root();
                 }
 
                 // Mark phase: trace from ALL roots
                 for entry in gc_maps.tracers.values() {
+                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                     let tracer = &(*entry.tracer_ptr);
                     if tracer.is_root() {
                         tracer.trace();
@@ -1893,6 +1995,7 @@ impl GarbageCollector {
                 // Also trace from remembered set
                 for &obj_id in remembered_set.iter() {
                     if let Some(entry) = gc_maps.objects.get(obj_id) {
+                        // SAFETY: Object pointer is valid while gc_maps lock is held.
                         (&*entry.ptr).trace();
                     }
                 }
@@ -1919,6 +2022,7 @@ impl GarbageCollector {
                     .tracers
                     .iter()
                     .filter(|(id, e)| {
+                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                         region_tracers.contains(id) && !(&*e.tracer_ptr).is_traceable()
                     })
                     .map(|(id, _)| id)
@@ -1935,6 +2039,7 @@ impl GarbageCollector {
                 let collected_objects: Vec<ObjectId> = gc_maps
                     .objects
                     .iter()
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
                     .filter(|(id, e)| in_region.contains(id) && !(&*e.ptr).is_traceable())
                     .map(|(id, _)| id)
                     .collect();
@@ -1942,10 +2047,12 @@ impl GarbageCollector {
 
                 // Reset ALL tracers
                 for entry in gc_maps.tracers.values() {
+                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                     (&*entry.tracer_ptr).reset();
                 }
                 for &obj_id in remembered_set.iter() {
                     if let Some(entry) = gc_maps.objects.get(obj_id) {
+                        // SAFETY: Object pointer is valid while gc_maps lock is held.
                         (&*entry.ptr).reset();
                     }
                 }
@@ -1968,15 +2075,19 @@ impl GarbageCollector {
 
             // Dealloc phase: all locks released
             for (mem, layout) in tracer_deallocs {
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(mem, layout);
             }
             for entry in object_deallocs {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
                     (*entry.finalizer).finalize();
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
                     (entry.drop_fn)(entry.mem);
                 }));
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(entry.mem, entry.layout);
             }
 
@@ -2016,11 +2127,13 @@ impl LocalGarbageCollector {
         unsafe {
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<GcPtr<T>>();
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
+                    // SAFETY: Pointer points to a valid, initialized GcPtr<T> that is being deallocated.
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
@@ -2048,11 +2161,13 @@ impl LocalGarbageCollector {
             });
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
             };
+            // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
@@ -2065,6 +2180,7 @@ impl LocalGarbageCollector {
     {
         unsafe {
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
+            // SAFETY: internal_ptr is valid for the lifetime of the source Gc handle.
             let object_id = (*gc.internal_ptr).object_id;
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
@@ -2080,11 +2196,13 @@ impl LocalGarbageCollector {
             }
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, tracer_id, object_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
             };
+            // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source Gc.
             (*(*gc.internal_ptr).ptr).reset_root();
             gc
         }
@@ -2098,11 +2216,13 @@ impl LocalGarbageCollector {
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<RefCell<GcPtr<T>>>();
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
                 self.core.alloc_mem::<GcRefCellInternal<T>>();
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
+                    // SAFETY: Pointer points to a valid, initialized RefCell<GcPtr<T>> that is being deallocated.
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
@@ -2130,6 +2250,7 @@ impl LocalGarbageCollector {
             });
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcRefCellInternal<T>.
             std::ptr::write(
                 gc_cell_inter_ptr,
                 GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
@@ -2138,6 +2259,7 @@ impl LocalGarbageCollector {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
             };
+            // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
@@ -2150,6 +2272,7 @@ impl LocalGarbageCollector {
     {
         unsafe {
             let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcRefCellInternal<T>>();
+            // SAFETY: internal_ptr is valid for the lifetime of the source GcRefCell handle.
             let object_id = (*gc.internal_ptr).object_id;
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
@@ -2165,6 +2288,7 @@ impl LocalGarbageCollector {
             }
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcRefCellInternal<T>.
             std::ptr::write(
                 gc_inter_ptr,
                 GcRefCellInternal::new(gc.ptr, tracer_id, object_id),
@@ -2173,6 +2297,7 @@ impl LocalGarbageCollector {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
             };
+            // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source GcRefCell.
             (*(*gc.internal_ptr).ptr).reset_root();
             gc
         }
@@ -2189,15 +2314,18 @@ impl LocalGarbageCollector {
                 match self.core.try_alloc_mem_with_gc::<GcInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
+                        // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
                         dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
+            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
+                    // SAFETY: Pointer points to a valid, initialized GcPtr<T> that is being deallocated.
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
@@ -2225,11 +2353,13 @@ impl LocalGarbageCollector {
             });
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcInternal<T>.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
             };
+            // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
@@ -2248,15 +2378,18 @@ impl LocalGarbageCollector {
                 match self.core.try_alloc_mem_with_gc::<GcRefCellInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
+                        // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
                         dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
+            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
+                    // SAFETY: Pointer points to a valid, initialized RefCell<GcPtr<T>> that is being deallocated.
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
@@ -2284,6 +2417,7 @@ impl LocalGarbageCollector {
             });
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcRefCellInternal<T>.
             std::ptr::write(
                 gc_cell_inter_ptr,
                 GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
@@ -2292,6 +2426,7 @@ impl LocalGarbageCollector {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
             };
+            // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
@@ -2324,6 +2459,7 @@ impl LocalGarbageCollector {
             }
             drop(gc_maps);
 
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
             std::ptr::write(
                 gc_inter_ptr,
                 GcInternal::new(weak.ptr, tracer_id, object_id),
@@ -2332,6 +2468,7 @@ impl LocalGarbageCollector {
                 internal_ptr: gc_inter_ptr,
                 ptr: weak.ptr,
             };
+            // SAFETY: Both internal_ptr (just initialized) and ptr (verified alive via STW lock) are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             gc
         }
@@ -2340,6 +2477,7 @@ impl LocalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn collect(&self) {
+        // SAFETY: Caller upholds the safety contract; delegates to core.collect().
         unsafe {
             self.core.collect();
         }
@@ -2347,12 +2485,14 @@ impl LocalGarbageCollector {
 
     #[allow(dead_code)]
     unsafe fn collect_all(&self) {
+        // SAFETY: Caller upholds the safety contract; delegates to core.collect_all().
         unsafe {
             self.core.collect_all();
         }
     }
 
     pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
+        // SAFETY: Caller provides valid tracer_id and object_id obtained from a live Gc handle.
         unsafe {
             self.core.remove_tracer(tracer_id, object_id);
         }
@@ -2363,6 +2503,7 @@ impl LocalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn begin_collection(&self, max_gen: Generation) {
+        // SAFETY: Caller upholds the safety contract; delegates to core.begin_collection().
         unsafe {
             self.core.begin_collection(max_gen);
         }
@@ -2373,6 +2514,7 @@ impl LocalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn mark_step(&self, budget: usize) -> bool {
+        // SAFETY: Caller upholds the safety contract; delegates to core.mark_step().
         unsafe { self.core.mark_step(budget) }
     }
 
@@ -2381,6 +2523,7 @@ impl LocalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn finish_collection(&self) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to core.finish_collection().
         unsafe { self.core.finish_collection() }
     }
 
@@ -2393,6 +2536,7 @@ impl LocalGarbageCollector {
         max_gen: Generation,
         step_budget: usize,
     ) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to core.collect_incremental().
         unsafe { self.core.collect_incremental(max_gen, step_budget) }
     }
 
@@ -2401,6 +2545,7 @@ impl LocalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn begin_concurrent_collection(&self, max_gen: Generation) {
+        // SAFETY: Caller upholds the safety contract; delegates to core.begin_concurrent_collection().
         unsafe {
             self.core.begin_concurrent_collection(max_gen);
         }
@@ -2420,6 +2565,7 @@ impl LocalGarbageCollector {
         max_gen: Generation,
         step_budget: usize,
     ) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to core.collect_concurrent().
         unsafe { self.core.collect_concurrent(max_gen, step_budget) }
     }
 
@@ -2428,6 +2574,7 @@ impl LocalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
+        // SAFETY: Caller upholds the safety contract; delegates to core.mark_step_timed().
         unsafe { self.core.mark_step_timed(max_duration) }
     }
 
@@ -2440,6 +2587,7 @@ impl LocalGarbageCollector {
         max_gen: Generation,
         max_step_duration: Duration,
     ) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to core.collect_incremental_timed().
         unsafe {
             self.core
                 .collect_incremental_timed(max_gen, max_step_duration)
@@ -2460,6 +2608,7 @@ impl LocalGarbageCollector {
         max_gen: Generation,
         max_step_duration: Duration,
     ) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to core.collect_concurrent_timed().
         unsafe {
             self.core
                 .collect_concurrent_timed(max_gen, max_step_duration)
@@ -2481,12 +2630,24 @@ impl LocalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn collect_region(&self, region: RegionId) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to core.collect_region().
         unsafe { self.core.collect_region(region) }
     }
 
     /// Return a snapshot of current GC diagnostics.
     pub fn stats(&self) -> GcStats {
         self.core.stats()
+    }
+
+    /// Set custom promotion thresholds (how many collections an object must survive
+    /// before being promoted to the next generation).
+    pub fn set_promotion_config(&self, config: PromotionConfig) {
+        self.core.set_promotion_config(config);
+    }
+
+    /// Get the current promotion config.
+    pub fn promotion_config(&self) -> PromotionConfig {
+        self.core.promotion_config()
     }
 }
 
@@ -2588,6 +2749,7 @@ thread_local! {
     pub static LOCAL_GC: RefCell<LocalGarbageCollector> = RefCell::new(LocalGarbageCollector::new());
     pub static LOCAL_GC_STRATEGY: RefCell<LocalStrategy> = {
         LOCAL_GC.with(move |gc| {
+            // SAFETY: Single-threaded access via thread_local ensures no aliasing; used during initialization only.
             let gc = unsafe { &mut *gc.as_ptr() };
             RefCell::new(LocalStrategy::new(gc,
             move |local_gc, _| {
