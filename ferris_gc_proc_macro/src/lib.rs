@@ -292,6 +292,10 @@ pub fn derive_finalize(item: TokenStream) -> TokenStream {
 /// #[ferris_gc_main(strategy = "threshold")]  // threshold with defaults
 /// #[ferris_gc_main(strategy = "threshold", gen0_threshold = 200, poll_interval_ms = 100)]
 /// #[ferris_gc_main(strategy = "adaptive", min_threshold = 30, max_threshold = 5000)]
+/// #[ferris_gc_main(strategy = "background")] // .NET-style background Gen2
+/// #[ferris_gc_main(strategy = "background", gen2_occupancy_trigger = 0.5, gen2_mark_step_budget = 128)]
+/// #[ferris_gc_main(strategy = "g1")]         // G1-style garbage-first with pause target
+/// #[ferris_gc_main(strategy = "g1", pause_target_ms = 20, young_gen_threshold = 200)]
 /// fn main() { }
 /// ```
 ///
@@ -312,6 +316,19 @@ pub fn derive_finalize(item: TokenStream) -> TokenStream {
 /// - `high_ratio` — collection ratio above which threshold decreases (default: 0.5)
 /// - `low_ratio` — collection ratio below which threshold increases (default: 0.1)
 /// - `adjust_factor` — multiplicative factor for threshold adjustment (default: 1.5)
+///
+/// **`background` strategy** (.NET-style background Gen2):
+/// - `gen0_threshold` — allocations before triggering Gen0 collection (default: 100)
+/// - `gen0_collections_per_gen1` — Gen0 collections between each Gen1 (default: 5)
+/// - `gen1_collections_per_gen2` — Gen1 collections between each Gen2 (default: 5)
+/// - `gen2_occupancy_trigger` — heap occupancy ratio to trigger background Gen2 (default: 0.75)
+/// - `gen2_mark_step_budget` — objects scanned per concurrent mark step (default: 64)
+///
+/// **`g1` strategy** (Garbage First with pause target):
+/// - `pause_target_ms` — target maximum pause time in milliseconds (default: 10)
+/// - `young_gen_threshold` — allocations before triggering G1 collection (default: 100)
+/// - `initiating_heap_occupancy_percent` — heap occupancy ratio to trigger background Gen2 (default: 0.45)
+/// - `concurrent_mark_budget` — objects scanned per concurrent mark step (default: 64)
 #[proc_macro_attribute]
 pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemFn);
@@ -378,15 +395,37 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
         "gen1_collections_per_gen2",
         "poll_interval_ms",
     ];
+    let valid_background = &[
+        "gen0_threshold",
+        "gen0_collections_per_gen1",
+        "gen1_collections_per_gen2",
+        "poll_interval_ms",
+        "gen2_occupancy_trigger",
+        "gen2_mark_step_budget",
+    ];
+    let valid_g1 = &[
+        "pause_target_ms",
+        "young_gen_threshold",
+        "initiating_heap_occupancy_percent",
+        "concurrent_mark_budget",
+        "poll_interval_ms",
+    ];
 
     let valid_params: &[&str] = match strategy.as_str() {
         "basic" => valid_basic,
         "threshold" => valid_threshold,
         "adaptive" => valid_adaptive,
+        "background" => valid_background,
+        "g1" => valid_g1,
         _ => &[], // will error below
     };
 
-    if strategy == "basic" || strategy == "threshold" || strategy == "adaptive" {
+    if strategy == "basic"
+        || strategy == "threshold"
+        || strategy == "adaptive"
+        || strategy == "background"
+        || strategy == "g1"
+    {
         for (name, _, span) in &config_params {
             if !valid_params.contains(&name.as_str()) {
                 return syn::Error::new(
@@ -522,12 +561,102 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         }
+        "background" => {
+            let gen0_threshold = find_param("gen0_threshold");
+            let gen0_per_gen1 = find_param("gen0_collections_per_gen1");
+            let gen1_per_gen2 = find_param("gen1_collections_per_gen2");
+            let poll_ms = find_param("poll_interval_ms");
+            let occupancy = find_param("gen2_occupancy_trigger");
+            let step_budget = find_param("gen2_mark_step_budget");
+
+            let mut overrides = Vec::new();
+            if let Some(v) = gen0_threshold {
+                overrides.push(quote! { gen0_threshold: #v });
+            }
+            if let Some(v) = gen0_per_gen1 {
+                overrides.push(quote! { gen0_collections_per_gen1: #v });
+            }
+            if let Some(v) = gen1_per_gen2 {
+                overrides.push(quote! { gen1_collections_per_gen2: #v });
+            }
+            if let Some(v) = poll_ms {
+                overrides.push(quote! { poll_interval: std::time::Duration::from_millis(#v) });
+            }
+            if let Some(v) = occupancy {
+                overrides.push(quote! { gen2_occupancy_trigger: #v });
+            }
+            if let Some(v) = step_budget {
+                overrides.push(quote! { gen2_mark_step_budget: #v });
+            }
+
+            quote! {
+                ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+                let __ferris_gc_config = ferris_gc::BackgroundConfig {
+                    #(#overrides,)*
+                    ..ferris_gc::BackgroundConfig::default()
+                };
+                ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
+                    let (start, stop) = ferris_gc::background_local_start(ferris_gc::BackgroundConfig {
+                        #(#overrides,)*
+                        ..ferris_gc::BackgroundConfig::default()
+                    });
+                    s.borrow().change_strategy(start, stop);
+                });
+                {
+                    let (start, stop) = ferris_gc::background_global_start(__ferris_gc_config);
+                    ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+                }
+            }
+        }
+        "g1" => {
+            let pause_ms = find_param("pause_target_ms");
+            let young_thresh = find_param("young_gen_threshold");
+            let occupancy = find_param("initiating_heap_occupancy_percent");
+            let mark_budget = find_param("concurrent_mark_budget");
+            let poll_ms = find_param("poll_interval_ms");
+
+            let mut overrides = Vec::new();
+            if let Some(v) = pause_ms {
+                overrides.push(quote! { pause_target: std::time::Duration::from_millis(#v) });
+            }
+            if let Some(v) = young_thresh {
+                overrides.push(quote! { young_gen_threshold: #v });
+            }
+            if let Some(v) = occupancy {
+                overrides.push(quote! { initiating_heap_occupancy_percent: #v });
+            }
+            if let Some(v) = mark_budget {
+                overrides.push(quote! { concurrent_mark_budget: #v });
+            }
+            if let Some(v) = poll_ms {
+                overrides.push(quote! { poll_interval: std::time::Duration::from_millis(#v) });
+            }
+
+            quote! {
+                ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+                let __ferris_gc_config = ferris_gc::G1Config {
+                    #(#overrides,)*
+                    ..ferris_gc::G1Config::default()
+                };
+                ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
+                    let (start, stop) = ferris_gc::g1_local_start(ferris_gc::G1Config {
+                        #(#overrides,)*
+                        ..ferris_gc::G1Config::default()
+                    });
+                    s.borrow().change_strategy(start, stop);
+                });
+                {
+                    let (start, stop) = ferris_gc::g1_global_start(__ferris_gc_config);
+                    ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+                }
+            }
+        }
         other => {
             let span = strategy_span.unwrap_or_else(proc_macro2::Span::call_site);
             return syn::Error::new(
                 span,
                 format!(
-                    "unknown GC strategy '{}'. Supported: basic, threshold, adaptive",
+                    "unknown GC strategy '{}'. Supported: basic, threshold, adaptive, background, g1",
                     other
                 ),
             )

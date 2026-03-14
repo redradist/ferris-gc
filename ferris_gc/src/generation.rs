@@ -4,6 +4,22 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RegionId(pub(crate) u32);
 
+/// Per-region liveness statistics for G1-style garbage-first collection.
+/// Tracks allocation pressure per region so the collector can prioritise
+/// regions with the highest garbage ratio.
+#[derive(Debug, Clone)]
+pub struct RegionStats {
+    /// Which region these stats describe.
+    pub region_id: RegionId,
+    /// Total bytes allocated in this region (object data only).
+    pub total_bytes: usize,
+    /// Number of live objects currently assigned to this region.
+    pub object_count: usize,
+    /// Estimated ratio of garbage in this region (0.0 = all live, 1.0 = all garbage).
+    /// Only meaningful after a mark phase; set to 0.0 by `region_stats()` (no mark).
+    pub estimated_garbage_ratio: f64,
+}
+
 /// Generational tier for the GC's generational collection strategy.
 /// Objects start in Gen0 (nursery) and are promoted to higher generations
 /// as they survive collections, reducing collection frequency for long-lived objects.

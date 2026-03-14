@@ -616,7 +616,7 @@ where
 
     /// Mutable borrow with write barrier.
     /// Triggers the write barrier so that if this object is in an older generation,
-    /// it gets added to the remembered set for young-generation collections.
+    /// its card is marked dirty in the card table for young-generation collections.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
         unsafe {
             // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
@@ -852,9 +852,11 @@ impl GlobalGarbageCollector {
                 ref_count: 1,
                 region,
             });
-            gc_maps
-                .ptr_to_object
-                .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
+            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
+            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
+            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
+            self.core.card_table.register_object(thin_ptr, obj_id);
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -959,9 +961,11 @@ impl GlobalGarbageCollector {
                 ref_count: 1,
                 region,
             });
-            gc_maps
-                .ptr_to_object
-                .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
+            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
+            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
+            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
+            self.core.card_table.register_object(thin_ptr, obj_id);
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -1040,7 +1044,6 @@ impl GlobalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            use std::alloc::dealloc;
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem_with_gc::<GcPtr<T>>()?;
             let (gc_inter_ptr, mem_info_internal_ptr) =
@@ -1048,7 +1051,7 @@ impl GlobalGarbageCollector {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
+                        mem_info_gc_ptr.0.dealloc_mem(mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
@@ -1081,9 +1084,11 @@ impl GlobalGarbageCollector {
                 ref_count: 1,
                 region,
             });
-            gc_maps
-                .ptr_to_object
-                .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
+            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
+            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
+            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
+            self.core.card_table.register_object(thin_ptr, obj_id);
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -1118,7 +1123,6 @@ impl GlobalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            use std::alloc::dealloc;
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) =
                 self.core.try_alloc_mem_with_gc::<RefCell<GcPtr<T>>>()?;
@@ -1127,7 +1131,7 @@ impl GlobalGarbageCollector {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        dealloc(mem_info_gc_ptr.0, mem_info_gc_ptr.1);
+                        mem_info_gc_ptr.0.dealloc_mem(mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
@@ -1162,9 +1166,11 @@ impl GlobalGarbageCollector {
                 ref_count: 1,
                 region,
             });
-            gc_maps
-                .ptr_to_object
-                .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
+            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
+            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
+            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
+            self.core.card_table.register_object(thin_ptr, obj_id);
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -1253,6 +1259,20 @@ impl GlobalGarbageCollector {
             // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core.collect_all();
         }
+    }
+
+    /// Parallel collection: serial mark phase, parallel sweep/dealloc using rayon.
+    /// Collects objects in generations 0..=max_gen.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    #[cfg(feature = "parallel")]
+    pub unsafe fn collect_parallel(
+        &self,
+        max_gen: crate::generation::Generation,
+    ) -> crate::generation::CollectionStats {
+        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
+        unsafe { self.core.collect_parallel(max_gen) }
     }
 
     pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
@@ -1391,6 +1411,26 @@ impl GlobalGarbageCollector {
     ) -> crate::generation::CollectionStats {
         // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.collect_region(region.0) }
+    }
+
+    /// G1-style "Garbage First" collection. Marks all objects, then sweeps
+    /// regions with the highest garbage ratio first, stopping when the elapsed
+    /// time reaches `pause_target`.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are held
+    /// across this call (stop-the-world requirement).
+    pub unsafe fn collect_garbage_first(
+        &self,
+        pause_target: std::time::Duration,
+    ) -> crate::generation::CollectionStats {
+        // SAFETY: Caller upholds the safety contract.
+        unsafe { self.core.collect_garbage_first(pause_target) }
+    }
+
+    /// Return per-region liveness statistics without running a collection.
+    pub fn region_stats(&self) -> Vec<crate::generation::RegionStats> {
+        self.core.region_stats()
     }
 
     /// Return a snapshot of current GC diagnostics.

@@ -24,9 +24,15 @@ extern crate lazy_static;
 #[cfg(feature = "std")]
 mod adaptive_strategy;
 #[cfg(feature = "std")]
+mod background_strategy;
+#[cfg(feature = "std")]
 mod basic_gc_strategy;
 #[cfg(feature = "std")]
+mod card_table;
+#[cfg(feature = "std")]
 mod default_trace;
+#[cfg(feature = "std")]
+mod g1_strategy;
 #[cfg(feature = "std")]
 mod gc;
 mod generation;
@@ -34,9 +40,13 @@ mod generation;
 pub(crate) mod slot_map;
 #[cfg(feature = "std")]
 mod threshold_strategy;
+#[cfg(feature = "std")]
+pub(crate) mod tlab;
 
 #[cfg(feature = "std")]
 pub use adaptive_strategy::{AdaptiveConfig, adaptive_global_start, adaptive_local_start};
+#[cfg(feature = "std")]
+pub use background_strategy::{BackgroundConfig, background_global_start, background_local_start};
 #[cfg(feature = "std")]
 pub use basic_gc_strategy::{
     ApplicationCleanup, BASIC_POLL_INTERVAL_MS, BASIC_STRATEGY_DISABLED, BASIC_STRATEGY_GLOBAL_GC,
@@ -45,6 +55,8 @@ pub use basic_gc_strategy::{
 #[cfg(feature = "std")]
 #[allow(unused_imports)]
 pub use default_trace::*;
+#[cfg(feature = "std")]
+pub use g1_strategy::{G1Config, g1_global_start, g1_local_start};
 #[cfg(feature = "std")]
 pub use gc::sync;
 #[cfg(feature = "std")]

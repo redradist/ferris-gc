@@ -16,10 +16,12 @@ rust-version = "1.85.0"
 default = ["std"]
 std = ["lazy_static"]
 proc-macro = ["ferris-gc-proc-macro"]
+parallel = ["rayon", "std"]
 
 [dependencies]
 lazy_static = { version = "1.4.0", optional = true }
 ferris-gc-proc-macro = { path = "../ferris_gc_proc_macro", version = "0.2.0", optional = true }
+rayon = { version = "1.10", optional = true }
 
 [dev-dependencies]
 ferris-gc-proc-macro = { path = "../ferris_gc_proc_macro", version = "0.2.0" }
