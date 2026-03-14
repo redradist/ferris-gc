@@ -39,7 +39,8 @@ mod threshold_strategy;
 pub use adaptive_strategy::{AdaptiveConfig, adaptive_global_start, adaptive_local_start};
 #[cfg(feature = "std")]
 pub use basic_gc_strategy::{
-    ApplicationCleanup, BASIC_STRATEGY_DISABLED, BASIC_STRATEGY_GLOBAL_GC, BASIC_STRATEGY_LOCAL_GCS,
+    ApplicationCleanup, BASIC_POLL_INTERVAL_MS, BASIC_STRATEGY_DISABLED, BASIC_STRATEGY_GLOBAL_GC,
+    BASIC_STRATEGY_LOCAL_GCS,
 };
 #[cfg(feature = "std")]
 #[allow(unused_imports)]

@@ -134,7 +134,78 @@ sync::GLOBAL_GC.set_promotion_config(PromotionConfig {
 });
 ```
 
-### Custom Collection Strategy
+### Strategy Configuration via `#[ferris_gc_main]`
+
+The `#[ferris_gc_main]` attribute macro sets up `ApplicationCleanup` and configures
+the collection strategy for **both** thread-local and global GCs automatically:
+
+```rust
+use ferris_gc::{Gc, Trace, Finalize};
+
+#[derive(Trace, Finalize)]
+struct Data { value: i32 }
+
+// Default: basic periodic strategy (background thread every 500ms)
+#[ferris_gc::ferris_gc_main]
+fn main() {
+    let _obj = Gc::new(Data { value: 1 });
+}
+```
+
+```rust
+// Threshold strategy: collect when allocation count exceeds a threshold
+#[ferris_gc::ferris_gc_main(strategy = "threshold")]
+fn main() {
+    let _obj = Gc::new(Data { value: 1 });
+}
+```
+
+```rust
+// Adaptive strategy: auto-tunes collection frequency based on allocation rate
+#[ferris_gc::ferris_gc_main(strategy = "adaptive")]
+fn main() {
+    let _obj = Gc::new(Data { value: 1 });
+}
+```
+
+You can combine the macro with runtime configuration — promotion thresholds,
+monitoring callbacks, and region-based allocation all work alongside any strategy:
+
+```rust
+use ferris_gc::{Gc, sync, PromotionConfig, Generation, LOCAL_GC};
+
+#[ferris_gc::ferris_gc_main(strategy = "adaptive")]
+fn main() {
+    // Tune promotion thresholds (thread-local)
+    LOCAL_GC.with(|gc| {
+        gc.borrow().set_promotion_config(PromotionConfig {
+            gen0_threshold: 5,
+            gen1_threshold: 10,
+        });
+    });
+
+    // Tune promotion thresholds (global)
+    sync::GLOBAL_GC.set_promotion_config(PromotionConfig {
+        gen0_threshold: 5,
+        gen1_threshold: 10,
+    });
+
+    // Monitor collections
+    LOCAL_GC.with(|gc| {
+        gc.borrow().set_on_collection(|stats| {
+            println!("GC: collected {} objects in {:?}", stats.objects_collected, stats.duration);
+        });
+    });
+
+    // Region-based allocation
+    let region = LOCAL_GC.with(|gc| gc.borrow().new_region());
+    let _obj = region.gc(42);  // allocate in specific region
+}
+```
+
+### Custom Collection Strategy (Manual)
+
+For fine-grained control without the macro, configure strategies manually:
 
 ```rust
 use ferris_gc::sync;
@@ -191,6 +262,7 @@ cargo run --example basic
 cargo run --example cyclic
 cargo run --example sync_gc
 cargo run --example incremental
+cargo run --example macro_strategies --features proc-macro   # #[ferris_gc_main] with strategies
 ```
 
 ## Benchmarks

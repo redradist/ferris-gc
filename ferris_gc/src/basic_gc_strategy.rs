@@ -5,12 +5,17 @@ use std::{thread, time};
 
 use std::thread::JoinHandle;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// When set to `true`, `basic_gc_strategy_start()` becomes a no-op.
 /// Used by `#[ferris_gc_main(strategy = "...")]` to prevent the basic
 /// background thread from starting when a different strategy is configured.
 pub static BASIC_STRATEGY_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Polling interval for the basic strategy background thread, in milliseconds.
+/// Set this **before** the first allocation to change the default (500ms).
+/// Used by `#[ferris_gc_main(poll_interval_ms = ...)]`.
+pub static BASIC_POLL_INTERVAL_MS: AtomicU64 = AtomicU64::new(50);
 
 lazy_static! {
     pub static ref BASIC_STRATEGY_LOCAL_GCS: RwLock<Vec<&'static LocalGarbageCollector>> =
@@ -43,8 +48,9 @@ pub fn basic_gc_strategy_start() {
         bthreads.write().unwrap().push(thread::spawn(move || {
             let app_active = &(*APPLICATION_ACTIVE);
             while app_active.load(Ordering::Acquire) {
-                let ten_secs = time::Duration::from_millis(500);
-                thread::sleep(ten_secs);
+                let interval =
+                    time::Duration::from_millis(BASIC_POLL_INTERVAL_MS.load(Ordering::Relaxed));
+                thread::sleep(interval);
                 {
                     if let Some(global_gc) = *(*BASIC_STRATEGY_GLOBAL_GC).read().unwrap() {
                         unsafe {

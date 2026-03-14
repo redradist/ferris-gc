@@ -287,22 +287,49 @@ pub fn derive_finalize(item: TokenStream) -> TokenStream {
 ///
 /// # Usage
 /// ```ignore
-/// #[ferris_gc_main]                          // basic strategy (default)
-/// #[ferris_gc_main(strategy = "threshold")]  // threshold-based generational GC
-/// #[ferris_gc_main(strategy = "adaptive")]   // adaptive auto-tuning generational GC
+/// #[ferris_gc_main]                          // basic strategy (default, 500ms poll)
+/// #[ferris_gc_main(strategy = "basic", poll_interval_ms = 200)]
+/// #[ferris_gc_main(strategy = "threshold")]  // threshold with defaults
+/// #[ferris_gc_main(strategy = "threshold", gen0_threshold = 200, poll_interval_ms = 100)]
+/// #[ferris_gc_main(strategy = "adaptive", min_threshold = 30, max_threshold = 5000)]
 /// fn main() { }
 /// ```
+///
+/// ## Parameters
+///
+/// **All strategies:**
+/// - `poll_interval_ms` — background thread polling interval in milliseconds
+///
+/// **`threshold` strategy:**
+/// - `gen0_threshold` — allocations before triggering Gen0 collection (default: 100)
+/// - `gen0_collections_per_gen1` — Gen0 collections between each Gen1 (default: 5)
+/// - `gen1_collections_per_gen2` — Gen1 collections between each Gen2 (default: 5)
+///
+/// **`adaptive` strategy** (all `threshold` params plus):
+/// - `initial_gen0_threshold` — starting allocation threshold (default: 100)
+/// - `min_threshold` — minimum threshold floor (default: 50)
+/// - `max_threshold` — maximum threshold ceiling (default: 10000)
+/// - `high_ratio` — collection ratio above which threshold decreases (default: 0.5)
+/// - `low_ratio` — collection ratio below which threshold increases (default: 0.1)
+/// - `adjust_factor` — multiplicative factor for threshold adjustment (default: 1.5)
 #[proc_macro_attribute]
 pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemFn);
     let attr_args = syn::parse_macro_input!(attrs as syn::AttributeArgs);
 
-    // Parse strategy attribute
+    // Parse all name = value attributes
     let mut strategy = String::from("basic");
     let mut strategy_span: Option<proc_macro2::Span> = None;
+    let mut config_params: Vec<(String, Lit, proc_macro2::Span)> = Vec::new();
+
     for arg in &attr_args {
         if let NestedMeta::Meta(Meta::NameValue(nv)) = arg {
-            if nv.path.is_ident("strategy") {
+            let name = nv
+                .path
+                .get_ident()
+                .map(|i| i.to_string())
+                .unwrap_or_default();
+            if name == "strategy" {
                 if let Lit::Str(s) = &nv.lit {
                     strategy = s.value();
                     strategy_span = Some(s.span());
@@ -315,52 +342,186 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
                     .into();
                 }
             } else {
-                let name = nv
+                let span = nv
                     .path
                     .get_ident()
-                    .map(|i| i.to_string())
-                    .unwrap_or_default();
-                return syn::Error::new_spanned(
-                    &nv.path,
-                    format!("unknown attribute '{}'. Only 'strategy' is supported", name),
-                )
-                .to_compile_error()
-                .into();
+                    .map(|i| i.span())
+                    .unwrap_or_else(proc_macro2::Span::call_site);
+                config_params.push((name, nv.lit.clone(), span));
             }
         } else {
             return syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "expected strategy = \"...\". Supported strategies: basic, threshold, adaptive",
+                "expected key = value. Example: #[ferris_gc_main(strategy = \"threshold\", gen0_threshold = 200)]",
             )
             .to_compile_error()
             .into();
         }
     }
 
+    // Validate config params for the chosen strategy
+    let valid_basic = &["poll_interval_ms"];
+    let valid_threshold = &[
+        "gen0_threshold",
+        "gen0_collections_per_gen1",
+        "gen1_collections_per_gen2",
+        "poll_interval_ms",
+    ];
+    let valid_adaptive = &[
+        "initial_gen0_threshold",
+        "min_threshold",
+        "max_threshold",
+        "high_ratio",
+        "low_ratio",
+        "adjust_factor",
+        "gen0_collections_per_gen1",
+        "gen1_collections_per_gen2",
+        "poll_interval_ms",
+    ];
+
+    let valid_params: &[&str] = match strategy.as_str() {
+        "basic" => valid_basic,
+        "threshold" => valid_threshold,
+        "adaptive" => valid_adaptive,
+        _ => &[], // will error below
+    };
+
+    if strategy == "basic" || strategy == "threshold" || strategy == "adaptive" {
+        for (name, _, span) in &config_params {
+            if !valid_params.contains(&name.as_str()) {
+                return syn::Error::new(
+                    *span,
+                    format!(
+                        "unknown parameter '{}' for strategy '{}'. Valid: {}",
+                        name,
+                        strategy,
+                        valid_params.join(", "),
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+
+    // Helper: find a config param by name and return its literal
+    let find_param = |name: &str| -> Option<&Lit> {
+        config_params
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, lit, _)| lit)
+    };
+
+    // Generate strategy setup code
     let strategy_setup = match strategy.as_str() {
-        "basic" => quote! {},
-        "threshold" => quote! {
-            ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
-            ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
-                let (start, stop) = ferris_gc::threshold_local_start(ferris_gc::ThresholdConfig::default());
-                s.borrow().change_strategy(start, stop);
-            });
-            {
-                let (start, stop) = ferris_gc::threshold_global_start(ferris_gc::ThresholdConfig::default());
-                ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+        "basic" => {
+            if let Some(lit) = find_param("poll_interval_ms") {
+                quote! {
+                    ferris_gc::BASIC_POLL_INTERVAL_MS.store(#lit, std::sync::atomic::Ordering::Release);
+                }
+            } else {
+                quote! {}
             }
-        },
-        "adaptive" => quote! {
-            ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
-            ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
-                let (start, stop) = ferris_gc::adaptive_local_start(ferris_gc::AdaptiveConfig::default());
-                s.borrow().change_strategy(start, stop);
-            });
-            {
-                let (start, stop) = ferris_gc::adaptive_global_start(ferris_gc::AdaptiveConfig::default());
-                ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+        }
+        "threshold" => {
+            let gen0_threshold = find_param("gen0_threshold");
+            let gen0_per_gen1 = find_param("gen0_collections_per_gen1");
+            let gen1_per_gen2 = find_param("gen1_collections_per_gen2");
+            let poll_ms = find_param("poll_interval_ms");
+
+            // Build field overrides — only emit fields that were explicitly set
+            let mut overrides = Vec::new();
+            if let Some(v) = gen0_threshold {
+                overrides.push(quote! { gen0_threshold: #v });
             }
-        },
+            if let Some(v) = gen0_per_gen1 {
+                overrides.push(quote! { gen0_collections_per_gen1: #v });
+            }
+            if let Some(v) = gen1_per_gen2 {
+                overrides.push(quote! { gen1_collections_per_gen2: #v });
+            }
+            if let Some(v) = poll_ms {
+                overrides.push(quote! { poll_interval: std::time::Duration::from_millis(#v) });
+            }
+
+            quote! {
+                ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+                let __ferris_gc_config = ferris_gc::ThresholdConfig {
+                    #(#overrides,)*
+                    ..ferris_gc::ThresholdConfig::default()
+                };
+                ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
+                    let (start, stop) = ferris_gc::threshold_local_start(ferris_gc::ThresholdConfig {
+                        #(#overrides,)*
+                        ..ferris_gc::ThresholdConfig::default()
+                    });
+                    s.borrow().change_strategy(start, stop);
+                });
+                {
+                    let (start, stop) = ferris_gc::threshold_global_start(__ferris_gc_config);
+                    ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+                }
+            }
+        }
+        "adaptive" => {
+            let initial = find_param("initial_gen0_threshold");
+            let min_t = find_param("min_threshold");
+            let max_t = find_param("max_threshold");
+            let high_r = find_param("high_ratio");
+            let low_r = find_param("low_ratio");
+            let adjust = find_param("adjust_factor");
+            let gen0_per_gen1 = find_param("gen0_collections_per_gen1");
+            let gen1_per_gen2 = find_param("gen1_collections_per_gen2");
+            let poll_ms = find_param("poll_interval_ms");
+
+            let mut overrides = Vec::new();
+            if let Some(v) = initial {
+                overrides.push(quote! { initial_gen0_threshold: #v });
+            }
+            if let Some(v) = min_t {
+                overrides.push(quote! { min_threshold: #v });
+            }
+            if let Some(v) = max_t {
+                overrides.push(quote! { max_threshold: #v });
+            }
+            if let Some(v) = high_r {
+                overrides.push(quote! { high_ratio: #v });
+            }
+            if let Some(v) = low_r {
+                overrides.push(quote! { low_ratio: #v });
+            }
+            if let Some(v) = adjust {
+                overrides.push(quote! { adjust_factor: #v });
+            }
+            if let Some(v) = gen0_per_gen1 {
+                overrides.push(quote! { gen0_collections_per_gen1: #v });
+            }
+            if let Some(v) = gen1_per_gen2 {
+                overrides.push(quote! { gen1_collections_per_gen2: #v });
+            }
+            if let Some(v) = poll_ms {
+                overrides.push(quote! { poll_interval: std::time::Duration::from_millis(#v) });
+            }
+
+            quote! {
+                ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+                let __ferris_gc_config = ferris_gc::AdaptiveConfig {
+                    #(#overrides,)*
+                    ..ferris_gc::AdaptiveConfig::default()
+                };
+                ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
+                    let (start, stop) = ferris_gc::adaptive_local_start(ferris_gc::AdaptiveConfig {
+                        #(#overrides,)*
+                        ..ferris_gc::AdaptiveConfig::default()
+                    });
+                    s.borrow().change_strategy(start, stop);
+                });
+                {
+                    let (start, stop) = ferris_gc::adaptive_global_start(__ferris_gc_config);
+                    ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+                }
+            }
+        }
         other => {
             let span = strategy_span.unwrap_or_else(proc_macro2::Span::call_site);
             return syn::Error::new(

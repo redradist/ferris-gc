@@ -25,6 +25,10 @@ ferris-gc-proc-macro = { path = "../ferris_gc_proc_macro", version = "0.2.0", op
 ferris-gc-proc-macro = { path = "../ferris_gc_proc_macro", version = "0.2.0" }
 criterion = { version = "0.5", features = ["html_reports"] }
 
+[[example]]
+name = "macro_strategies"
+required-features = ["proc-macro"]
+
 [[bench]]
 name = "gc_bench"
 harness = false
