@@ -15,6 +15,19 @@ pub type OptGc<T> = Option<Gc<T>>;
 /// Convenience alias for an optional thread-safe GC interior-mutable cell.
 pub type OptGcCell<T> = Option<GcRefCell<T>>;
 
+/// Type-safe region identifier for the **global (thread-safe)** garbage collector.
+/// Returned by [`GlobalGarbageCollector::new_region`]. Cannot be used with
+/// the thread-local GC — the compiler will reject the mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyncRegionId(crate::generation::RegionId);
+
+impl SyncRegionId {
+    /// Return the raw numeric id (for logging / diagnostics).
+    pub fn id(self) -> u32 {
+        (self.0).0
+    }
+}
+
 struct GcInfo {
     root_ref_count: AtomicUsize,
 }
@@ -314,10 +327,10 @@ where
     }
 
     /// Allocate a new thread-safe GC-managed object in the specified region.
-    pub fn new_in(t: T, region: crate::generation::RegionId) -> Gc<T> {
+    pub fn new_in(t: T, region: SyncRegionId) -> Gc<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        unsafe { (*GLOBAL_GC).create_gc(t, region) }
+        unsafe { (*GLOBAL_GC).create_gc(t, region.0) }
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -333,13 +346,10 @@ where
     }
 
     /// Fallible allocation in a specified region.
-    pub fn try_new_in(
-        t: T,
-        region: crate::generation::RegionId,
-    ) -> Result<Gc<T>, crate::gc::GcAllocError> {
+    pub fn try_new_in(t: T, region: SyncRegionId) -> Result<Gc<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        unsafe { (*GLOBAL_GC).try_create_gc(t, region) }
+        unsafe { (*GLOBAL_GC).try_create_gc(t, region.0) }
     }
 }
 
@@ -580,10 +590,10 @@ where
     }
 
     /// Allocate a new thread-safe GC-managed interior-mutable cell in the specified region.
-    pub fn new_in(t: T, region: crate::generation::RegionId) -> GcRefCell<T> {
+    pub fn new_in(t: T, region: SyncRegionId) -> GcRefCell<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        unsafe { (*GLOBAL_GC).create_gc_cell(t, region) }
+        unsafe { (*GLOBAL_GC).create_gc_cell(t, region.0) }
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -598,13 +608,10 @@ where
     }
 
     /// Fallible allocation in a specified region.
-    pub fn try_new_in(
-        t: T,
-        region: crate::generation::RegionId,
-    ) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
+    pub fn try_new_in(t: T, region: SyncRegionId) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        unsafe { (*GLOBAL_GC).try_create_gc_cell(t, region) }
+        unsafe { (*GLOBAL_GC).try_create_gc_cell(t, region.0) }
     }
 
     /// Mutable borrow with write barrier.
@@ -1365,13 +1372,13 @@ impl GlobalGarbageCollector {
     }
 
     /// Create a new region. Future allocations go into this region.
-    pub fn new_region(&self) -> crate::generation::RegionId {
-        self.core.new_region()
+    pub fn new_region(&self) -> SyncRegionId {
+        SyncRegionId(self.core.new_region())
     }
 
     /// Get the current allocation region.
-    pub fn current_region(&self) -> crate::generation::RegionId {
-        self.core.current_region()
+    pub fn current_region(&self) -> SyncRegionId {
+        SyncRegionId(self.core.current_region())
     }
 
     /// Collect only objects in the specified region.
@@ -1380,10 +1387,10 @@ impl GlobalGarbageCollector {
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub unsafe fn collect_region(
         &self,
-        region: crate::generation::RegionId,
+        region: SyncRegionId,
     ) -> crate::generation::CollectionStats {
         // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
-        unsafe { self.core.collect_region(region) }
+        unsafe { self.core.collect_region(region.0) }
     }
 
     /// Return a snapshot of current GC diagnostics.
@@ -1412,6 +1419,36 @@ impl GlobalGarbageCollector {
     /// Remove the collection callback.
     pub fn clear_on_collection(&self) {
         self.core.clear_on_collection();
+    }
+}
+
+// ---- SyncRegionId helpers for global (sync) GC ----
+
+impl SyncRegionId {
+    /// Allocate a new `sync::Gc<T>` in this region (global collector).
+    pub fn gc<T: 'static + Sized + Trace>(self, t: T) -> Gc<T> {
+        Gc::new_in(t, self)
+    }
+
+    /// Fallible `sync::Gc<T>` allocation in this region (global collector).
+    pub fn try_gc<T: 'static + Sized + Trace>(
+        self,
+        t: T,
+    ) -> Result<Gc<T>, crate::gc::GcAllocError> {
+        Gc::try_new_in(t, self)
+    }
+
+    /// Allocate a new `sync::GcRefCell<T>` in this region (global collector).
+    pub fn gc_cell<T: 'static + Sized + Trace>(self, t: T) -> GcRefCell<T> {
+        GcRefCell::new_in(t, self)
+    }
+
+    /// Fallible `sync::GcRefCell<T>` allocation in this region (global collector).
+    pub fn try_gc_cell<T: 'static + Sized + Trace>(
+        self,
+        t: T,
+    ) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
+        GcRefCell::try_new_in(t, self)
     }
 }
 
@@ -2051,7 +2088,7 @@ mod tests {
     fn sync_region_assignment() {
         let (_guard, _) = setup();
         let _obj = Gc::new(1);
-        let region = (*GLOBAL_GC).current_region();
+        let region = (*GLOBAL_GC).core.current_region();
         let gc_maps = (*GLOBAL_GC)
             .core
             .gc_maps

@@ -2,7 +2,7 @@
 /// Objects are assigned to a region on allocation. Individual regions can be
 /// collected independently, reducing pause times by limiting the scope of each collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RegionId(pub u32);
+pub struct RegionId(pub(crate) u32);
 
 /// Generational tier for the GC's generational collection strategy.
 /// Objects start in Gen0 (nursery) and are promoted to higher generations

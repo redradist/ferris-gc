@@ -13,6 +13,19 @@ use std::sync::{Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Type-safe region identifier for the **thread-local** garbage collector.
+/// Returned by [`LocalGarbageCollector::new_region`]. Cannot be used with
+/// the global (`sync`) GC — the compiler will reject the mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocalRegionId(RegionId);
+
+impl LocalRegionId {
+    /// Return the raw numeric id (for logging / diagnostics).
+    pub fn id(self) -> u32 {
+        (self.0).0
+    }
+}
+
 use crate::basic_gc_strategy::basic_gc_strategy_start;
 
 pub mod sync;
@@ -397,7 +410,7 @@ where
     }
 
     /// Allocate a new GC-managed object in the specified region.
-    pub fn new_in(t: T, region: RegionId) -> Gc<T> {
+    pub fn new_in(t: T, region: LocalRegionId) -> Gc<T> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
@@ -405,7 +418,7 @@ where
                 strategy.start();
             }
         });
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc(t, region) })
+        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc(t, region.0) })
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -427,7 +440,7 @@ where
     }
 
     /// Fallible allocation in a specified region.
-    pub fn try_new_in(t: T, region: RegionId) -> Result<Gc<T>, GcAllocError> {
+    pub fn try_new_in(t: T, region: LocalRegionId) -> Result<Gc<T>, GcAllocError> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
@@ -435,7 +448,7 @@ where
                 strategy.start();
             }
         });
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc(t, region) })
+        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc(t, region.0) })
     }
 }
 
@@ -688,7 +701,7 @@ where
     }
 
     /// Allocate a new GC-managed interior-mutable cell in the specified region.
-    pub fn new_in(t: T, region: RegionId) -> GcRefCell<T> {
+    pub fn new_in(t: T, region: LocalRegionId) -> GcRefCell<T> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
@@ -696,7 +709,7 @@ where
                 strategy.start();
             }
         });
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc_cell(t, region) })
+        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc_cell(t, region.0) })
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -718,7 +731,7 @@ where
     }
 
     /// Fallible allocation in a specified region.
-    pub fn try_new_in(t: T, region: RegionId) -> Result<GcRefCell<T>, GcAllocError> {
+    pub fn try_new_in(t: T, region: LocalRegionId) -> Result<GcRefCell<T>, GcAllocError> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
@@ -726,7 +739,7 @@ where
                 strategy.start();
             }
         });
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc_cell(t, region) })
+        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc_cell(t, region.0) })
     }
 
     /// Mutable borrow with write barrier.
@@ -2868,22 +2881,22 @@ impl LocalGarbageCollector {
     }
 
     /// Create a new region. Future allocations go into this region.
-    pub fn new_region(&self) -> RegionId {
-        self.core.new_region()
+    pub fn new_region(&self) -> LocalRegionId {
+        LocalRegionId(self.core.new_region())
     }
 
     /// Get the current allocation region.
-    pub fn current_region(&self) -> RegionId {
-        self.core.current_region()
+    pub fn current_region(&self) -> LocalRegionId {
+        LocalRegionId(self.core.current_region())
     }
 
     /// Collect only objects in the specified region.
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_region(&self, region: RegionId) -> CollectionStats {
+    pub unsafe fn collect_region(&self, region: LocalRegionId) -> CollectionStats {
         // SAFETY: Caller upholds the safety contract; delegates to core.collect_region().
-        unsafe { self.core.collect_region(region) }
+        unsafe { self.core.collect_region(region.0) }
     }
 
     /// Return a snapshot of current GC diagnostics.
@@ -2910,6 +2923,33 @@ impl LocalGarbageCollector {
     /// Remove the collection callback.
     pub fn clear_on_collection(&self) {
         self.core.clear_on_collection();
+    }
+}
+
+// ---- LocalRegionId helpers for thread-local GC ----
+
+impl LocalRegionId {
+    /// Allocate a new `Gc<T>` in this region (thread-local collector).
+    pub fn gc<T: 'static + Sized + Trace>(self, t: T) -> Gc<T> {
+        Gc::new_in(t, self)
+    }
+
+    /// Fallible `Gc<T>` allocation in this region (thread-local collector).
+    pub fn try_gc<T: 'static + Sized + Trace>(self, t: T) -> Result<Gc<T>, GcAllocError> {
+        Gc::try_new_in(t, self)
+    }
+
+    /// Allocate a new `GcRefCell<T>` in this region (thread-local collector).
+    pub fn gc_cell<T: 'static + Sized + Trace>(self, t: T) -> GcRefCell<T> {
+        GcRefCell::new_in(t, self)
+    }
+
+    /// Fallible `GcRefCell<T>` allocation in this region (thread-local collector).
+    pub fn try_gc_cell<T: 'static + Sized + Trace>(
+        self,
+        t: T,
+    ) -> Result<GcRefCell<T>, GcAllocError> {
+        GcRefCell::try_new_in(t, self)
     }
 }
 
