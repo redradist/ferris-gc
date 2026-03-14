@@ -307,7 +307,17 @@ where
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-        unsafe { (*GLOBAL_GC).create_gc(t) }
+        unsafe {
+            let region = GLOBAL_GC.core.current_region();
+            (*GLOBAL_GC).create_gc(t, region)
+        }
+    }
+
+    /// Allocate a new thread-safe GC-managed object in the specified region.
+    pub fn new_in(t: T, region: crate::generation::RegionId) -> Gc<T> {
+        basic_gc_strategy_start();
+        GLOBAL_GC_STRATEGY.ensure_started();
+        unsafe { (*GLOBAL_GC).create_gc(t, region) }
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -316,7 +326,20 @@ where
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-        unsafe { (*GLOBAL_GC).try_create_gc(t) }
+        unsafe {
+            let region = GLOBAL_GC.core.current_region();
+            (*GLOBAL_GC).try_create_gc(t, region)
+        }
+    }
+
+    /// Fallible allocation in a specified region.
+    pub fn try_new_in(
+        t: T,
+        region: crate::generation::RegionId,
+    ) -> Result<Gc<T>, crate::gc::GcAllocError> {
+        basic_gc_strategy_start();
+        GLOBAL_GC_STRATEGY.ensure_started();
+        unsafe { (*GLOBAL_GC).try_create_gc(t, region) }
     }
 }
 
@@ -550,8 +573,17 @@ where
     pub fn new(t: T) -> GcRefCell<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-        unsafe { (*GLOBAL_GC).create_gc_cell(t) }
+        unsafe {
+            let region = GLOBAL_GC.core.current_region();
+            (*GLOBAL_GC).create_gc_cell(t, region)
+        }
+    }
+
+    /// Allocate a new thread-safe GC-managed interior-mutable cell in the specified region.
+    pub fn new_in(t: T, region: crate::generation::RegionId) -> GcRefCell<T> {
+        basic_gc_strategy_start();
+        GLOBAL_GC_STRATEGY.ensure_started();
+        unsafe { (*GLOBAL_GC).create_gc_cell(t, region) }
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -559,8 +591,20 @@ where
     pub fn try_new(t: T) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
-        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-        unsafe { (*GLOBAL_GC).try_create_gc_cell(t) }
+        unsafe {
+            let region = GLOBAL_GC.core.current_region();
+            (*GLOBAL_GC).try_create_gc_cell(t, region)
+        }
+    }
+
+    /// Fallible allocation in a specified region.
+    pub fn try_new_in(
+        t: T,
+        region: crate::generation::RegionId,
+    ) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
+        basic_gc_strategy_start();
+        GLOBAL_GC_STRATEGY.ensure_started();
+        unsafe { (*GLOBAL_GC).try_create_gc_cell(t, region) }
     }
 
     /// Mutable borrow with write barrier.
@@ -764,7 +808,7 @@ impl GlobalGarbageCollector {
         }
     }
 
-    unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
+    unsafe fn create_gc<T>(&self, t: T, region: crate::generation::RegionId) -> Gc<T>
     where
         T: Sized + Trace,
     {
@@ -799,7 +843,7 @@ impl GlobalGarbageCollector {
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
-                region: self.core.current_region(),
+                region,
             });
             gc_maps
                 .ptr_to_object
@@ -868,7 +912,7 @@ impl GlobalGarbageCollector {
         }
     }
 
-    unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T>
+    unsafe fn create_gc_cell<T>(&self, t: T, region: crate::generation::RegionId) -> GcRefCell<T>
     where
         T: Sized + Trace,
     {
@@ -906,7 +950,7 @@ impl GlobalGarbageCollector {
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
-                region: self.core.current_region(),
+                region,
             });
             gc_maps
                 .ptr_to_object
@@ -980,7 +1024,11 @@ impl GlobalGarbageCollector {
         }
     }
 
-    unsafe fn try_create_gc<T>(&self, t: T) -> Result<Gc<T>, crate::gc::GcAllocError>
+    unsafe fn try_create_gc<T>(
+        &self,
+        t: T,
+        region: crate::generation::RegionId,
+    ) -> Result<Gc<T>, crate::gc::GcAllocError>
     where
         T: Sized + Trace,
     {
@@ -1024,7 +1072,7 @@ impl GlobalGarbageCollector {
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
-                region: self.core.current_region(),
+                region,
             });
             gc_maps
                 .ptr_to_object
@@ -1054,7 +1102,11 @@ impl GlobalGarbageCollector {
         }
     }
 
-    unsafe fn try_create_gc_cell<T>(&self, t: T) -> Result<GcRefCell<T>, crate::gc::GcAllocError>
+    unsafe fn try_create_gc_cell<T>(
+        &self,
+        t: T,
+        region: crate::generation::RegionId,
+    ) -> Result<GcRefCell<T>, crate::gc::GcAllocError>
     where
         T: Sized + Trace,
     {
@@ -1101,7 +1153,7 @@ impl GlobalGarbageCollector {
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
-                region: self.core.current_region(),
+                region,
             });
             gc_maps
                 .ptr_to_object

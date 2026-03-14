@@ -390,7 +390,22 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc(t) })
+        LOCAL_GC.with(move |gc| unsafe {
+            let region = gc.borrow().core.current_region();
+            gc.borrow_mut().create_gc(t, region)
+        })
+    }
+
+    /// Allocate a new GC-managed object in the specified region.
+    pub fn new_in(t: T, region: RegionId) -> Gc<T> {
+        basic_gc_strategy_start();
+        LOCAL_GC_STRATEGY.with(|strategy| {
+            if !strategy.borrow().is_active() {
+                let strategy = unsafe { &mut *strategy.as_ptr() };
+                strategy.start();
+            }
+        });
+        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc(t, region) })
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -405,7 +420,22 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc(t) })
+        LOCAL_GC.with(move |gc| unsafe {
+            let region = gc.borrow().core.current_region();
+            gc.borrow_mut().try_create_gc(t, region)
+        })
+    }
+
+    /// Fallible allocation in a specified region.
+    pub fn try_new_in(t: T, region: RegionId) -> Result<Gc<T>, GcAllocError> {
+        basic_gc_strategy_start();
+        LOCAL_GC_STRATEGY.with(|strategy| {
+            if !strategy.borrow().is_active() {
+                let strategy = unsafe { &mut *strategy.as_ptr() };
+                strategy.start();
+            }
+        });
+        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc(t, region) })
     }
 }
 
@@ -651,7 +681,22 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc_cell(t) })
+        LOCAL_GC.with(move |gc| unsafe {
+            let region = gc.borrow().core.current_region();
+            gc.borrow_mut().create_gc_cell(t, region)
+        })
+    }
+
+    /// Allocate a new GC-managed interior-mutable cell in the specified region.
+    pub fn new_in(t: T, region: RegionId) -> GcRefCell<T> {
+        basic_gc_strategy_start();
+        LOCAL_GC_STRATEGY.with(|strategy| {
+            if !strategy.borrow().is_active() {
+                let strategy = unsafe { &mut *strategy.as_ptr() };
+                strategy.start();
+            }
+        });
+        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc_cell(t, region) })
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -666,7 +711,22 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc_cell(t) })
+        LOCAL_GC.with(move |gc| unsafe {
+            let region = gc.borrow().core.current_region();
+            gc.borrow_mut().try_create_gc_cell(t, region)
+        })
+    }
+
+    /// Fallible allocation in a specified region.
+    pub fn try_new_in(t: T, region: RegionId) -> Result<GcRefCell<T>, GcAllocError> {
+        basic_gc_strategy_start();
+        LOCAL_GC_STRATEGY.with(|strategy| {
+            if !strategy.borrow().is_active() {
+                let strategy = unsafe { &mut *strategy.as_ptr() };
+                strategy.start();
+            }
+        });
+        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc_cell(t, region) })
     }
 
     /// Mutable borrow with write barrier.
@@ -2250,7 +2310,7 @@ impl LocalGarbageCollector {
         }
     }
 
-    unsafe fn create_gc<T>(&self, t: T) -> Gc<T>
+    unsafe fn create_gc<T>(&self, t: T, region: RegionId) -> Gc<T>
     where
         T: Sized + Trace,
     {
@@ -2284,7 +2344,7 @@ impl LocalGarbageCollector {
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
-                region: self.core.current_region(),
+                region,
             });
             gc_maps
                 .ptr_to_object
@@ -2352,7 +2412,7 @@ impl LocalGarbageCollector {
         }
     }
 
-    unsafe fn create_gc_cell<T>(&self, t: T) -> GcRefCell<T>
+    unsafe fn create_gc_cell<T>(&self, t: T, region: RegionId) -> GcRefCell<T>
     where
         T: Sized + Trace,
     {
@@ -2389,7 +2449,7 @@ impl LocalGarbageCollector {
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
-                region: self.core.current_region(),
+                region,
             });
             gc_maps
                 .ptr_to_object
@@ -2464,7 +2524,7 @@ impl LocalGarbageCollector {
     }
 
     /// Fallible version of `create_gc`. Returns `Err(GcAllocError)` on OOM.
-    unsafe fn try_create_gc<T>(&self, t: T) -> Result<Gc<T>, GcAllocError>
+    unsafe fn try_create_gc<T>(&self, t: T, region: RegionId) -> Result<Gc<T>, GcAllocError>
     where
         T: Sized + Trace,
     {
@@ -2506,7 +2566,7 @@ impl LocalGarbageCollector {
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
-                region: self.core.current_region(),
+                region,
             });
             gc_maps
                 .ptr_to_object
@@ -2539,7 +2599,11 @@ impl LocalGarbageCollector {
     }
 
     /// Fallible version of `create_gc_cell`. Returns `Err(GcAllocError)` on OOM.
-    unsafe fn try_create_gc_cell<T>(&self, t: T) -> Result<GcRefCell<T>, GcAllocError>
+    unsafe fn try_create_gc_cell<T>(
+        &self,
+        t: T,
+        region: RegionId,
+    ) -> Result<GcRefCell<T>, GcAllocError>
     where
         T: Sized + Trace,
     {
@@ -2584,7 +2648,7 @@ impl LocalGarbageCollector {
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
-                region: self.core.current_region(),
+                region,
             });
             gc_maps
                 .ptr_to_object
