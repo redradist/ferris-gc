@@ -135,6 +135,10 @@ Internally uses slot-map arenas (`SlotMap<ObjectId, ObjectEntry>`) for O(1) inse
 
 With `--no-default-features`, only core traits (`Trace`, `Finalize`) and generation types are exported (`no_std` compatible).
 
+## MSRV
+
+The minimum supported Rust version is **1.85.0** (edition 2024).
+
 ## Examples
 
 ```bash

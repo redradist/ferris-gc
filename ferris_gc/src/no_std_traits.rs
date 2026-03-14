@@ -17,6 +17,7 @@ pub trait Trace: Finalize {
     fn reset(&self);
     fn is_traceable(&self) -> bool;
     fn trace_children(&self, _children: &mut Vec<*const dyn Trace>) {}
+    fn clear_trace(&self) {}
 }
 
 /// Destructor callback invoked by the collector before deallocation.

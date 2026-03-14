@@ -5,9 +5,10 @@ authors = ["redradist, redradist@gmail.com"]
 description = "Flexible implementation of garbage collector for Rust"
 repository = "https://github.com/redradist/ferris-gc"
 readme = "../README.md"
-license = "Apache-2.0/MIT"
+license = "Apache-2.0 OR MIT"
 keywords = ["garbage", "memory"]
 edition = "2024"
+rust-version = "1.85.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

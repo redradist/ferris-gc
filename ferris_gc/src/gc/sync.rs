@@ -106,6 +106,10 @@ where
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
         self.t.trace_children(children);
     }
+
+    fn clear_trace(&self) {
+        self.info.root_ref_count.store(0, Ordering::Release);
+    }
 }
 
 impl<T> Trace for RefCell<GcPtr<T>>
@@ -148,6 +152,13 @@ where
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
         self.borrow().t.trace_children(children);
+    }
+
+    fn clear_trace(&self) {
+        self.borrow()
+            .info
+            .root_ref_count
+            .store(0, Ordering::Release);
     }
 }
 

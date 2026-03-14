@@ -13,7 +13,7 @@ use std::sync::{Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::basic_gc_strategy::{BASIC_STRATEGY_LOCAL_GCS, basic_gc_strategy_start};
+use crate::basic_gc_strategy::basic_gc_strategy_start;
 
 pub mod sync;
 
@@ -61,6 +61,9 @@ pub trait Trace: Finalize {
     /// Non-recursive child discovery for incremental tri-color marking.
     /// Pushes immediate GC-managed children (object pointers) onto `children`.
     fn trace_children(&self, _children: &mut Vec<*const dyn Trace>) {}
+    /// Unconditionally clear mark-phase state (root_ref_count) without cascading.
+    /// Used after sweep to reset surviving objects for the next collection cycle.
+    fn clear_trace(&self) {}
 }
 
 /// Destructor callback invoked by the collector before an object is deallocated.
@@ -174,6 +177,10 @@ where
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
         self.t.trace_children(children);
     }
+
+    fn clear_trace(&self) {
+        self.info.root_ref_count.store(0, Ordering::Release);
+    }
 }
 
 impl<T> Trace for RefCell<GcPtr<T>>
@@ -216,6 +223,13 @@ where
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
         self.borrow().t.trace_children(children);
+    }
+
+    fn clear_trace(&self) {
+        self.borrow()
+            .info
+            .root_ref_count
+            .store(0, Ordering::Release);
     }
 }
 
@@ -407,7 +421,11 @@ where
         let tracer_id = self.tracer_id;
         let object_id = self.object_id;
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
-            gc.borrow_mut().remove_tracer(tracer_id, object_id);
+            // Use try_borrow_mut to avoid panic from re-entrant drops:
+            // RC hybrid dealloc may drop inner Gc fields whose drop also calls remove_tracer.
+            if let Ok(gc) = gc.try_borrow_mut() {
+                gc.remove_tracer(tracer_id, object_id);
+            }
         });
     }
 }
@@ -581,7 +599,11 @@ where
         let tracer_id = self.tracer_id;
         let object_id = self.object_id;
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
-            gc.borrow_mut().remove_tracer(tracer_id, object_id);
+            // Use try_borrow_mut to avoid panic from re-entrant drops:
+            // RC hybrid dealloc may drop inner Gc fields whose drop also calls remove_tracer.
+            if let Ok(gc) = gc.try_borrow_mut() {
+                gc.remove_tracer(tracer_id, object_id);
+            }
         });
     }
 }
@@ -1265,21 +1287,12 @@ impl GarbageCollector {
                     .collect();
                 stats.objects_collected = collected_objects.len();
 
-                // Reset ALL remaining tracers (not just in-scope)
-                for entry in gc_maps.tracers.values() {
-                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    let tracer = &(*entry.tracer_ptr);
-                    tracer.reset();
-                }
-
-                // Reset remembered set entries that were traced in partial collections
-                if max_gen < Generation::Gen2 {
-                    for &obj_id in remembered_set.iter() {
-                        if let Some(entry) = gc_maps.objects.get(obj_id) {
-                            // SAFETY: Object pointer is valid while gc_maps lock is held.
-                            (&*entry.ptr).reset();
-                        }
-                    }
+                // Unconditionally clear mark state for ALL objects.
+                // This replaces the old cascade-based reset which failed on cycles
+                // (root_ref_count leaked due to trace/reset guard asymmetry).
+                for entry in gc_maps.objects.values() {
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
+                    (&*entry.ptr).clear_trace();
                 }
 
                 // Remove collected objects
@@ -2060,16 +2073,10 @@ impl GarbageCollector {
                     .collect();
                 stats.objects_collected = collected_objects.len();
 
-                // Reset ALL tracers
-                for entry in gc_maps.tracers.values() {
-                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    (&*entry.tracer_ptr).reset();
-                }
-                for &obj_id in remembered_set.iter() {
-                    if let Some(entry) = gc_maps.objects.get(obj_id) {
-                        // SAFETY: Object pointer is valid while gc_maps lock is held.
-                        (&*entry.ptr).reset();
-                    }
+                // Unconditionally clear mark state for ALL objects.
+                for entry in gc_maps.objects.values() {
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
+                    (&*entry.ptr).clear_trace();
                 }
 
                 // Remove collected objects
@@ -2126,7 +2133,7 @@ impl GarbageCollector {
 /// Allocation threshold for triggering automatic Gen0 collection on the owning thread.
 /// Local GCs collect on allocation (not from a background thread) to avoid data races
 /// on non-atomic Cell/RefCell internals.
-const LOCAL_GC_ALLOC_THRESHOLD: usize = 100;
+const LOCAL_GC_ALLOC_THRESHOLD: usize = 1000;
 
 pub struct LocalGarbageCollector {
     pub(crate) core: GarbageCollector,
