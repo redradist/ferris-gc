@@ -106,6 +106,10 @@ pub struct CollectionStats {
     pub objects_promoted: usize,
     /// Number of tracer handles deallocated (pointing to collected objects).
     pub tracers_collected: usize,
+    /// Total bytes reclaimed by this collection.
+    pub bytes_freed: usize,
+    /// Wall-clock duration of this collection cycle.
+    pub duration: core::time::Duration,
 }
 
 /// Snapshot of GC diagnostics.
@@ -127,4 +131,6 @@ pub struct GcStats {
     pub last_collection: Option<CollectionStats>,
     /// Allocations since last Gen0 collection.
     pub allocation_count: usize,
+    /// High-water mark of heap usage in bytes since GC creation.
+    pub peak_heap_size: usize,
 }

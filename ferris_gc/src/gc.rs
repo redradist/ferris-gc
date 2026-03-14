@@ -952,6 +952,13 @@ pub(crate) struct GarbageCollector {
     pub(crate) next_region_id: AtomicU32,
     /// Configurable promotion thresholds per generation.
     pub(crate) promotion_config: Mutex<PromotionConfig>,
+    /// Current total heap size in bytes (tracked atomically).
+    pub(crate) current_heap_size: AtomicUsize,
+    /// High-water mark of heap usage in bytes.
+    pub(crate) peak_heap_size: AtomicUsize,
+    /// Optional callback invoked after each collection cycle.
+    #[allow(clippy::type_complexity)]
+    pub(crate) on_collection: Mutex<Option<Box<dyn Fn(&CollectionStats) + Send + Sync>>>,
 }
 
 // SAFETY: All mutable state in GarbageCollector is behind Mutex or atomic types,
@@ -977,6 +984,9 @@ impl GarbageCollector {
             current_region: AtomicU32::new(0),
             next_region_id: AtomicU32::new(1),
             promotion_config: Mutex::new(PromotionConfig::default()),
+            current_heap_size: AtomicUsize::new(0),
+            peak_heap_size: AtomicUsize::new(0),
+            on_collection: Mutex::new(None),
         }
     }
 
@@ -1024,7 +1034,38 @@ impl GarbageCollector {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
             allocation_count: self.allocation_count.load(Ordering::Relaxed),
+            peak_heap_size: self.peak_heap_size.load(Ordering::Relaxed),
         }
+    }
+
+    /// Register a callback invoked after each collection cycle.
+    pub fn set_on_collection(&self, callback: impl Fn(&CollectionStats) + Send + Sync + 'static) {
+        *self.on_collection.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(callback));
+    }
+
+    /// Remove the collection callback.
+    pub fn clear_on_collection(&self) {
+        *self.on_collection.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Fire the on_collection callback (panic-safe).
+    fn fire_on_collection(&self, stats: &CollectionStats) {
+        let guard = self.on_collection.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cb) = guard.as_ref() {
+            let cb: &(dyn Fn(&CollectionStats) + Send + Sync) = cb.as_ref();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(stats)));
+        }
+    }
+
+    /// Track heap growth after an allocation.
+    fn track_alloc(&self, size: usize) {
+        let new_size = self.current_heap_size.fetch_add(size, Ordering::Relaxed) + size;
+        self.peak_heap_size.fetch_max(new_size, Ordering::Relaxed);
+    }
+
+    /// Track heap shrinkage after a deallocation.
+    fn track_dealloc(&self, size: usize) {
+        self.current_heap_size.fetch_sub(size, Ordering::Relaxed);
     }
 
     pub(crate) unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout))
@@ -1175,6 +1216,7 @@ impl GarbageCollector {
 
             // RC hybrid: dealloc object outside lock scope (prevents re-entrant deadlock)
             if let Some(obj_entry) = object_dealloc {
+                self.track_dealloc(obj_entry.layout.size());
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // SAFETY: finalize_fn and mem are valid; wrapped in catch_unwind for panic safety.
                     (obj_entry.finalize_fn)(obj_entry.mem);
@@ -1204,12 +1246,15 @@ impl GarbageCollector {
     /// Surviving objects in gens < max_gen may be promoted.
     pub unsafe fn collect_generation(&self, max_gen: Generation) -> CollectionStats {
         unsafe {
+            let start = std::time::Instant::now();
             let mut stats = CollectionStats {
                 generation: max_gen,
                 objects_scanned: 0,
                 objects_collected: 0,
                 objects_promoted: 0,
                 tracers_collected: 0,
+                bytes_freed: 0,
+                duration: std::time::Duration::ZERO,
             };
 
             let (tracer_deallocs, object_deallocs) = {
@@ -1308,6 +1353,7 @@ impl GarbageCollector {
                     if let Some(entry) = gc_maps.objects.remove(obj_id) {
                         gc_maps.ptr_to_object.remove(&entry.ptr.get_thin_ptr());
                         remembered_set.remove(&obj_id);
+                        stats.bytes_freed += entry.layout.size();
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
@@ -1375,12 +1421,17 @@ impl GarbageCollector {
                 dealloc(mem, layout);
             }
 
+            // Track heap shrinkage
+            self.track_dealloc(stats.bytes_freed);
+
             // Record diagnostics
+            stats.duration = start.elapsed();
             self.total_collections.fetch_add(1, Ordering::Relaxed);
             *self
                 .last_collection
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(stats);
+            self.fire_on_collection(&stats);
 
             stats
         }
@@ -1537,8 +1588,9 @@ impl GarbageCollector {
     /// Short STW.
     pub unsafe fn finish_collection(&self) -> CollectionStats {
         unsafe {
+            let start = std::time::Instant::now();
             let max_gen;
-            let (tracer_deallocs, object_deallocs, stats) = {
+            let (tracer_deallocs, object_deallocs, mut stats) = {
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
                 let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
                 let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
@@ -1609,6 +1661,8 @@ impl GarbageCollector {
                     objects_collected: 0,
                     objects_promoted: 0,
                     tracers_collected: 0,
+                    bytes_freed: 0,
+                    duration: std::time::Duration::ZERO,
                 };
 
                 let white_objects: HashSet<ObjectId> = incr
@@ -1641,6 +1695,7 @@ impl GarbageCollector {
                     if let Some(entry) = gc_maps.objects.remove(obj_id) {
                         gc_maps.ptr_to_object.remove(&entry.ptr.get_thin_ptr());
                         remembered_set.remove(&obj_id);
+                        stats.bytes_freed += entry.layout.size();
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
@@ -1714,12 +1769,17 @@ impl GarbageCollector {
                 dealloc(mem, layout);
             }
 
+            // Track heap shrinkage
+            self.track_dealloc(stats.bytes_freed);
+
             // Record diagnostics
+            stats.duration = start.elapsed();
             self.total_collections.fetch_add(1, Ordering::Relaxed);
             *self
                 .last_collection
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(stats);
+            self.fire_on_collection(&stats);
 
             stats
         }
@@ -2002,12 +2062,15 @@ impl GarbageCollector {
     /// Traces from all roots (needed for correctness), but sweeps only objects in the target region.
     pub unsafe fn collect_region(&self, region: RegionId) -> CollectionStats {
         unsafe {
+            let start = std::time::Instant::now();
             let mut stats = CollectionStats {
                 generation: Generation::Gen2,
                 objects_scanned: 0,
                 objects_collected: 0,
                 objects_promoted: 0,
                 tracers_collected: 0,
+                bytes_freed: 0,
+                duration: std::time::Duration::ZERO,
             };
 
             let (tracer_deallocs, object_deallocs) = {
@@ -2098,6 +2161,7 @@ impl GarbageCollector {
                     if let Some(entry) = gc_maps.objects.remove(obj_id) {
                         gc_maps.ptr_to_object.remove(&entry.ptr.get_thin_ptr());
                         remembered_set.remove(&obj_id);
+                        stats.bytes_freed += entry.layout.size();
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
@@ -2129,11 +2193,16 @@ impl GarbageCollector {
                 dealloc(mem, layout);
             }
 
+            // Track heap shrinkage
+            self.track_dealloc(stats.bytes_freed);
+
+            stats.duration = start.elapsed();
             self.total_collections.fetch_add(1, Ordering::Relaxed);
             *self
                 .last_collection
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(stats);
+            self.fire_on_collection(&stats);
             stats
         }
     }
@@ -2220,6 +2289,7 @@ impl LocalGarbageCollector {
             gc_maps
                 .ptr_to_object
                 .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
@@ -2324,6 +2394,7 @@ impl LocalGarbageCollector {
             gc_maps
                 .ptr_to_object
                 .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
@@ -2440,6 +2511,7 @@ impl LocalGarbageCollector {
             gc_maps
                 .ptr_to_object
                 .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
@@ -2517,6 +2589,7 @@ impl LocalGarbageCollector {
             gc_maps
                 .ptr_to_object
                 .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
@@ -2763,6 +2836,16 @@ impl LocalGarbageCollector {
     /// Get the current promotion config.
     pub fn promotion_config(&self) -> PromotionConfig {
         self.core.promotion_config()
+    }
+
+    /// Register a callback invoked after each collection cycle.
+    pub fn set_on_collection(&self, callback: impl Fn(&CollectionStats) + Send + Sync + 'static) {
+        self.core.set_on_collection(callback);
+    }
+
+    /// Remove the collection callback.
+    pub fn clear_on_collection(&self) {
+        self.core.clear_on_collection();
     }
 }
 
@@ -4804,5 +4887,115 @@ mod tests {
             assert_eq!(objs_before, objs_after, "no objects should be collected");
         });
         drop(v);
+    }
+
+    #[test]
+    fn stats_tracks_collection_duration() {
+        clean_gc_state();
+        let _obj = Gc::new(42);
+        drop(_obj);
+        LOCAL_GC.with(|gc| {
+            let gc_ref = gc.borrow();
+            unsafe {
+                gc_ref.core.collect();
+            }
+            let stats = gc_ref.stats();
+            let last = stats
+                .last_collection
+                .expect("should have a last collection");
+            assert!(
+                last.duration > std::time::Duration::ZERO,
+                "duration should be > 0"
+            );
+        });
+    }
+
+    #[test]
+    fn stats_tracks_bytes_freed() {
+        clean_gc_state();
+        // Create two objects forming a cycle so RC hybrid does NOT eagerly free them.
+        // Only mark-sweep collection can reclaim cycles.
+        let a = Gc::new(GcRefCell::new(
+            Option::<Gc<GcRefCell<Option<Gc<GcRefCell<Option<i32>>>>>>>::None,
+        ));
+        let b = Gc::new(GcRefCell::new(Some(a.clone())));
+        // We just need objects that survive past drop for the collector to find them.
+        // Instead, use a simpler approach: just allocate, drop, and collect in separate scopes.
+        drop(a);
+        drop(b);
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow().core.collect();
+        });
+        LOCAL_GC.with(|gc| {
+            let stats = gc.borrow().stats();
+            let last = stats
+                .last_collection
+                .expect("should have a last collection");
+            assert!(last.bytes_freed > 0, "bytes_freed should be > 0");
+        });
+    }
+
+    #[test]
+    fn stats_tracks_peak_heap_size() {
+        clean_gc_state();
+        let _obj1 = Gc::new(1_i64);
+        let _obj2 = Gc::new(2_i64);
+        let peak_with_objects = LOCAL_GC.with(|gc| gc.borrow().stats().peak_heap_size);
+        assert!(peak_with_objects > 0, "peak should be > 0 after alloc");
+        drop(_obj1);
+        drop(_obj2);
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow().core.collect();
+        });
+        let peak_after = LOCAL_GC.with(|gc| gc.borrow().stats().peak_heap_size);
+        assert!(
+            peak_after >= peak_with_objects,
+            "peak should not decrease after collection"
+        );
+    }
+
+    #[test]
+    fn on_collection_callback_fires() {
+        clean_gc_state();
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
+        LOCAL_GC.with(|gc| {
+            gc.borrow().set_on_collection(move |_stats| {
+                called_clone.store(true, std::sync::atomic::Ordering::Release);
+            });
+        });
+        let _obj = Gc::new(42);
+        drop(_obj);
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow().core.collect();
+        });
+        assert!(
+            called.load(std::sync::atomic::Ordering::Acquire),
+            "callback should have been called"
+        );
+        LOCAL_GC.with(|gc| {
+            gc.borrow().clear_on_collection();
+        });
+    }
+
+    #[test]
+    fn on_collection_callback_panic_does_not_break_gc() {
+        clean_gc_state();
+        LOCAL_GC.with(|gc| {
+            gc.borrow().set_on_collection(|_stats| {
+                panic!("intentional panic in callback");
+            });
+        });
+        let _obj = Gc::new(42);
+        drop(_obj);
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow().core.collect();
+        });
+        // GC should still work after panicking callback
+        let stats = LOCAL_GC.with(|gc| gc.borrow().stats());
+        assert!(stats.total_collections > 0);
+        LOCAL_GC.with(|gc| {
+            gc.borrow().clear_on_collection();
+        });
     }
 }

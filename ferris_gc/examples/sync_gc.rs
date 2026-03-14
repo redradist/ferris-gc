@@ -46,10 +46,7 @@ fn main() {
         gen0_threshold: 3, // survive 3 Gen0 collections → promote to Gen1
         gen1_threshold: 5, // survive 5 Gen1 collections → promote to Gen2
     });
-    println!(
-        "Promotion config: {:?}",
-        sync::GLOBAL_GC.promotion_config()
-    );
+    println!("Promotion config: {:?}", sync::GLOBAL_GC.promotion_config());
 
     // --- Multi-threaded allocation ---
     let data = sync::Gc::new(SharedData { value: 42 });

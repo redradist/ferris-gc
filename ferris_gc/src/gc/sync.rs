@@ -804,6 +804,7 @@ impl GlobalGarbageCollector {
             gc_maps
                 .ptr_to_object
                 .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
@@ -910,6 +911,7 @@ impl GlobalGarbageCollector {
             gc_maps
                 .ptr_to_object
                 .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
@@ -1027,6 +1029,7 @@ impl GlobalGarbageCollector {
             gc_maps
                 .ptr_to_object
                 .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
@@ -1103,6 +1106,7 @@ impl GlobalGarbageCollector {
             gc_maps
                 .ptr_to_object
                 .insert((gc_ptr as *const dyn Trace).get_thin_ptr(), obj_id);
+            self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
@@ -1343,6 +1347,19 @@ impl GlobalGarbageCollector {
     /// Get the current promotion config.
     pub fn promotion_config(&self) -> crate::generation::PromotionConfig {
         self.core.promotion_config()
+    }
+
+    /// Register a callback invoked after each collection cycle.
+    pub fn set_on_collection(
+        &self,
+        callback: impl Fn(&crate::generation::CollectionStats) + Send + Sync + 'static,
+    ) {
+        self.core.set_on_collection(callback);
+    }
+
+    /// Remove the collection callback.
+    pub fn clear_on_collection(&self) {
+        self.core.clear_on_collection();
     }
 }
 
