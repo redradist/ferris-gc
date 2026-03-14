@@ -1,9 +1,11 @@
 [package]
 name = "ferris-gc-proc-macro"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["redradist, redradist@gmail.com"]
-description = "Plugin for ferris-gc"
+description = "Derive macros for ferris-gc: #[derive(Trace, Finalize)] and #[ferris_gc_main]"
+repository = "https://github.com/redradist/ferris-gc"
 license = "Apache-2.0 OR MIT"
+keywords = ["garbage", "gc", "macro"]
 edition = "2024"
 rust-version = "1.85.0"
 

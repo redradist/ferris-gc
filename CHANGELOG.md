@@ -13,7 +13,18 @@
 - **API documentation** — doc comments for all public types, methods, and type aliases.
 - **SAFETY audit** — SAFETY comments on all `unsafe impl` blocks and `unsafe {}` blocks throughout gc.rs and sync.rs.
 
+### Fixed
+- **Cyclic mark-sweep correctness** — `root_ref_count` no longer leaks in cyclic object graphs; replaced cascade-based reset with unconditional `clear_trace()`.
+- **Re-entrant drop panic** — `Gc`/`GcRefCell` drop uses `try_borrow_mut()` to handle nested RC hybrid deallocation gracefully.
+- **Use-after-free** in deallocation ordering — objects now freed before tracers in all collection methods.
+- **Data races** on `Cell`/`RefCell` internals — switched to allocation-triggered collection for thread-local GC (no background thread access).
+- **Stacked Borrows violations** (Miri) — fixed raw pointer provenance, finalizer fat pointer invalidation, and uninitialized memory races.
+- All 102 tests pass under Miri with zero undefined behavior.
+
 ### Changed
+- Minimum supported Rust version: **1.85.0** (edition 2024).
+- License field uses SPDX expression: `Apache-2.0 OR MIT`.
+- `ferris-gc-proc-macro` bumped to 0.2.0.
 - **Breaking:** `ObjectMaps` and `TracerMaps` replaced with unified `GcMaps` (internal API).
 - **Breaking:** `GcInternal<T>` now stores `TracerId` and `ObjectId` instead of raw pointer lookups.
 - **Breaking:** `GarbageCollector` uses single `Mutex<GcMaps>` instead of separate `Mutex<ObjectMaps>` + `RwLock<TracerMaps>`.

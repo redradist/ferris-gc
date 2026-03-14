@@ -53,15 +53,21 @@ impl ThinPtr for *const dyn Trace {
 ///
 /// The easiest way to get a correct implementation is `#[derive(Trace)]`.
 pub trait Trace: Finalize {
+    /// Returns `true` if this handle is a root (stack-owned, not stored inside a GC object).
     fn is_root(&self) -> bool;
+    /// Mark this handle as non-root. Called by the collector during root discovery
+    /// to distinguish stack-owned handles from GC-internal references.
     fn reset_root(&self);
+    /// Mark this object and its children as reachable. Called during the mark phase.
     fn trace(&self);
+    /// Undo the mark set by `trace()`. Called after sweep to prepare for the next cycle.
     fn reset(&self);
+    /// Returns `true` if this object was marked reachable during the current mark phase.
     fn is_traceable(&self) -> bool;
     /// Non-recursive child discovery for incremental tri-color marking.
     /// Pushes immediate GC-managed children (object pointers) onto `children`.
     fn trace_children(&self, _children: &mut Vec<*const dyn Trace>) {}
-    /// Unconditionally clear mark-phase state (root_ref_count) without cascading.
+    /// Unconditionally clear mark-phase state without cascading.
     /// Used after sweep to reset surviving objects for the next collection cycle.
     fn clear_trace(&self) {}
 }
@@ -2135,6 +2141,14 @@ impl GarbageCollector {
 /// on non-atomic Cell/RefCell internals.
 const LOCAL_GC_ALLOC_THRESHOLD: usize = 1000;
 
+/// Thread-local garbage collector.
+///
+/// Each thread gets its own instance via the [`LOCAL_GC`] thread-local.
+/// Provides allocation, collection, and diagnostic methods. All operations
+/// are single-threaded — for cross-thread GC, use [`sync::GlobalGarbageCollector`].
+///
+/// Collection is triggered automatically after every `LOCAL_GC_ALLOC_THRESHOLD`
+/// allocations, or manually via `collect()` / `collect_generation()`.
 pub struct LocalGarbageCollector {
     pub(crate) core: GarbageCollector,
 }
