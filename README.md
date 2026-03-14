@@ -25,7 +25,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ferris-gc = { version = "0.1.5", features = ["proc-macro"] }
+ferris-gc = { version = "0.2.0", features = ["proc-macro"] }
 ```
 
 ### Basic Usage
@@ -75,6 +75,8 @@ fn main() {
 
 ### Incremental Collection with Time Budget
 
+**Thread-local:**
+
 ```rust
 use ferris_gc::{Gc, Generation, LOCAL_GC};
 use std::time::Duration;
@@ -91,7 +93,24 @@ LOCAL_GC.with(|gc| unsafe {
 });
 ```
 
+**Global (thread-safe):**
+
+```rust
+use ferris_gc::{sync, Generation};
+use std::time::Duration;
+
+// Collect with max 1ms pause per mark step
+unsafe {
+    sync::GLOBAL_GC.collect_incremental_timed(
+        Generation::Gen2,
+        Duration::from_millis(1),
+    );
+}
+```
+
 ### Configurable Promotion
+
+**Thread-local:**
 
 ```rust
 use ferris_gc::{PromotionConfig, LOCAL_GC};
@@ -102,6 +121,32 @@ LOCAL_GC.with(|gc| {
         gen1_threshold: 10, // survive 10 Gen1 collections before promotion
     });
 });
+```
+
+**Global (thread-safe):**
+
+```rust
+use ferris_gc::{sync, PromotionConfig};
+
+sync::GLOBAL_GC.set_promotion_config(PromotionConfig {
+    gen0_threshold: 5,
+    gen1_threshold: 10,
+});
+```
+
+### Custom Collection Strategy
+
+```rust
+use ferris_gc::sync;
+
+// Switch global GC to threshold-based strategy
+ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+let (start, stop) = ferris_gc::threshold_global_start(ferris_gc::ThresholdConfig::default());
+sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+
+// Or use the adaptive auto-tuning strategy
+let (start, stop) = ferris_gc::adaptive_global_start(ferris_gc::AdaptiveConfig::default());
+sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
 ```
 
 ## Architecture
