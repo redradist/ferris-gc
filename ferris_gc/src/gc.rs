@@ -329,6 +329,8 @@ where
 {
     internal_ptr: *mut GcInternal<T>,
     ptr: *const GcPtr<T>,
+    tracer_id: TracerId,
+    object_id: ObjectId,
 }
 
 impl<T> Deref for Gc<T>
@@ -402,10 +404,9 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
+        let tracer_id = self.tracer_id;
+        let object_id = self.object_id;
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
-            // SAFETY: internal_ptr is valid for the lifetime of this Gc handle; reading tracer_id/object_id before removal.
-            let tracer_id = (*self.internal_ptr).tracer_id;
-            let object_id = (*self.internal_ptr).object_id;
             gc.borrow_mut().remove_tracer(tracer_id, object_id);
         });
     }
@@ -568,6 +569,8 @@ where
 {
     internal_ptr: *mut GcRefCellInternal<T>,
     ptr: *const RefCell<GcPtr<T>>,
+    tracer_id: TracerId,
+    object_id: ObjectId,
 }
 
 impl<T> Drop for GcRefCell<T>
@@ -575,10 +578,9 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
+        let tracer_id = self.tracer_id;
+        let object_id = self.object_id;
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
-            // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle; reading tracer_id/object_id before removal.
-            let tracer_id = (*self.internal_ptr).tracer_id;
-            let object_id = (*self.internal_ptr).object_id;
             gc.borrow_mut().remove_tracer(tracer_id, object_id);
         });
     }
@@ -843,6 +845,10 @@ impl std::error::Error for GcAllocError {}
 pub(crate) type GcObjMem = *mut u8;
 
 pub(crate) type DropFn = unsafe fn(*mut u8);
+/// Function pointer that calls `finalize()` on the object at the given memory address.
+/// Derives the `&dyn Finalize` reference at call time to avoid Stacked Borrows
+/// provenance issues from storing a pre-computed `*const dyn Finalize`.
+pub(crate) type FinalizeFn = unsafe fn(*mut u8);
 
 /// Per-object metadata stored in a contiguous SlotMap.
 pub(crate) struct ObjectEntry {
@@ -851,7 +857,7 @@ pub(crate) struct ObjectEntry {
     pub(crate) layout: Layout,
     pub(crate) generation: Generation,
     pub(crate) survive_count: u32,
-    pub(crate) finalizer: *const dyn Finalize,
+    pub(crate) finalize_fn: FinalizeFn,
     pub(crate) drop_fn: DropFn,
     pub(crate) weak_alive: Option<Arc<AtomicBool>>,
     /// Number of tracers pointing to this object (RC hybrid).
@@ -1141,8 +1147,8 @@ impl GarbageCollector {
             // RC hybrid: dealloc object outside lock scope (prevents re-entrant deadlock)
             if let Some(obj_entry) = object_dealloc {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
-                    (*obj_entry.finalizer).finalize();
+                    // SAFETY: finalize_fn and mem are valid; wrapped in catch_unwind for panic safety.
+                    (obj_entry.finalize_fn)(obj_entry.mem);
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
@@ -1329,14 +1335,13 @@ impl GarbageCollector {
             }
 
             // Dealloc phase: all locks released
-            for (mem, layout) in tracer_deallocs {
-                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
-                dealloc(mem, layout);
-            }
+            // IMPORTANT: Object drops must happen BEFORE tracer deallocs, because
+            // dropping an object may drop inner Gc<T> handles whose Drop impl
+            // dereferences tracer memory to read tracer_id/object_id.
             for entry in object_deallocs {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
-                    (*entry.finalizer).finalize();
+                    // SAFETY: finalize_fn and mem are valid; wrapped in catch_unwind for panic safety.
+                    (entry.finalize_fn)(entry.mem);
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
@@ -1344,6 +1349,10 @@ impl GarbageCollector {
                 }));
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(entry.mem, entry.layout);
+            }
+            for (mem, layout) in tracer_deallocs {
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
+                dealloc(mem, layout);
             }
 
             // Record diagnostics
@@ -1389,14 +1398,13 @@ impl GarbageCollector {
                 (tracer_deallocs, object_deallocs)
             };
             self.allocation_count.store(0, Ordering::Relaxed);
-            for (mem, layout) in tracer_deallocs {
-                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
-                dealloc(mem, layout);
-            }
+            // IMPORTANT: Object drops must happen BEFORE tracer deallocs, because
+            // dropping an object may drop inner Gc<T> handles whose Drop impl
+            // dereferences tracer memory to read tracer_id/object_id.
             for entry in object_deallocs {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
-                    (*entry.finalizer).finalize();
+                    // SAFETY: finalize_fn and mem are valid; wrapped in catch_unwind for panic safety.
+                    (entry.finalize_fn)(entry.mem);
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
@@ -1404,6 +1412,10 @@ impl GarbageCollector {
                 }));
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(entry.mem, entry.layout);
+            }
+            for (mem, layout) in tracer_deallocs {
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
+                dealloc(mem, layout);
             }
         }
     }
@@ -1658,14 +1670,13 @@ impl GarbageCollector {
             }
 
             // Dealloc phase: all locks released
-            for (mem, layout) in tracer_deallocs {
-                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
-                dealloc(mem, layout);
-            }
+            // IMPORTANT: Object drops must happen BEFORE tracer deallocs, because
+            // dropping an object may drop inner Gc<T> handles whose Drop impl
+            // dereferences tracer memory to read tracer_id/object_id.
             for entry in object_deallocs {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
-                    (*entry.finalizer).finalize();
+                    // SAFETY: finalize_fn and mem are valid; wrapped in catch_unwind for panic safety.
+                    (entry.finalize_fn)(entry.mem);
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
@@ -1673,6 +1684,10 @@ impl GarbageCollector {
                 }));
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(entry.mem, entry.layout);
+            }
+            for (mem, layout) in tracer_deallocs {
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
+                dealloc(mem, layout);
             }
 
             // Record diagnostics
@@ -2074,14 +2089,13 @@ impl GarbageCollector {
             };
 
             // Dealloc phase: all locks released
-            for (mem, layout) in tracer_deallocs {
-                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
-                dealloc(mem, layout);
-            }
+            // IMPORTANT: Object drops must happen BEFORE tracer deallocs, because
+            // dropping an object may drop inner Gc<T> handles whose Drop impl
+            // dereferences tracer memory to read tracer_id/object_id.
             for entry in object_deallocs {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: Finalizer pointer is valid; wrapped in catch_unwind for panic safety.
-                    (*entry.finalizer).finalize();
+                    // SAFETY: finalize_fn and mem are valid; wrapped in catch_unwind for panic safety.
+                    (entry.finalize_fn)(entry.mem);
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
@@ -2089,6 +2103,10 @@ impl GarbageCollector {
                 }));
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
                 dealloc(entry.mem, entry.layout);
+            }
+            for (mem, layout) in tracer_deallocs {
+                // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
+                dealloc(mem, layout);
             }
 
             self.total_collections.fetch_add(1, Ordering::Relaxed);
@@ -2105,6 +2123,11 @@ impl GarbageCollector {
 /// Each thread gets its own `LocalGarbageCollector` via the `LOCAL_GC` thread-local.
 /// Provides allocation (`create_gc`), collection (`collect`), and incremental/concurrent
 /// collection methods. All operations are single-threaded (no cross-thread sharing).
+/// Allocation threshold for triggering automatic Gen0 collection on the owning thread.
+/// Local GCs collect on allocation (not from a background thread) to avoid data races
+/// on non-atomic Cell/RefCell internals.
+const LOCAL_GC_ALLOC_THRESHOLD: usize = 100;
+
 pub struct LocalGarbageCollector {
     pub(crate) core: GarbageCollector,
 }
@@ -2117,6 +2140,16 @@ impl LocalGarbageCollector {
     fn new() -> LocalGarbageCollector {
         LocalGarbageCollector {
             core: GarbageCollector::new(),
+        }
+    }
+
+    /// Check allocation count and trigger Gen0 collection if threshold exceeded.
+    unsafe fn maybe_collect(&self) {
+        let count = self.core.allocation_count.load(Ordering::Relaxed);
+        if count >= LOCAL_GC_ALLOC_THRESHOLD {
+            unsafe {
+                self.core.collect_generation(Generation::Gen0);
+            }
         }
     }
 
@@ -2137,13 +2170,20 @@ impl LocalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
+            unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
+                unsafe {
+                    // SAFETY: Pointer points to a valid GcPtr<T>; derives reference at call
+                    // time to avoid Stacked Borrows provenance issues.
+                    (*(ptr as *const GcPtr<T>)).t.finalize();
+                }
+            }
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalizer: (*gc_ptr).t.as_finalize(),
+                finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
@@ -2159,17 +2199,21 @@ impl LocalGarbageCollector {
                 layout: mem_info_internal_ptr.1,
                 object_id: obj_id,
             });
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             drop(gc_maps);
 
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
+                tracer_id,
+                object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.maybe_collect();
             gc
         }
     }
@@ -2194,13 +2238,15 @@ impl LocalGarbageCollector {
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
                 entry.ref_count += 1;
             }
-            drop(gc_maps);
-
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, tracer_id, object_id));
+            drop(gc_maps);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
+                tracer_id,
+                object_id,
             };
             // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source Gc.
             (*(*gc.internal_ptr).ptr).reset_root();
@@ -2226,13 +2272,22 @@ impl LocalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
+            unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
+                unsafe {
+                    // SAFETY: Pointer points to a valid RefCell<GcPtr<T>>; derives reference
+                    // at call time to avoid Stacked Borrows provenance issues.
+                    (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
+                        .t
+                        .finalize();
+                }
+            }
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalizer: (*(*gc_ptr).as_ptr()).t.as_finalize(),
+                finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
@@ -2248,20 +2303,24 @@ impl LocalGarbageCollector {
                 layout: mem_info_internal_ptr.1,
                 object_id: obj_id,
             });
-            drop(gc_maps);
-
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcRefCellInternal<T>.
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
                 GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
+            drop(gc_maps);
+
             let gc = GcRefCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
+                tracer_id,
+                object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.maybe_collect();
             gc
         }
     }
@@ -2286,16 +2345,18 @@ impl LocalGarbageCollector {
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
                 entry.ref_count += 1;
             }
-            drop(gc_maps);
-
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcRefCellInternal<T>.
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_inter_ptr,
                 GcRefCellInternal::new(gc.ptr, tracer_id, object_id),
             );
+            drop(gc_maps);
             let gc = GcRefCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
+                tracer_id,
+                object_id,
             };
             // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source GcRefCell.
             (*(*gc.internal_ptr).ptr).reset_root();
@@ -2329,13 +2390,20 @@ impl LocalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
+            unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
+                unsafe {
+                    // SAFETY: Pointer points to a valid GcPtr<T>; derives reference at call
+                    // time to avoid Stacked Borrows provenance issues.
+                    (*(ptr as *const GcPtr<T>)).t.finalize();
+                }
+            }
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalizer: (*gc_ptr).t.as_finalize(),
+                finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
@@ -2351,17 +2419,21 @@ impl LocalGarbageCollector {
                 layout: mem_info_internal_ptr.1,
                 object_id: obj_id,
             });
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             drop(gc_maps);
 
-            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcInternal<T>.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
+                tracer_id,
+                object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.maybe_collect();
             Ok(gc)
         }
     }
@@ -2393,13 +2465,22 @@ impl LocalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
+            unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
+                unsafe {
+                    // SAFETY: Pointer points to a valid RefCell<GcPtr<T>>; derives reference
+                    // at call time to avoid Stacked Borrows provenance issues.
+                    (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
+                        .t
+                        .finalize();
+                }
+            }
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalizer: (*(*gc_ptr).as_ptr()).t.as_finalize(),
+                finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
@@ -2415,20 +2496,24 @@ impl LocalGarbageCollector {
                 layout: mem_info_internal_ptr.1,
                 object_id: obj_id,
             });
-            drop(gc_maps);
-
-            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcRefCellInternal<T>.
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
                 GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
+            drop(gc_maps);
+
             let gc = GcRefCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
+                tracer_id,
+                object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.maybe_collect();
             Ok(gc)
         }
     }
@@ -2467,6 +2552,8 @@ impl LocalGarbageCollector {
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: weak.ptr,
+                tracer_id,
+                object_id,
             };
             // SAFETY: Both internal_ptr (just initialized) and ptr (verified alive via STW lock) are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
@@ -2670,8 +2757,11 @@ pub type StopLocalStrategyFn = Box<dyn FnMut(&'static LocalGarbageCollector)>;
 /// Pluggable collection strategy for the thread-local GC.
 /// Controls when and how garbage collection runs (e.g., periodic background thread,
 /// allocation-triggered, or manual). Use `change_strategy` to swap at runtime.
+///
+/// Internally stores a raw pointer to the `LocalGarbageCollector` to avoid
+/// Stacked Borrows violations during thread-local destruction ordering.
 pub struct LocalStrategy {
-    gc: Cell<&'static LocalGarbageCollector>,
+    gc: Cell<*const LocalGarbageCollector>,
     is_active: AtomicBool,
     start_func: RefCell<StartLocalStrategyFn>,
     stop_func: RefCell<StopLocalStrategyFn>,
@@ -2680,7 +2770,7 @@ pub struct LocalStrategy {
 
 impl LocalStrategy {
     fn new<StartFn, StopFn>(
-        gc: &'static LocalGarbageCollector,
+        gc_ptr: *const LocalGarbageCollector,
         start_fn: StartFn,
         stop_fn: StopFn,
     ) -> LocalStrategy
@@ -2690,7 +2780,7 @@ impl LocalStrategy {
         StopFn: 'static + FnMut(&'static LocalGarbageCollector),
     {
         LocalStrategy {
-            gc: Cell::new(gc),
+            gc: Cell::new(gc_ptr),
             is_active: AtomicBool::new(false),
             start_func: RefCell::new(Box::new(start_fn)),
             stop_func: RefCell::new(Box::new(stop_fn)),
@@ -2720,10 +2810,11 @@ impl LocalStrategy {
     /// Start the collection strategy (e.g., spawn a background collection thread).
     pub fn start(&'static self) {
         self.is_active.store(true, Ordering::Release);
-        self.join_handle.replace((*(self.start_func.borrow_mut()))(
-            self.gc.get(),
-            &self.is_active,
-        ));
+        // SAFETY: gc pointer is valid for the lifetime of the thread-local and is only
+        // accessed from the owning thread.
+        let gc_ref = unsafe { &*self.gc.get() };
+        self.join_handle
+            .replace((*(self.start_func.borrow_mut()))(gc_ref, &self.is_active));
     }
 
     /// Stop the collection strategy and join any background thread.
@@ -2734,14 +2825,21 @@ impl LocalStrategy {
                 .join()
                 .expect("LocalStrategy::stop, LocalStrategy Thread being joined has panicked !!");
         }
-        (*(self.stop_func.borrow_mut()))(self.gc.get());
+        // SAFETY: gc pointer is valid for the lifetime of the thread-local and is only
+        // accessed from the owning thread.
+        let gc_ref = unsafe { &*self.gc.get() };
+        (*(self.stop_func.borrow_mut()))(gc_ref);
     }
 }
 
 impl Drop for LocalStrategy {
     fn drop(&mut self) {
         self.is_active.store(false, Ordering::Release);
-        (*(self.stop_func.borrow_mut()))(self.gc.get());
+        // SAFETY: gc pointer is valid for the lifetime of the thread-local and is only
+        // accessed from the owning thread. Using a raw pointer avoids Stacked Borrows
+        // violations during thread-local destruction ordering.
+        let gc_ref = unsafe { &*self.gc.get() };
+        (*(self.stop_func.borrow_mut()))(gc_ref);
     }
 }
 
@@ -2749,18 +2847,20 @@ thread_local! {
     pub static LOCAL_GC: RefCell<LocalGarbageCollector> = RefCell::new(LocalGarbageCollector::new());
     pub static LOCAL_GC_STRATEGY: RefCell<LocalStrategy> = {
         LOCAL_GC.with(move |gc| {
-            // SAFETY: Single-threaded access via thread_local ensures no aliasing; used during initialization only.
-            let gc = unsafe { &mut *gc.as_ptr() };
-            RefCell::new(LocalStrategy::new(gc,
-            move |local_gc, _| {
-                let mut basic_strategy_local_gcs = BASIC_STRATEGY_LOCAL_GCS.write().unwrap_or_else(|e| e.into_inner());
-                basic_strategy_local_gcs.push(local_gc);
+            // Use as_ptr() directly to get a raw pointer without creating an intermediate
+            // reference, avoiding Stacked Borrows provenance issues during thread-local
+            // destruction ordering.
+            let gc_ptr = gc.as_ptr() as *const LocalGarbageCollector;
+            // NOTE: Local GCs use allocation-triggered collection on the owning thread
+            // instead of registering with the background thread. Collecting from a
+            // background thread would be a data race because thread-local objects use
+            // non-atomic Cell/RefCell internals. The background thread is only used
+            // for the global/sync GC which uses atomic operations.
+            RefCell::new(LocalStrategy::new(gc_ptr,
+            move |_local_gc, _| {
                 None
             },
-            move |local_gc| {
-                let mut basic_strategy_local_gcs = BASIC_STRATEGY_LOCAL_GCS.write().unwrap_or_else(|e| e.into_inner());
-                let index = basic_strategy_local_gcs.iter().position(|&r| r == local_gc).unwrap();
-                basic_strategy_local_gcs.remove(index);
+            move |_local_gc| {
             }))
         })
     };

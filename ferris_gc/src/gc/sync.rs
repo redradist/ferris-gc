@@ -252,6 +252,8 @@ where
 {
     internal_ptr: *mut GcInternal<T>,
     ptr: *const GcPtr<T>,
+    tracer_id: TracerId,
+    object_id: ObjectId,
 }
 
 /// # Safety
@@ -322,10 +324,9 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
+        let tracer_id = self.tracer_id;
+        let object_id = self.object_id;
         unsafe {
-            // SAFETY: internal_ptr is valid; the Gc handle owns this allocation until drop.
-            let tracer_id = (*self.internal_ptr).tracer_id;
-            let object_id = (*self.internal_ptr).object_id;
             // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
             (*GLOBAL_GC).remove_tracer(tracer_id, object_id);
         }
@@ -485,6 +486,8 @@ where
 {
     internal_ptr: *mut GcRefCellInternal<T>,
     ptr: *const RefCell<GcPtr<T>>,
+    tracer_id: TracerId,
+    object_id: ObjectId,
 }
 
 // SAFETY: GcRefCell uses atomic ref-counting internally. All structural mutations
@@ -498,10 +501,9 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
+        let tracer_id = self.tracer_id;
+        let object_id = self.object_id;
         unsafe {
-            // SAFETY: internal_ptr is valid; the GcRefCell handle owns this allocation until drop.
-            let tracer_id = (*self.internal_ptr).tracer_id;
-            let object_id = (*self.internal_ptr).object_id;
             // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
             (*GLOBAL_GC).remove_tracer(tracer_id, object_id);
         }
@@ -769,14 +771,20 @@ impl GlobalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
+            unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
+                unsafe {
+                    // SAFETY: Pointer points to a valid GcPtr<T>; derives reference at call
+                    // time to avoid Stacked Borrows provenance issues.
+                    (*(ptr as *const GcPtr<T>)).t.finalize();
+                }
+            }
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                // SAFETY: gc_ptr was just written above and is valid.
-                finalizer: (*gc_ptr).t.as_finalize(),
+                finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
@@ -792,13 +800,16 @@ impl GlobalGarbageCollector {
                 layout: mem_info_internal_ptr.1,
                 object_id: obj_id,
             });
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             drop(gc_maps);
 
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
+                tracer_id,
+                object_id: obj_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
@@ -828,13 +839,16 @@ impl GlobalGarbageCollector {
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
                 entry.ref_count += 1;
             }
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, tracer_id, object_id));
             drop(gc_maps);
 
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, tracer_id, object_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
+                tracer_id,
+                object_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
@@ -861,14 +875,22 @@ impl GlobalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
+            unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
+                unsafe {
+                    // SAFETY: Pointer points to a valid RefCell<GcPtr<T>>; derives reference
+                    // at call time to avoid Stacked Borrows provenance issues.
+                    (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
+                        .t
+                        .finalize();
+                }
+            }
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                // SAFETY: gc_ptr was just written above; as_ptr() returns a raw pointer to the RefCell contents.
-                finalizer: (*(*gc_ptr).as_ptr()).t.as_finalize(),
+                finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
@@ -884,16 +906,19 @@ impl GlobalGarbageCollector {
                 layout: mem_info_internal_ptr.1,
                 object_id: obj_id,
             });
-            drop(gc_maps);
-
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcRefCellInternal<T>.
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
                 GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
+            drop(gc_maps);
+
             let gc = GcRefCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
+                tracer_id,
+                object_id: obj_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
@@ -923,16 +948,18 @@ impl GlobalGarbageCollector {
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
                 entry.ref_count += 1;
             }
-            drop(gc_maps);
-
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcRefCellInternal<T>.
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_inter_ptr,
                 GcRefCellInternal::new(gc.ptr, tracer_id, object_id),
             );
+            drop(gc_maps);
             let gc = GcRefCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
+                tracer_id,
+                object_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
@@ -967,14 +994,20 @@ impl GlobalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
+            unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
+                unsafe {
+                    // SAFETY: Pointer points to a valid GcPtr<T>; derives reference at call
+                    // time to avoid Stacked Borrows provenance issues.
+                    (*(ptr as *const GcPtr<T>)).t.finalize();
+                }
+            }
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                // SAFETY: gc_ptr was just written above and is valid.
-                finalizer: (*gc_ptr).t.as_finalize(),
+                finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
@@ -990,13 +1023,15 @@ impl GlobalGarbageCollector {
                 layout: mem_info_internal_ptr.1,
                 object_id: obj_id,
             });
-            drop(gc_maps);
-
-            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcInternal<T>.
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
+            drop(gc_maps);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
+                tracer_id,
+                object_id: obj_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
@@ -1033,14 +1068,22 @@ impl GlobalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
+            unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
+                unsafe {
+                    // SAFETY: Pointer points to a valid RefCell<GcPtr<T>>; derives reference
+                    // at call time to avoid Stacked Borrows provenance issues.
+                    (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
+                        .t
+                        .finalize();
+                }
+            }
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                // SAFETY: gc_ptr was just written above; as_ptr() returns a raw pointer to the RefCell contents.
-                finalizer: (*(*gc_ptr).as_ptr()).t.as_finalize(),
+                finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
                 ref_count: 1,
@@ -1056,16 +1099,18 @@ impl GlobalGarbageCollector {
                 layout: mem_info_internal_ptr.1,
                 object_id: obj_id,
             });
-            drop(gc_maps);
-
-            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcRefCellInternal<T>.
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
                 GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
+            drop(gc_maps);
             let gc = GcRefCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
+                tracer_id,
+                object_id: obj_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
@@ -1100,16 +1145,18 @@ impl GlobalGarbageCollector {
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
                 entry.ref_count += 1;
             }
-            drop(gc_maps);
-
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
+            // Initialize tracer memory BEFORE releasing the lock, so the background
+            // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_inter_ptr,
                 GcInternal::new(weak.ptr, tracer_id, object_id),
             );
+            drop(gc_maps);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: weak.ptr,
+                tracer_id,
+                object_id,
             };
             // SAFETY: internal_ptr was just written above; weak.ptr is valid because alive check passed.
             (*(*gc.internal_ptr).ptr).reset_root();
