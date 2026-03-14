@@ -1328,19 +1328,19 @@ impl GarbageCollector {
                     .collect();
 
                 for obj_id in surviving_objs {
-                    if let Some(entry) = gc_maps.objects.get_mut(obj_id)
-                        && entry.generation <= max_gen
-                    {
-                        let cur_gen = entry.generation;
-                        entry.survive_count += 1;
-                        let promo_cfg = self.promotion_config();
-                        let should_promote =
-                            entry.survive_count >= promo_cfg.threshold_for(cur_gen);
-                        if should_promote {
-                            entry.survive_count = 0;
-                            if let Some(next_gen) = cur_gen.next() {
-                                entry.generation = next_gen;
-                                stats.objects_promoted += 1;
+                    if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
+                        if entry.generation <= max_gen {
+                            let cur_gen = entry.generation;
+                            entry.survive_count += 1;
+                            let promo_cfg = self.promotion_config();
+                            let should_promote =
+                                entry.survive_count >= promo_cfg.threshold_for(cur_gen);
+                            if should_promote {
+                                entry.survive_count = 0;
+                                if let Some(next_gen) = cur_gen.next() {
+                                    entry.generation = next_gen;
+                                    stats.objects_promoted += 1;
+                                }
                             }
                         }
                     }
@@ -1558,11 +1558,11 @@ impl GarbageCollector {
 
                 // Re-gray any remembered-set entries that were already Black.
                 for &obj_id in remembered_set.iter() {
-                    if let Some(color) = incr.colors.get_mut(&obj_id)
-                        && *color == MarkColor::Black
-                    {
-                        *color = MarkColor::Gray;
-                        incr.gray_stack.push(obj_id);
+                    if let Some(color) = incr.colors.get_mut(&obj_id) {
+                        if *color == MarkColor::Black {
+                            *color = MarkColor::Gray;
+                            incr.gray_stack.push(obj_id);
+                        }
                     }
                 }
 
@@ -1662,19 +1662,19 @@ impl GarbageCollector {
                     .collect();
 
                 for obj_id in surviving {
-                    if let Some(entry) = gc_maps.objects.get_mut(obj_id)
-                        && entry.generation <= max_gen
-                    {
-                        let cur_gen = entry.generation;
-                        entry.survive_count += 1;
-                        let promo_cfg = self.promotion_config();
-                        let should_promote =
-                            entry.survive_count >= promo_cfg.threshold_for(cur_gen);
-                        if should_promote {
-                            entry.survive_count = 0;
-                            if let Some(next_gen) = cur_gen.next() {
-                                entry.generation = next_gen;
-                                stats.objects_promoted += 1;
+                    if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
+                        if entry.generation <= max_gen {
+                            let cur_gen = entry.generation;
+                            entry.survive_count += 1;
+                            let promo_cfg = self.promotion_config();
+                            let should_promote =
+                                entry.survive_count >= promo_cfg.threshold_for(cur_gen);
+                            if should_promote {
+                                entry.survive_count = 0;
+                                if let Some(next_gen) = cur_gen.next() {
+                                    entry.generation = next_gen;
+                                    stats.objects_promoted += 1;
+                                }
                             }
                         }
                     }
@@ -1893,11 +1893,11 @@ impl GarbageCollector {
             // Use snapshotted edges instead of following live pointers
             if let Some(children) = incr.edges.get(&obj_id).cloned() {
                 for child_id in children {
-                    if let Some(color) = incr.colors.get_mut(&child_id)
-                        && *color == MarkColor::White
-                    {
-                        *color = MarkColor::Gray;
-                        incr.gray_stack.push(child_id);
+                    if let Some(color) = incr.colors.get_mut(&child_id) {
+                        if *color == MarkColor::White {
+                            *color = MarkColor::Gray;
+                            incr.gray_stack.push(child_id);
+                        }
                     }
                 }
             }
@@ -1949,11 +1949,11 @@ impl GarbageCollector {
 
             if let Some(children) = incr.edges.get(&obj_id).cloned() {
                 for child_id in children {
-                    if let Some(color) = incr.colors.get_mut(&child_id)
-                        && *color == MarkColor::White
-                    {
-                        *color = MarkColor::Gray;
-                        incr.gray_stack.push(child_id);
+                    if let Some(color) = incr.colors.get_mut(&child_id) {
+                        if *color == MarkColor::White {
+                            *color = MarkColor::Gray;
+                            incr.gray_stack.push(child_id);
+                        }
                     }
                 }
             }
