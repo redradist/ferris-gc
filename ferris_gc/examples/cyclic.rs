@@ -50,14 +50,9 @@ fn main() {
 
     println!("Created cycle: A -> B -> A");
 
-    // Drop all local handles
+    // Drop all local handles — the strategy detects and collects the cycle
     drop(a);
     drop(b);
 
-    // The cycle is detected and collected by the GC
-    ferris_gc::LOCAL_GC.with(|gc| unsafe {
-        gc.borrow_mut().collect();
-    });
-
-    println!("Cycle collected!");
+    println!("All handles dropped — the strategy will detect and collect the cycle.");
 }

@@ -73,41 +73,6 @@ fn main() {
 }
 ```
 
-### Incremental Collection with Time Budget
-
-**Thread-local:**
-
-```rust
-use ferris_gc::{Gc, Generation, LOCAL_GC};
-use std::time::Duration;
-
-// Allocate many objects...
-let objects: Vec<Gc<i32>> = (0..100_000).map(|i| Gc::new(i)).collect();
-
-// Collect with max 1ms pause per mark step
-LOCAL_GC.with(|gc| unsafe {
-    gc.borrow().collect_incremental_timed(
-        Generation::Gen2,
-        Duration::from_millis(1),
-    );
-});
-```
-
-**Global (thread-safe):**
-
-```rust
-use ferris_gc::{sync, Generation};
-use std::time::Duration;
-
-// Collect with max 1ms pause per mark step
-unsafe {
-    sync::GLOBAL_GC.collect_incremental_timed(
-        Generation::Gen2,
-        Duration::from_millis(1),
-    );
-}
-```
-
 ### Configurable Promotion
 
 **Thread-local:**
@@ -302,7 +267,7 @@ FerrisGC provides five macro-level strategies that control **when** and **how** 
 
 ### Basic (default)
 
-A simple periodic strategy. A background thread wakes every `poll_interval_ms` (default: 50ms) and calls `collect()` on all registered collectors. Minimal configuration, good for prototypes and small applications.
+A simple periodic strategy. A background thread wakes every `poll_interval_ms` (default: 50ms) and runs collection on all registered collectors. Minimal configuration, good for prototypes and small applications.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -376,21 +341,6 @@ Best for large heaps where predictable pause times are critical.
 | Latency-sensitive with large heap | **g1** | Pause-target + garbage-first region selection |
 | Maximum throughput | **threshold** or **adaptive** | Minimal overhead, no concurrent threads |
 
-### Low-Level Collection Methods
-
-In addition to automatic strategies, you can invoke collection manually:
-
-| Method | Pause Profile |
-|--------|---------------|
-| `collect()` | Full STW — single long pause |
-| `collect_generation(gen)` | Generational — shorter pauses (young gen only) |
-| `collect_incremental(gen, budget)` | Incremental — multiple short pauses |
-| `collect_incremental_timed(gen, duration)` | Time-budgeted — bounded pause time |
-| `collect_concurrent(gen, budget)` | Concurrent — minimal STW (snapshot + sweep only) |
-| `collect_region(region)` | Region-based — scoped collection |
-| `collect_garbage_first(pause_target)` | G1-style — dirtiest regions first within time budget |
-| `collect_parallel()` | Parallel sweep — uses rayon for deallocation (requires `parallel` feature) |
-
 ## Performance Features
 
 ### Card Table (Write Barrier)
@@ -403,7 +353,7 @@ The thread-local collector uses bump-pointer allocation within 64KB TLAB blocks.
 
 ### Parallel Sweep (requires `parallel` feature)
 
-With the `parallel` feature enabled, `collect_parallel()` uses [rayon](https://crates.io/crates/rayon) to parallelize the deallocation phase. The mark phase remains serial (single-threaded graph traversal is typically faster due to pointer-chasing), but dead objects are deallocated in parallel across CPU cores.
+With the `parallel` feature enabled, the deallocation phase is parallelized using [rayon](https://crates.io/crates/rayon). The mark phase remains serial (single-threaded graph traversal is typically faster due to pointer-chasing), but dead objects are deallocated in parallel across CPU cores.
 
 ```toml
 [dependencies]
@@ -416,7 +366,7 @@ ferris-gc = { version = "0.2.0", features = ["parallel"] }
 |---------|---------|-------------|
 | `std` | yes | Full GC runtime (collectors, strategies, threading) |
 | `proc-macro` | no | `#[derive(Trace, Finalize)]` and `#[ferris_gc_main]` |
-| `parallel` | no | Parallel sweep via rayon (`collect_parallel()`) |
+| `parallel` | no | Parallel sweep via rayon |
 
 With `--no-default-features`, only core traits (`Trace`, `Finalize`) and generation types are exported (`no_std` compatible).
 
@@ -437,8 +387,8 @@ cargo run --example macro_strategies --features proc-macro   # #[ferris_gc_main]
 ## Benchmarks
 
 ```bash
-cargo bench                    # Run all benchmarks (including million-object tests)
-cargo bench -- "local/alloc"   # Run only local allocation benchmarks
+cargo bench --features _internal                    # Run all benchmarks (including million-object tests)
+cargo bench --features _internal -- "local/alloc"   # Run only local allocation benchmarks
 ```
 
 ## Fuzzing

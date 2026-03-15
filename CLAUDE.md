@@ -10,9 +10,11 @@ FerrisGC is a Rust garbage collection library providing both thread-local (`Gc<T
 
 ```bash
 cargo build                        # Build all workspace crates
-cargo test                         # Run all tests
+cargo test                         # Run all tests (unit + integration)
 cargo test -p ferris-gc --lib      # Run only library tests
 cargo test -p ferris-gc --lib -- gc::tests::one_object  # Run a single test
+cargo test --features _internal    # Run all tests including miri_tests integration test
+cargo bench --features _internal   # Run benchmarks (requires _internal feature)
 cargo check                        # Type-check without full compilation
 ```
 
@@ -57,8 +59,11 @@ Pre-built `Trace`/`Finalize` impls for primitives, String, Box, Vec, HashMap, BT
 |---------|---------|-------------|
 | `std` | yes | Full GC runtime (collectors, strategies, threading) |
 | `proc-macro` | no | `#[derive(Trace, Finalize)]` and `#[ferris_gc_main]` |
+| `_internal` | no | Exposes `_collect()`, `_compact()` etc. for benchmarks/integration tests |
 
 With `--no-default-features`, only core traits (`Trace`, `Finalize`) and `generation` types are exported (`no_std` compatible).
+
+Collection methods (`collect`, `collect_generation`, `collect_incremental`, `compact`, etc.) are `pub(crate)` — only accessible to strategies internally. Users configure collection behavior through strategies, not by calling these methods directly.
 
 ## Known Issues
 

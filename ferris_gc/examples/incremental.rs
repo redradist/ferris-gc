@@ -1,7 +1,9 @@
-//! Incremental and time-budgeted garbage collection.
+//! Demonstrates strategy configuration and GC diagnostics.
+//!
+//! Shows how to switch collection strategies and monitor GC behavior
+//! without manual collection calls.
 
-use ferris_gc::{Finalize, Gc, Generation, Trace};
-use std::time::{Duration, Instant};
+use ferris_gc::{Finalize, Gc, Trace};
 
 struct Payload {
     _data: Vec<u8>,
@@ -26,6 +28,23 @@ impl Trace for Payload {
 fn main() {
     let _cleanup = ferris_gc::ApplicationCleanup;
 
+    // Disable the default basic strategy and use threshold-based collection
+    ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+    ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
+        let strategy = ferris_gc::threshold_local_strategy(ferris_gc::ThresholdConfig::default());
+        s.borrow().set_strategy(strategy);
+    });
+
+    // Monitor collection events
+    ferris_gc::LOCAL_GC.with(|gc| {
+        gc.borrow().set_on_collection(|stats| {
+            println!(
+                "  [GC] collected {} objects, freed {} bytes in {:?}",
+                stats.objects_collected, stats.bytes_freed, stats.duration,
+            );
+        });
+    });
+
     // Allocate many objects
     let mut objects: Vec<Gc<Payload>> = Vec::new();
     for _ in 0..10_000 {
@@ -38,46 +57,18 @@ fn main() {
     // Keep half alive
     let _alive: Vec<_> = objects.drain(..5_000).collect();
     drop(objects);
+    println!("Dropped 5,000 objects — strategy will collect them automatically");
 
+    // Allocate more to trigger threshold-based collection
+    for _ in 0..2_000 {
+        let _ = Gc::new(Payload {
+            _data: vec![0u8; 64],
+        });
+    }
+
+    // Check stats
     ferris_gc::LOCAL_GC.with(|gc| {
-        let gc_ref = gc.borrow();
-
-        // Incremental collection with object-count budget
-        let start = Instant::now();
-        unsafe {
-            let stats = gc_ref.collect_incremental(Generation::Gen2, 500);
-            println!(
-                "Incremental (budget=500 objects): collected {} in {:?}",
-                stats.objects_collected,
-                start.elapsed()
-            );
-        }
-
-        // Time-budgeted collection: max 1ms per mark step
-        let start = Instant::now();
-        unsafe {
-            let stats =
-                gc_ref.collect_incremental_timed(Generation::Gen2, Duration::from_millis(1));
-            println!(
-                "Time-budgeted (max 1ms/step): scanned {} in {:?}",
-                stats.objects_scanned,
-                start.elapsed()
-            );
-        }
-
-        // Concurrent collection: mark without STW
-        let start = Instant::now();
-        unsafe {
-            let stats = gc_ref.collect_concurrent(Generation::Gen2, 1000);
-            println!(
-                "Concurrent (budget=1000): scanned {} in {:?}",
-                stats.objects_scanned,
-                start.elapsed()
-            );
-        }
-
-        // Check stats
-        let stats = gc_ref.stats();
+        let stats = gc.borrow().stats();
         println!(
             "\nGC Stats: {} live objects, {} bytes heap, {} collections",
             stats.live_objects, stats.heap_size, stats.total_collections

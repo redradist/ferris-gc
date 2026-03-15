@@ -39,15 +39,11 @@ fn main() {
     let p1_clone = p1.clone();
     println!("p1_clone = ({}, {})", p1_clone.x, p1_clone.y);
 
-    // Objects are collected when all handles are dropped
+    // Objects are collected automatically when all handles are dropped.
+    // The background strategy handles collection — no manual calls needed.
     drop(p1);
     drop(p1_clone);
     drop(p2);
 
-    // Manual collection
-    ferris_gc::LOCAL_GC.with(|gc| unsafe {
-        gc.borrow_mut().collect();
-    });
-
-    println!("Collection complete!");
+    println!("All handles dropped — the strategy will collect them.");
 }

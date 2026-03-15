@@ -814,6 +814,7 @@ pub struct GlobalGarbageCollector {
 unsafe impl Sync for GlobalGarbageCollector {}
 unsafe impl Send for GlobalGarbageCollector {}
 
+#[allow(dead_code)]
 impl GlobalGarbageCollector {
     fn new() -> GlobalGarbageCollector {
         GlobalGarbageCollector {
@@ -1255,7 +1256,7 @@ impl GlobalGarbageCollector {
 
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect(&self) {
+    pub(crate) unsafe fn collect(&self) {
         unsafe {
             // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core.collect();
@@ -1276,7 +1277,7 @@ impl GlobalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     #[cfg(feature = "parallel")]
-    pub unsafe fn collect_parallel(
+    pub(crate) unsafe fn collect_parallel(
         &self,
         max_gen: crate::generation::Generation,
     ) -> crate::generation::CollectionStats {
@@ -1289,7 +1290,7 @@ impl GlobalGarbageCollector {
     /// # Safety
     /// Must not be called while any GC references are being dereferenced.
     #[cfg(feature = "parallel")]
-    pub unsafe fn collect_parallel_mark(
+    pub(crate) unsafe fn collect_parallel_mark(
         &self,
         max_gen: crate::generation::Generation,
     ) -> crate::generation::CollectionStats {
@@ -1305,7 +1306,7 @@ impl GlobalGarbageCollector {
 
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn begin_collection(&self, max_gen: crate::generation::Generation) {
+    pub(crate) unsafe fn begin_collection(&self, max_gen: crate::generation::Generation) {
         unsafe {
             // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core.begin_collection(max_gen);
@@ -1314,21 +1315,21 @@ impl GlobalGarbageCollector {
 
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn mark_step(&self, budget: usize) -> bool {
+    pub(crate) unsafe fn mark_step(&self, budget: usize) -> bool {
         // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.mark_step(budget) }
     }
 
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn finish_collection(&self) -> crate::generation::CollectionStats {
+    pub(crate) unsafe fn finish_collection(&self) -> crate::generation::CollectionStats {
         // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.finish_collection() }
     }
 
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_incremental(
+    pub(crate) unsafe fn collect_incremental(
         &self,
         max_gen: crate::generation::Generation,
         step_budget: usize,
@@ -1341,7 +1342,10 @@ impl GlobalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn begin_concurrent_collection(&self, max_gen: crate::generation::Generation) {
+    pub(crate) unsafe fn begin_concurrent_collection(
+        &self,
+        max_gen: crate::generation::Generation,
+    ) {
         unsafe {
             // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core.begin_concurrent_collection(max_gen);
@@ -1349,7 +1353,7 @@ impl GlobalGarbageCollector {
     }
 
     /// Process gray objects using edge snapshot. NO STW lock — safe for concurrent use.
-    pub fn concurrent_mark_step(&self, budget: usize) -> bool {
+    pub(crate) fn concurrent_mark_step(&self, budget: usize) -> bool {
         self.core.concurrent_mark_step(budget)
     }
 
@@ -1357,7 +1361,7 @@ impl GlobalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_concurrent(
+    pub(crate) unsafe fn collect_concurrent(
         &self,
         max_gen: crate::generation::Generation,
         step_budget: usize,
@@ -1370,7 +1374,7 @@ impl GlobalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
+    pub(crate) unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
         // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
         unsafe { self.core.mark_step_timed(max_duration) }
     }
@@ -1379,7 +1383,7 @@ impl GlobalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_incremental_timed(
+    pub(crate) unsafe fn collect_incremental_timed(
         &self,
         max_gen: crate::generation::Generation,
         max_step_duration: Duration,
@@ -1392,7 +1396,7 @@ impl GlobalGarbageCollector {
     }
 
     /// Time-budgeted concurrent mark step. NO STW lock — safe for concurrent use.
-    pub fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
+    pub(crate) fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
         self.core.concurrent_mark_step_timed(max_duration)
     }
 
@@ -1400,7 +1404,7 @@ impl GlobalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_concurrent_timed(
+    pub(crate) unsafe fn collect_concurrent_timed(
         &self,
         max_gen: crate::generation::Generation,
         max_step_duration: Duration,
@@ -1426,7 +1430,7 @@ impl GlobalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_region(
+    pub(crate) unsafe fn collect_region(
         &self,
         region: SyncRegionId,
     ) -> crate::generation::CollectionStats {
@@ -1441,7 +1445,7 @@ impl GlobalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are held
     /// across this call (stop-the-world requirement).
-    pub unsafe fn collect_garbage_first(
+    pub(crate) unsafe fn collect_garbage_first(
         &self,
         pause_target: std::time::Duration,
     ) -> crate::generation::CollectionStats {
@@ -1490,8 +1494,47 @@ impl GlobalGarbageCollector {
     /// # Safety
     /// Must not be called while any GC references are being dereferenced.
     /// Acquires STW write lock internally.
-    pub unsafe fn compact(&self) -> usize {
+    pub(crate) unsafe fn compact(&self) -> usize {
         unsafe { self.core.compact() }
+    }
+}
+
+// ---- Feature-gated public access for benchmarks and integration tests ----
+
+#[cfg(feature = "_internal")]
+impl GlobalGarbageCollector {
+    pub unsafe fn _collect(&self) {
+        unsafe { self.collect() }
+    }
+    pub unsafe fn _collect_incremental(
+        &self,
+        max_gen: crate::generation::Generation,
+        step_budget: usize,
+    ) -> crate::generation::CollectionStats {
+        unsafe { self.collect_incremental(max_gen, step_budget) }
+    }
+    pub unsafe fn _collect_incremental_timed(
+        &self,
+        max_gen: crate::generation::Generation,
+        max_step_duration: Duration,
+    ) -> crate::generation::CollectionStats {
+        unsafe { self.collect_incremental_timed(max_gen, max_step_duration) }
+    }
+    pub unsafe fn _collect_concurrent_timed(
+        &self,
+        max_gen: crate::generation::Generation,
+        max_step_duration: Duration,
+    ) -> crate::generation::CollectionStats {
+        unsafe { self.collect_concurrent_timed(max_gen, max_step_duration) }
+    }
+    pub unsafe fn _collect_region(
+        &self,
+        region: SyncRegionId,
+    ) -> crate::generation::CollectionStats {
+        unsafe { self.collect_region(region) }
+    }
+    pub unsafe fn _compact(&self) -> usize {
+        unsafe { self.compact() }
     }
 }
 

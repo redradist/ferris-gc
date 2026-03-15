@@ -82,7 +82,7 @@ impl Finalize for CyclicNode {
 
 fn collect() {
     LOCAL_GC.with(|gc| unsafe {
-        gc.borrow().collect();
+        gc.borrow()._collect();
     });
 }
 
@@ -207,7 +207,7 @@ fn miri_compact() {
 
     // Compact the heap
     LOCAL_GC.with(|gc| unsafe {
-        gc.borrow().compact();
+        gc.borrow()._compact();
     });
 
     // Surviving objects must still be accessible

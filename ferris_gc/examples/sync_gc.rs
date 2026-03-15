@@ -1,12 +1,11 @@
 //! Thread-safe garbage collection with sync::Gc<T>.
 //!
 //! Demonstrates global GC configuration: custom strategy, promotion config,
-//! manual collection, incremental collection, and multi-threaded usage.
+//! monitoring callbacks, and multi-threaded usage.
 
 use ferris_gc::sync;
-use ferris_gc::{Finalize, Generation, PromotionConfig, Trace};
+use ferris_gc::{Finalize, PromotionConfig, Trace};
 use std::thread;
-use std::time::Duration;
 
 struct SharedData {
     value: i32,
@@ -47,6 +46,14 @@ fn main() {
     });
     println!("Promotion config: {:?}", sync::GLOBAL_GC.promotion_config());
 
+    // --- Monitoring callback ---
+    sync::GLOBAL_GC.set_on_collection(|stats| {
+        println!(
+            "  [global GC] collected {} objects, freed {} bytes in {:?}",
+            stats.objects_collected, stats.bytes_freed, stats.duration,
+        );
+    });
+
     // --- Multi-threaded allocation ---
     let data = sync::Gc::new(SharedData { value: 42 });
 
@@ -65,13 +72,7 @@ fn main() {
         h.join().unwrap();
     }
 
-    // --- Manual collection ---
-    unsafe {
-        sync::GLOBAL_GC.collect();
-    }
-    println!("Manual collection done");
-
-    // Allocate more objects for incremental demo
+    // Allocate more objects to trigger collection via the strategy
     let mut objects: Vec<sync::Gc<SharedData>> = Vec::new();
     for i in 0..1_000 {
         objects.push(sync::Gc::new(SharedData { value: i }));
@@ -79,25 +80,6 @@ fn main() {
     // Keep half alive
     let _alive: Vec<_> = objects.drain(..500).collect();
     drop(objects);
-
-    // --- Incremental collection ---
-    unsafe {
-        let stats = sync::GLOBAL_GC.collect_incremental(Generation::Gen2, 200);
-        println!(
-            "Incremental: collected {}, scanned {}",
-            stats.objects_collected, stats.objects_scanned
-        );
-    }
-
-    // --- Time-budgeted concurrent collection ---
-    unsafe {
-        let stats =
-            sync::GLOBAL_GC.collect_concurrent_timed(Generation::Gen2, Duration::from_millis(1));
-        println!(
-            "Concurrent (max 1ms/step): collected {}, scanned {}",
-            stats.objects_collected, stats.objects_scanned
-        );
-    }
 
     // --- Stats ---
     let stats = sync::GLOBAL_GC.stats();

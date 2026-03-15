@@ -4,10 +4,7 @@
 //! Run with:  cargo run --example macro_strategies --features proc-macro
 
 use ferris_gc::sync;
-use ferris_gc::{
-    Finalize, Gc, GcCell, Generation, LOCAL_GC, LocalRegionId, PromotionConfig, Trace,
-};
-use std::time::Duration;
+use ferris_gc::{Finalize, Gc, GcCell, LOCAL_GC, LocalRegionId, PromotionConfig, Trace};
 
 struct Node {
     value: i32,
@@ -98,15 +95,7 @@ fn main() {
 
     drop(a);
     drop(b);
-
-    // Collect only the target region
-    LOCAL_GC.with(|gc| {
-        let stats = unsafe { gc.borrow().collect_region(region) };
-        println!(
-            "Region collect: {} objects collected, {} bytes freed\n",
-            stats.objects_collected, stats.bytes_freed,
-        );
-    });
+    println!("Dropped cycle — the strategy will collect it\n");
 
     // --- Global GC: sync region-based allocation ---
     println!("--- Global: sync region-based allocation ---");
@@ -117,8 +106,8 @@ fn main() {
     let _obj2 = sync_region.gc(99);
     println!("Allocated 2 objects in sync region {}", sync_region.id());
 
-    // --- Thread-local: incremental collection ---
-    println!("\n--- Incremental collection ---");
+    // --- Thread-local: allocate objects to trigger strategy-based collection ---
+    println!("\n--- Triggering collection via allocation ---");
     let mut objects: Vec<Gc<Node>> = Vec::new();
     for i in 0..1_000 {
         objects.push(Gc::new(Node {
@@ -129,15 +118,13 @@ fn main() {
     let _alive: Vec<_> = objects.drain(..500).collect();
     drop(objects);
 
-    LOCAL_GC.with(|gc| unsafe {
-        let stats = gc
-            .borrow()
-            .collect_incremental_timed(Generation::Gen2, Duration::from_millis(1));
-        println!(
-            "Incremental (max 1ms/step): scanned {}, collected {}",
-            stats.objects_scanned, stats.objects_collected,
-        );
-    });
+    // Allocate more to trigger the strategy's threshold
+    for i in 0..2_000 {
+        let _ = Gc::new(Node {
+            value: i,
+            next: GcCell::new(None),
+        });
+    }
 
     // --- Stats ---
     println!("\n--- Diagnostics ---");

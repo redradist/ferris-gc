@@ -17,6 +17,7 @@ default = ["std"]
 std = ["lazy_static"]
 proc-macro = ["ferris-gc-proc-macro"]
 parallel = ["rayon", "std"]
+_internal = []
 
 [dependencies]
 lazy_static = { version = "1.4.0", optional = true }
@@ -31,6 +32,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "macro_strategies"
 required-features = ["proc-macro"]
 
+[[test]]
+name = "miri_tests"
+required-features = ["_internal"]
+
 [[bench]]
 name = "gc_bench"
 harness = false
+required-features = ["_internal"]

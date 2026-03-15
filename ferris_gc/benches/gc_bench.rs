@@ -165,11 +165,11 @@ fn bench_collection_100k(c: &mut Criterion) {
                 }
                 // Measure only collection
                 let start = std::time::Instant::now();
-                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut().collect() });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut()._collect() });
                 total += start.elapsed();
                 drop(v);
                 // Clean up for next iteration
-                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut().collect() });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut()._collect() });
             }
             total
         });
@@ -195,11 +195,11 @@ fn bench_collection_1m(c: &mut Criterion) {
                 }
                 // Measure only collection
                 let start = std::time::Instant::now();
-                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut().collect() });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut()._collect() });
                 total += start.elapsed();
                 drop(v);
                 // Clean up for next iteration
-                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut().collect() });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut()._collect() });
             }
             total
         });
@@ -226,12 +226,12 @@ fn bench_incremental_collection_100k(c: &mut Criterion) {
                 // Measure only incremental collection
                 let start = std::time::Instant::now();
                 LOCAL_GC.with(|gc| unsafe {
-                    gc.borrow_mut().collect_incremental(Generation::Gen2, 1000)
+                    gc.borrow_mut()._collect_incremental(Generation::Gen2, 1000)
                 });
                 total += start.elapsed();
                 drop(v);
                 // Clean up for next iteration
-                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut().collect() });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow_mut()._collect() });
             }
             total
         });
@@ -275,11 +275,11 @@ fn bench_sync_collection_100k(c: &mut Criterion) {
                 }
                 // Measure only collection
                 let start = std::time::Instant::now();
-                unsafe { (*ferris_gc::sync::GLOBAL_GC).collect() };
+                unsafe { sync::GLOBAL_GC._collect() };
                 total += start.elapsed();
                 drop(v);
                 // Clean up for next iteration
-                unsafe { (*ferris_gc::sync::GLOBAL_GC).collect() };
+                unsafe { sync::GLOBAL_GC._collect() };
             }
             total
         });
@@ -317,6 +317,7 @@ fn bench_alloc_varying_large(c: &mut Criterion) {
 
 /// Allocate 10,000 objects, compact, and measure compaction time.
 fn bench_compact_10k(c: &mut Criterion) {
+    let _cleanup = ferris_gc::ApplicationCleanup;
     let n = 10_000usize;
     c.bench_function("local/compact_10k", |b| {
         b.iter_custom(|iters| {
@@ -331,10 +332,10 @@ fn bench_compact_10k(c: &mut Criterion) {
                     v[i] = Gc::new(0);
                 }
                 let start = std::time::Instant::now();
-                LOCAL_GC.with(|gc| unsafe { gc.borrow().compact() });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow()._compact() });
                 total += start.elapsed();
                 drop(v);
-                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect() });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow()._collect() });
             }
             total
         });
@@ -359,10 +360,10 @@ fn bench_gen0_vs_full_50k(c: &mut Criterion) {
                     v[i] = Gc::new(0);
                 }
                 let start = std::time::Instant::now();
-                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect_generation(Generation::Gen0) });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow()._collect_generation(Generation::Gen0) });
                 total += start.elapsed();
                 drop(v);
-                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect() });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow()._collect() });
             }
             total
         });
@@ -380,10 +381,10 @@ fn bench_gen0_vs_full_50k(c: &mut Criterion) {
                     v[i] = Gc::new(0);
                 }
                 let start = std::time::Instant::now();
-                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect_generation(Generation::Gen2) });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow()._collect_generation(Generation::Gen2) });
                 total += start.elapsed();
                 drop(v);
-                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect() });
+                LOCAL_GC.with(|gc| unsafe { gc.borrow()._collect() });
             }
             total
         });
@@ -410,7 +411,7 @@ fn bench_deref_after_compact(c: &mut Criterion) {
 
     group.bench_function("after_compact", |b| {
         let v: Vec<Gc<i32>> = (0..n as i32).map(|i| Gc::new(i)).collect();
-        LOCAL_GC.with(|gc| unsafe { gc.borrow().compact() });
+        LOCAL_GC.with(|gc| unsafe { gc.borrow()._compact() });
         b.iter(|| {
             let mut sum = 0i64;
             for gc in &v {

@@ -394,8 +394,10 @@ where
     type Target = GcPtr<T>;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { &(*self.ptr) }
+        // SAFETY: internal_ptr is valid for the lifetime of this Gc handle.
+        // We dereference through internal_ptr→ptr so that compaction (which
+        // updates GcInternal.ptr) is transparent to callers.
+        unsafe { &*(*self.internal_ptr).ptr }
     }
 }
 
@@ -526,31 +528,36 @@ where
     }
 
     fn trace(&self) {
-        if self.ptr.is_null() {
+        if self.internal_ptr.is_null() {
             return;
         }
-        // SAFETY: Null check above ensures the pointer is valid.
-        unsafe { (*self.ptr).trace() }
+        // SAFETY: Null check above ensures internal_ptr is valid.
+        // Go through internal_ptr→ptr so compaction is transparent.
+        unsafe { (*(*self.internal_ptr).ptr).trace() }
     }
 
     fn reset(&self) {
-        if self.ptr.is_null() {
+        if self.internal_ptr.is_null() {
             return;
         }
-        // SAFETY: Null check above ensures the pointer is valid.
-        unsafe { (*self.ptr).reset() }
+        // SAFETY: Null check above ensures internal_ptr is valid.
+        unsafe { (*(*self.internal_ptr).ptr).reset() }
     }
 
     fn is_traceable(&self) -> bool {
-        if self.ptr.is_null() {
+        if self.internal_ptr.is_null() {
             return false;
         }
-        // SAFETY: Null check above ensures the pointer is valid.
-        unsafe { (*self.ptr).is_traceable() }
+        // SAFETY: Null check above ensures internal_ptr is valid.
+        unsafe { (*(*self.internal_ptr).ptr).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        children.push(self.ptr as *const dyn Trace);
+        if self.internal_ptr.is_null() {
+            return;
+        }
+        // SAFETY: Null check above ensures internal_ptr is valid.
+        children.push(unsafe { (*self.internal_ptr).ptr as *const dyn Trace });
     }
 }
 
@@ -630,6 +637,14 @@ where
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
         children.push(self.ptr as *const dyn Trace);
     }
+
+    unsafe fn relocate(&self, old_ptr: *const u8, new_ptr: *const u8) {
+        if self.ptr as *const u8 == old_ptr {
+            // SAFETY: Called during STW compaction with exclusive access.
+            let self_mut = self as *const Self as *mut Self;
+            unsafe { (*self_mut).ptr = new_ptr as *const RefCell<GcPtr<T>> };
+        }
+    }
 }
 
 impl<T> Finalize for GcCellInternal<T>
@@ -682,8 +697,10 @@ where
     type Target = RefCell<GcPtr<T>>;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { &(*self.ptr) }
+        // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
+        // We dereference through internal_ptr→ptr so that compaction (which
+        // updates GcCellInternal.ptr) is transparent to callers.
+        unsafe { &*(*self.internal_ptr).ptr }
     }
 }
 
@@ -768,11 +785,14 @@ where
     /// Triggers the write barrier so that if this object is in an older generation,
     /// its card is marked dirty in the card table for young-generation collections.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
+        // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
+        // Go through internal_ptr→ptr so compaction relocation is transparent.
+        let ptr = unsafe { (*self.internal_ptr).ptr };
         LOCAL_GC.with(|gc| {
-            gc.borrow().core.write_barrier(self.ptr as *const dyn Trace);
+            gc.borrow().core.write_barrier(ptr as *const dyn Trace);
         });
-        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { (*self.ptr).borrow_mut() }
+        // SAFETY: ptr is valid for the lifetime of this GcCell handle.
+        unsafe { (*ptr).borrow_mut() }
     }
 }
 
@@ -791,38 +811,33 @@ where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
-        // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
+        // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
         unsafe { (*self.internal_ptr).is_root() }
     }
 
     fn reset_root(&self) {
-        unsafe {
-            // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.internal_ptr).reset_root();
-        }
+        // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
+        unsafe { (*self.internal_ptr).reset_root() }
     }
 
     fn trace(&self) {
-        unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).borrow().trace();
-        }
+        // SAFETY: internal_ptr→ptr is valid; go through internal_ptr for compaction safety.
+        unsafe { (*(*self.internal_ptr).ptr).borrow().trace() }
     }
 
     fn reset(&self) {
-        unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).borrow().reset();
-        }
+        // SAFETY: internal_ptr→ptr is valid; go through internal_ptr for compaction safety.
+        unsafe { (*(*self.internal_ptr).ptr).borrow().reset() }
     }
 
     fn is_traceable(&self) -> bool {
-        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { (*self.ptr).borrow().is_traceable() }
+        // SAFETY: internal_ptr→ptr is valid; go through internal_ptr for compaction safety.
+        unsafe { (*(*self.internal_ptr).ptr).borrow().is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        children.push(self.ptr as *const dyn Trace);
+        // SAFETY: internal_ptr→ptr is valid; go through internal_ptr for compaction safety.
+        children.push(unsafe { (*self.internal_ptr).ptr as *const dyn Trace });
     }
 }
 
@@ -1121,6 +1136,7 @@ pub(crate) struct GarbageCollector {
 unsafe impl Sync for GarbageCollector {}
 unsafe impl Send for GarbageCollector {}
 
+#[allow(dead_code)]
 impl GarbageCollector {
     pub(crate) fn new() -> GarbageCollector {
         GarbageCollector {
@@ -3105,7 +3121,7 @@ impl GarbageCollector {
 
             // Copy each object into the contiguous buffer
             let mut offset: usize = 0;
-            let mut relocations: Vec<(ObjectId, *const u8, *mut u8, GcObjMem, Layout)> =
+            let mut relocations: Vec<(ObjectId, *const u8, *mut u8, Layout)> =
                 Vec::with_capacity(num_objects);
 
             for (id, layout) in &obj_layouts {
@@ -3126,9 +3142,7 @@ impl GarbageCollector {
                 // SAFETY: old_ptr and new_ptr point to valid, non-overlapping memory of at least layout.size() bytes.
                 std::ptr::copy_nonoverlapping(old_ptr, new_ptr, layout.size());
 
-                // SAFETY: entry.mem is valid; read is used to copy without moving out of a shared borrow.
-                let old_mem = std::ptr::read(&entry.mem as *const GcObjMem);
-                relocations.push((*id, old_ptr as *const u8, new_ptr, old_mem, *layout));
+                relocations.push((*id, old_ptr as *const u8, new_ptr, *layout));
 
                 offset += layout.size();
             }
@@ -3144,7 +3158,9 @@ impl GarbageCollector {
                 layout: compact_layout,
             });
 
-            for (id, _old_raw, new_raw, _old_mem, layout) in &relocations {
+            let mut old_mems: Vec<(GcObjMem, Layout)> = Vec::with_capacity(num_objects);
+
+            for (id, _old_raw, new_raw, layout) in &relocations {
                 // Two-phase update: first update ObjectEntry (needs &mut objects),
                 // then update ptr_to_object (needs &mut ptr_to_object).
                 // We collect the old/new thin ptrs to avoid overlapping borrows.
@@ -3175,8 +3191,14 @@ impl GarbageCollector {
                     entry.ptr = new_fat_ptr;
                     let new_thin = entry.ptr.get_thin_ptr();
 
-                    // Replace memory tracking with compact block reference
-                    entry.mem = GcObjMem::Compact(*new_raw, compact_block.clone());
+                    // Replace memory tracking with compact block reference.
+                    // Use std::mem::replace to properly move the old GcObjMem out,
+                    // avoiding double-drop of Arc refs in Compact/Tlab variants.
+                    let old_mem = std::mem::replace(
+                        &mut entry.mem,
+                        GcObjMem::Compact(*new_raw, compact_block.clone()),
+                    );
+                    old_mems.push((old_mem, *layout));
                     entry.layout = *layout;
 
                     (old_thin, new_thin)
@@ -3193,18 +3215,11 @@ impl GarbageCollector {
 
             // Relocate tracer pointers: tell each GcInternal to update its gc_ptr field
             for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
-                for (_, old_raw, new_raw, _, _) in &relocations {
+                for (_, old_raw, new_raw, _) in &relocations {
                     // SAFETY: tracer_ptr is valid while gc_maps lock is held; relocate is called during STW with exclusive access.
                     (&*tracer_entry.tracer_ptr).relocate(*old_raw, *new_raw);
                 }
             }
-
-            // Free old allocations (the original scattered memory)
-            // Drop happens outside gc_maps lock
-            let old_mems: Vec<(GcObjMem, Layout)> = relocations
-                .into_iter()
-                .map(|(_, _, _, old_mem, layout)| (old_mem, layout))
-                .collect();
 
             drop(gc_maps);
 
@@ -3268,6 +3283,7 @@ pub struct LocalGarbageCollector {
 unsafe impl Sync for LocalGarbageCollector {}
 unsafe impl Send for LocalGarbageCollector {}
 
+#[allow(dead_code)]
 impl LocalGarbageCollector {
     fn new() -> LocalGarbageCollector {
         LocalGarbageCollector {
@@ -3776,11 +3792,20 @@ impl LocalGarbageCollector {
 
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect(&self) {
+    pub(crate) unsafe fn collect(&self) {
         // SAFETY: Caller upholds the safety contract; delegates to core.collect().
         unsafe {
             self.core.collect();
         }
+    }
+
+    /// Collect objects up to the specified generation.
+    ///
+    /// # Safety
+    /// The caller must ensure no references to GC-managed objects are used during collection.
+    pub(crate) unsafe fn collect_generation(&self, max_gen: Generation) -> CollectionStats {
+        // SAFETY: Caller upholds the safety contract; delegates to core.collect_generation().
+        unsafe { self.core.collect_generation(max_gen) }
     }
 
     #[allow(dead_code)]
@@ -3797,7 +3822,7 @@ impl LocalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     #[cfg(feature = "parallel")]
-    pub unsafe fn collect_parallel(&self, max_gen: Generation) -> CollectionStats {
+    pub(crate) unsafe fn collect_parallel(&self, max_gen: Generation) -> CollectionStats {
         // SAFETY: Caller upholds the safety contract; delegates to core.collect_parallel().
         unsafe { self.core.collect_parallel(max_gen) }
     }
@@ -3809,7 +3834,7 @@ impl LocalGarbageCollector {
     /// # Safety
     /// Must not be called while any GC references are being dereferenced.
     #[cfg(feature = "parallel")]
-    pub unsafe fn collect_parallel_mark(&self, max_gen: Generation) -> CollectionStats {
+    pub(crate) unsafe fn collect_parallel_mark(&self, max_gen: Generation) -> CollectionStats {
         unsafe { self.core.collect_parallel_mark(max_gen) }
     }
 
@@ -3824,7 +3849,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn begin_collection(&self, max_gen: Generation) {
+    pub(crate) unsafe fn begin_collection(&self, max_gen: Generation) {
         // SAFETY: Caller upholds the safety contract; delegates to core.begin_collection().
         unsafe {
             self.core.begin_collection(max_gen);
@@ -3835,7 +3860,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn mark_step(&self, budget: usize) -> bool {
+    pub(crate) unsafe fn mark_step(&self, budget: usize) -> bool {
         // SAFETY: Caller upholds the safety contract; delegates to core.mark_step().
         unsafe { self.core.mark_step(budget) }
     }
@@ -3844,7 +3869,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn finish_collection(&self) -> CollectionStats {
+    pub(crate) unsafe fn finish_collection(&self) -> CollectionStats {
         // SAFETY: Caller upholds the safety contract; delegates to core.finish_collection().
         unsafe { self.core.finish_collection() }
     }
@@ -3853,7 +3878,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_incremental(
+    pub(crate) unsafe fn collect_incremental(
         &self,
         max_gen: Generation,
         step_budget: usize,
@@ -3866,7 +3891,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn begin_concurrent_collection(&self, max_gen: Generation) {
+    pub(crate) unsafe fn begin_concurrent_collection(&self, max_gen: Generation) {
         // SAFETY: Caller upholds the safety contract; delegates to core.begin_concurrent_collection().
         unsafe {
             self.core.begin_concurrent_collection(max_gen);
@@ -3874,7 +3899,7 @@ impl LocalGarbageCollector {
     }
 
     /// Process gray objects using edge snapshot. NO STW lock — safe for concurrent use.
-    pub fn concurrent_mark_step(&self, budget: usize) -> bool {
+    pub(crate) fn concurrent_mark_step(&self, budget: usize) -> bool {
         self.core.concurrent_mark_step(budget)
     }
 
@@ -3882,7 +3907,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_concurrent(
+    pub(crate) unsafe fn collect_concurrent(
         &self,
         max_gen: Generation,
         step_budget: usize,
@@ -3895,7 +3920,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
+    pub(crate) unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
         // SAFETY: Caller upholds the safety contract; delegates to core.mark_step_timed().
         unsafe { self.core.mark_step_timed(max_duration) }
     }
@@ -3904,7 +3929,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_incremental_timed(
+    pub(crate) unsafe fn collect_incremental_timed(
         &self,
         max_gen: Generation,
         max_step_duration: Duration,
@@ -3917,7 +3942,7 @@ impl LocalGarbageCollector {
     }
 
     /// Time-budgeted concurrent mark step. NO STW lock — safe for concurrent use.
-    pub fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
+    pub(crate) fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
         self.core.concurrent_mark_step_timed(max_duration)
     }
 
@@ -3925,7 +3950,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_concurrent_timed(
+    pub(crate) unsafe fn collect_concurrent_timed(
         &self,
         max_gen: Generation,
         max_step_duration: Duration,
@@ -3951,7 +3976,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub unsafe fn collect_region(&self, region: LocalRegionId) -> CollectionStats {
+    pub(crate) unsafe fn collect_region(&self, region: LocalRegionId) -> CollectionStats {
         // SAFETY: Caller upholds the safety contract; delegates to core.collect_region().
         unsafe { self.core.collect_region(region.0) }
     }
@@ -3963,7 +3988,7 @@ impl LocalGarbageCollector {
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are held
     /// across this call (stop-the-world requirement).
-    pub unsafe fn collect_garbage_first(&self, pause_target: Duration) -> CollectionStats {
+    pub(crate) unsafe fn collect_garbage_first(&self, pause_target: Duration) -> CollectionStats {
         // SAFETY: Caller upholds the safety contract; delegates to core.
         unsafe { self.core.collect_garbage_first(pause_target) }
     }
@@ -4007,8 +4032,57 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// Must not be called while any GC references are being dereferenced.
-    pub unsafe fn compact(&self) -> usize {
+    pub(crate) unsafe fn compact(&self) -> usize {
         unsafe { self.core.compact() }
+    }
+}
+
+// ---- Feature-gated public access for benchmarks and integration tests ----
+
+#[cfg(feature = "_internal")]
+impl LocalGarbageCollector {
+    pub unsafe fn _collect(&self) {
+        unsafe { self.collect() }
+    }
+    pub unsafe fn _collect_generation(&self, max_gen: Generation) -> CollectionStats {
+        unsafe { self.collect_generation(max_gen) }
+    }
+    pub unsafe fn _collect_incremental(
+        &self,
+        max_gen: Generation,
+        step_budget: usize,
+    ) -> CollectionStats {
+        unsafe { self.collect_incremental(max_gen, step_budget) }
+    }
+    pub unsafe fn _collect_incremental_timed(
+        &self,
+        max_gen: Generation,
+        max_step_duration: Duration,
+    ) -> CollectionStats {
+        unsafe { self.collect_incremental_timed(max_gen, max_step_duration) }
+    }
+    pub unsafe fn _collect_concurrent(
+        &self,
+        max_gen: Generation,
+        step_budget: usize,
+    ) -> CollectionStats {
+        unsafe { self.collect_concurrent(max_gen, step_budget) }
+    }
+    pub unsafe fn _collect_concurrent_timed(
+        &self,
+        max_gen: Generation,
+        max_step_duration: Duration,
+    ) -> CollectionStats {
+        unsafe { self.collect_concurrent_timed(max_gen, max_step_duration) }
+    }
+    pub unsafe fn _collect_region(&self, region: LocalRegionId) -> CollectionStats {
+        unsafe { self.collect_region(region) }
+    }
+    pub unsafe fn _collect_garbage_first(&self, pause_target: Duration) -> CollectionStats {
+        unsafe { self.collect_garbage_first(pause_target) }
+    }
+    pub unsafe fn _compact(&self) -> usize {
+        unsafe { self.compact() }
     }
 }
 
@@ -4880,6 +4954,45 @@ mod tests {
                 "young object referenced from old-gen (via card table) must survive Gen0 collection"
             );
         });
+    }
+
+    #[test]
+    fn compact_preserves_live_objects() {
+        clean_gc_state();
+        let n = 100;
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            v.push(Gc::new(i as i32));
+        }
+        // Drop half to create fragmentation
+        for i in (0..n).step_by(2) {
+            v[i] = Gc::new(0);
+        }
+        LOCAL_GC.with(|gc| unsafe { gc.borrow().compact() });
+        // Verify values are still accessible after compaction
+        assert_eq!(***v.get(1).unwrap(), 1);
+        assert_eq!(***v.get(3).unwrap(), 3);
+        drop(v);
+        LOCAL_GC.with(|gc| unsafe { gc.borrow().collect() });
+    }
+
+    #[test]
+    fn compact_repeated_iterations() {
+        clean_gc_state();
+        for _ in 0..20 {
+            let n = 1000;
+            let mut v = Vec::with_capacity(n);
+            for i in 0..n {
+                v.push(Gc::new(i as i32));
+            }
+            for i in (0..n).step_by(2) {
+                v[i] = Gc::new(0);
+            }
+            LOCAL_GC.with(|gc| unsafe { gc.borrow().compact() });
+            assert_eq!(***v.get(1).unwrap(), 1);
+            drop(v);
+            LOCAL_GC.with(|gc| unsafe { gc.borrow().collect() });
+        }
     }
 
     #[test]
