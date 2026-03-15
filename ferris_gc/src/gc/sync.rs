@@ -756,7 +756,7 @@ where
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             if self.alive.load(Ordering::Acquire) {
-                Some((*GLOBAL_GC).upgrade_weak(self))
+                (*GLOBAL_GC).upgrade_weak(self)
             } else {
                 None
             }
@@ -1207,20 +1207,22 @@ impl GlobalGarbageCollector {
 
     /// Create a new strong Gc<T> from a weak reference (for upgrade).
     /// Caller must hold STW read lock.
-    unsafe fn upgrade_weak<T>(&self, weak: &GcWeak<T>) -> Gc<T>
+    unsafe fn upgrade_weak<T>(&self, weak: &GcWeak<T>) -> Option<Gc<T>>
     where
         T: Sized + Trace,
     {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             let thin = (weak.ptr as *const dyn Trace).get_thin_ptr();
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
-            let object_id = *gc_maps
-                .ptr_to_object
-                .get(&thin)
-                .expect("upgrade_weak: object not found");
+            // Re-check under gc_maps lock: the object may have been freed by a
+            // concurrent drop (RC hybrid) between the alive check and this point.
+            let object_id = match gc_maps.ptr_to_object.get(&thin) {
+                Some(&id) => id,
+                None => return None,
+            };
+            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
                 mem: mem_info_internal_ptr.0,
@@ -1244,9 +1246,10 @@ impl GlobalGarbageCollector {
                 tracer_id,
                 object_id,
             };
-            // SAFETY: internal_ptr was just written above; weak.ptr is valid because alive check passed.
+            // SAFETY: internal_ptr was just written above; weak.ptr is valid because
+            // the object exists (we checked under gc_maps lock above).
             (*(*gc.internal_ptr).ptr).reset_root();
-            gc
+            Some(gc)
         }
     }
 
