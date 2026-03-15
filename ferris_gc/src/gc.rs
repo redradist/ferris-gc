@@ -281,7 +281,7 @@ where
     T: 'static + Sized + Trace,
 {
     is_root: AtomicBool,
-    ptr: *const GcPtr<T>,
+    ptr: Cell<*const GcPtr<T>>,
     pub(crate) tracer_id: TracerId,
     pub(crate) object_id: ObjectId,
 }
@@ -293,7 +293,7 @@ where
     fn new(ptr: *const GcPtr<T>, tracer_id: TracerId, object_id: ObjectId) -> GcInternal<T> {
         GcInternal {
             is_root: AtomicBool::new(true),
-            ptr,
+            ptr: Cell::new(ptr),
             tracer_id,
             object_id,
         }
@@ -313,7 +313,7 @@ where
             self.is_root.store(false, Ordering::Release);
             unsafe {
                 // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
-                (*self.ptr).reset_root();
+                (*self.ptr.get()).reset_root();
             }
         }
     }
@@ -321,34 +321,32 @@ where
     fn trace(&self) {
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).trace();
+            (*self.ptr.get()).trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).reset();
+            (*self.ptr.get()).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
         // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { (*self.ptr).is_traceable() }
+        unsafe { (*self.ptr.get()).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        children.push(self.ptr as *const dyn Trace);
+        children.push(self.ptr.get() as *const dyn Trace);
     }
 
     unsafe fn relocate(&self, old_ptr: *const u8, new_ptr: *const u8) {
-        if self.ptr as *const u8 == old_ptr {
-            // SAFETY: Called during STW compaction. The stw_lock write guard
-            // guarantees no concurrent access to this field. We mutate through
-            // a raw pointer because GcInternal is heap-allocated and we have
-            // exclusive access during STW.
-            let self_mut = self as *const Self as *mut Self;
-            unsafe { (*self_mut).ptr = new_ptr as *const GcPtr<T> };
+        if self.ptr.get() as *const u8 == old_ptr {
+            // SAFETY: Called during STW compaction. Cell provides interior
+            // mutability, and the stw_lock write guard guarantees no concurrent
+            // access.
+            self.ptr.set(new_ptr as *const GcPtr<T>);
         }
     }
 }
@@ -397,7 +395,7 @@ where
         // SAFETY: internal_ptr is valid for the lifetime of this Gc handle.
         // We dereference through internal_ptr→ptr so that compaction (which
         // updates GcInternal.ptr) is transparent to callers.
-        unsafe { &*(*self.internal_ptr).ptr }
+        unsafe { &*(*self.internal_ptr).ptr.get() }
     }
 }
 
@@ -533,7 +531,7 @@ where
         }
         // SAFETY: Null check above ensures internal_ptr is valid.
         // Go through internal_ptr→ptr so compaction is transparent.
-        unsafe { (*(*self.internal_ptr).ptr).trace() }
+        unsafe { (*(*self.internal_ptr).ptr.get()).trace() }
     }
 
     fn reset(&self) {
@@ -541,7 +539,7 @@ where
             return;
         }
         // SAFETY: Null check above ensures internal_ptr is valid.
-        unsafe { (*(*self.internal_ptr).ptr).reset() }
+        unsafe { (*(*self.internal_ptr).ptr.get()).reset() }
     }
 
     fn is_traceable(&self) -> bool {
@@ -549,7 +547,7 @@ where
             return false;
         }
         // SAFETY: Null check above ensures internal_ptr is valid.
-        unsafe { (*(*self.internal_ptr).ptr).is_traceable() }
+        unsafe { (*(*self.internal_ptr).ptr.get()).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -557,7 +555,7 @@ where
             return;
         }
         // SAFETY: Null check above ensures internal_ptr is valid.
-        children.push(unsafe { (*self.internal_ptr).ptr as *const dyn Trace });
+        children.push(unsafe { (*self.internal_ptr).ptr.get() as *const dyn Trace });
     }
 }
 
@@ -574,7 +572,7 @@ where
     T: 'static + Sized + Trace,
 {
     is_root: AtomicBool,
-    ptr: *const RefCell<GcPtr<T>>,
+    ptr: Cell<*const RefCell<GcPtr<T>>>,
     pub(crate) tracer_id: TracerId,
     pub(crate) object_id: ObjectId,
 }
@@ -590,7 +588,7 @@ where
     ) -> GcCellInternal<T> {
         GcCellInternal {
             is_root: AtomicBool::new(true),
-            ptr,
+            ptr: Cell::new(ptr),
             tracer_id,
             object_id,
         }
@@ -610,7 +608,7 @@ where
             self.is_root.store(false, Ordering::Release);
             unsafe {
                 // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-                (*self.ptr).borrow().reset_root();
+                (*self.ptr.get()).borrow().reset_root();
             }
         }
     }
@@ -618,31 +616,32 @@ where
     fn trace(&self) {
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).borrow().trace();
+            (*self.ptr.get()).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).borrow().reset();
+            (*self.ptr.get()).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
         // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { (*self.ptr).borrow().is_traceable() }
+        unsafe { (*self.ptr.get()).borrow().is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        children.push(self.ptr as *const dyn Trace);
+        children.push(self.ptr.get() as *const dyn Trace);
     }
 
     unsafe fn relocate(&self, old_ptr: *const u8, new_ptr: *const u8) {
-        if self.ptr as *const u8 == old_ptr {
-            // SAFETY: Called during STW compaction with exclusive access.
-            let self_mut = self as *const Self as *mut Self;
-            unsafe { (*self_mut).ptr = new_ptr as *const RefCell<GcPtr<T>> };
+        if self.ptr.get() as *const u8 == old_ptr {
+            // SAFETY: Called during STW compaction. Cell provides interior
+            // mutability, and the stw_lock write guard guarantees no concurrent
+            // access.
+            self.ptr.set(new_ptr as *const RefCell<GcPtr<T>>);
         }
     }
 }
@@ -700,7 +699,7 @@ where
         // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
         // We dereference through internal_ptr→ptr so that compaction (which
         // updates GcCellInternal.ptr) is transparent to callers.
-        unsafe { &*(*self.internal_ptr).ptr }
+        unsafe { &*(*self.internal_ptr).ptr.get() }
     }
 }
 
@@ -787,7 +786,7 @@ where
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
         // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
         // Go through internal_ptr→ptr so compaction relocation is transparent.
-        let ptr = unsafe { (*self.internal_ptr).ptr };
+        let ptr = unsafe { (*self.internal_ptr).ptr.get() };
         LOCAL_GC.with(|gc| {
             gc.borrow().core.write_barrier(ptr as *const dyn Trace);
         });
@@ -822,22 +821,22 @@ where
 
     fn trace(&self) {
         // SAFETY: internal_ptr→ptr is valid; go through internal_ptr for compaction safety.
-        unsafe { (*(*self.internal_ptr).ptr).borrow().trace() }
+        unsafe { (*(*self.internal_ptr).ptr.get()).borrow().trace() }
     }
 
     fn reset(&self) {
         // SAFETY: internal_ptr→ptr is valid; go through internal_ptr for compaction safety.
-        unsafe { (*(*self.internal_ptr).ptr).borrow().reset() }
+        unsafe { (*(*self.internal_ptr).ptr.get()).borrow().reset() }
     }
 
     fn is_traceable(&self) -> bool {
         // SAFETY: internal_ptr→ptr is valid; go through internal_ptr for compaction safety.
-        unsafe { (*(*self.internal_ptr).ptr).borrow().is_traceable() }
+        unsafe { (*(*self.internal_ptr).ptr.get()).borrow().is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
         // SAFETY: internal_ptr→ptr is valid; go through internal_ptr for compaction safety.
-        children.push(unsafe { (*self.internal_ptr).ptr as *const dyn Trace });
+        children.push(unsafe { (*self.internal_ptr).ptr.get() as *const dyn Trace });
     }
 }
 
@@ -3430,7 +3429,7 @@ impl LocalGarbageCollector {
                 object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
+            (*(*gc.internal_ptr).ptr.get()).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             self.maybe_collect();
             gc
@@ -3468,7 +3467,7 @@ impl LocalGarbageCollector {
                 object_id,
             };
             // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source Gc.
-            (*(*gc.internal_ptr).ptr).reset_root();
+            (*(*gc.internal_ptr).ptr.get()).reset_root();
             gc
         }
     }
@@ -3540,7 +3539,7 @@ impl LocalGarbageCollector {
                 object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
+            (*(*gc.internal_ptr).ptr.get()).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             self.maybe_collect();
             gc
@@ -3581,7 +3580,7 @@ impl LocalGarbageCollector {
                 object_id,
             };
             // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source GcCell.
-            (*(*gc.internal_ptr).ptr).reset_root();
+            (*(*gc.internal_ptr).ptr.get()).reset_root();
             gc
         }
     }
@@ -3656,7 +3655,7 @@ impl LocalGarbageCollector {
                 object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
+            (*(*gc.internal_ptr).ptr.get()).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             self.maybe_collect();
             Ok(gc)
@@ -3742,7 +3741,7 @@ impl LocalGarbageCollector {
                 object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
+            (*(*gc.internal_ptr).ptr.get()).reset_root();
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             self.maybe_collect();
             Ok(gc)
@@ -3787,7 +3786,7 @@ impl LocalGarbageCollector {
                 object_id,
             };
             // SAFETY: Both internal_ptr (just initialized) and ptr (verified alive via STW lock) are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
+            (*(*gc.internal_ptr).ptr.get()).reset_root();
             gc
         }
     }
