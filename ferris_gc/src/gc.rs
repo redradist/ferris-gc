@@ -3186,8 +3186,10 @@ impl GarbageCollector {
                         fat_ptr_bytes.as_mut_ptr(),
                         std::mem::size_of::<*const u8>(),
                     );
+                    // SAFETY: read_unaligned because fat_ptr_bytes is a [u8] (align 1)
+                    // but *const dyn Trace requires pointer alignment.
                     let new_fat_ptr: *const dyn Trace =
-                        std::ptr::read(fat_ptr_bytes.as_ptr() as *const *const dyn Trace);
+                        std::ptr::read_unaligned(fat_ptr_bytes.as_ptr() as *const *const dyn Trace);
                     entry.ptr = new_fat_ptr;
                     let new_thin = entry.ptr.get_thin_ptr();
 
