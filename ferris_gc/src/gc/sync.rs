@@ -292,8 +292,8 @@ where
 
 /// # Safety
 /// The underlying GcInternal uses atomic ref-counting, and the global GC
-/// protects all structural mutations with Mutex/RwLock. Gc<T> is safe to
-/// send across threads when T itself is Send.
+/// protects all structural mutations with Mutex/RwLock. `Gc<T>` is safe to
+/// send across threads when `T` itself is Send.
 unsafe impl<T> Sync for Gc<T> where T: 'static + Sized + Trace + Sync {}
 unsafe impl<T> Send for Gc<T> where T: 'static + Sized + Trace + Send {}
 
@@ -392,53 +392,43 @@ where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
-        unsafe {
-            if self.internal_ptr.is_null() {
-                return false;
-            }
-            // SAFETY: Null check above ensures the pointer is valid.
-            (*self.internal_ptr).is_root()
+        if self.internal_ptr.is_null() {
+            return false;
         }
+        // SAFETY: Null check above ensures the pointer is valid.
+        unsafe { (*self.internal_ptr).is_root() }
     }
 
     fn reset_root(&self) {
-        unsafe {
-            if self.internal_ptr.is_null() {
-                return;
-            }
-            // SAFETY: Null check above ensures the pointer is valid.
-            (*self.internal_ptr).reset_root();
+        if self.internal_ptr.is_null() {
+            return;
         }
+        // SAFETY: Null check above ensures the pointer is valid.
+        unsafe { (*self.internal_ptr).reset_root() }
     }
 
     fn trace(&self) {
-        unsafe {
-            if self.ptr.is_null() {
-                return;
-            }
-            // SAFETY: Null check above ensures the pointer is valid.
-            (*self.ptr).trace();
+        if self.ptr.is_null() {
+            return;
         }
+        // SAFETY: Null check above ensures the pointer is valid.
+        unsafe { (*self.ptr).trace() }
     }
 
     fn reset(&self) {
-        unsafe {
-            if self.ptr.is_null() {
-                return;
-            }
-            // SAFETY: Null check above ensures the pointer is valid.
-            (*self.ptr).reset();
+        if self.ptr.is_null() {
+            return;
         }
+        // SAFETY: Null check above ensures the pointer is valid.
+        unsafe { (*self.ptr).reset() }
     }
 
     fn is_traceable(&self) -> bool {
-        unsafe {
-            if self.ptr.is_null() {
-                return false;
-            }
-            // SAFETY: Null check above ensures the pointer is valid.
-            (*self.ptr).is_traceable()
+        if self.ptr.is_null() {
+            return false;
         }
+        // SAFETY: Null check above ensures the pointer is valid.
+        unsafe { (*self.ptr).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -1373,7 +1363,7 @@ impl GlobalGarbageCollector {
         unsafe { self.core.collect_concurrent(max_gen, step_budget) }
     }
 
-    /// Time-budgeted incremental mark step. See [`GarbageCollector::mark_step_timed`].
+    /// Time-budgeted incremental mark step. See `GarbageCollector::mark_step_timed`.
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.

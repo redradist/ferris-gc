@@ -8,7 +8,7 @@
 //! | `proc-macro` | no | `#[derive(Trace, Finalize)]` and `#[ferris_gc_main]` macros. |
 //!
 //! With `default-features = false` (no `std`), only the core traits
-//! ([`Trace`], [`Finalize`]) and the [`generation`] types are available.
+//! ([`Trace`], [`Finalize`]) and the `generation` types are available.
 //! This allows libraries to implement `Trace`/`Finalize` without pulling in
 //! the allocator, threading, or collection machinery.
 
