@@ -135,7 +135,7 @@ pub struct GcStats {
     pub heap_size: usize,
     /// Number of live GC-managed objects.
     pub live_objects: usize,
-    /// Number of live tracers (Gc/GcRefCell handles pointing to objects).
+    /// Number of live tracers (Gc/GcCell handles pointing to objects).
     pub live_tracers: usize,
     /// Number of objects per generation.
     pub gen0_objects: usize,

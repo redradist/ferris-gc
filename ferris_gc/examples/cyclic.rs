@@ -1,10 +1,10 @@
-//! Demonstrates cycle collection using GcRefCell.
+//! Demonstrates cycle collection using GcCell.
 
-use ferris_gc::{Finalize, Gc, GcRefCell, Trace};
+use ferris_gc::{Finalize, Gc, GcCell, Trace};
 
 struct Node {
     name: String,
-    next: GcRefCell<Option<Gc<Node>>>,
+    next: GcCell<Option<Gc<Node>>>,
 }
 
 impl Finalize for Node {
@@ -40,11 +40,11 @@ fn main() {
     // Create a cycle: A -> B -> A
     let a = Gc::new(Node {
         name: "A".into(),
-        next: GcRefCell::new(None),
+        next: GcCell::new(None),
     });
     let b = Gc::new(Node {
         name: "B".into(),
-        next: GcRefCell::new(Some(a.clone())),
+        next: GcCell::new(Some(a.clone())),
     });
     **a.next.borrow_mut() = Some(b.clone());
 

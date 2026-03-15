@@ -1,10 +1,10 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use ferris_gc::{Gc, GcRefCell, Trace, Finalize};
+use ferris_gc::{Gc, GcCell, Trace, Finalize};
 
 
 struct Node {
-    next: GcRefCell<Option<Gc<Node>>>,
+    next: GcCell<Option<Gc<Node>>>,
 }
 
 impl Finalize for Node {
@@ -29,7 +29,7 @@ fuzz_target!(|data: &[u8]| {
         match byte % 5 {
             0 => {
                 // Create new node
-                nodes.push(Gc::new(Node { next: GcRefCell::new(None) }));
+                nodes.push(Gc::new(Node { next: GcCell::new(None) }));
             }
             1 => {
                 // Link two nodes (potentially creating a cycle)

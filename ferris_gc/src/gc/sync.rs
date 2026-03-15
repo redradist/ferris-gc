@@ -13,7 +13,7 @@ use crate::slot_map::{ObjectId, TracerId};
 /// Convenience alias for an optional thread-safe GC pointer.
 pub type OptGc<T> = Option<Gc<T>>;
 /// Convenience alias for an optional thread-safe GC interior-mutable cell.
-pub type OptGcCell<T> = Option<GcRefCell<T>>;
+pub type OptGcCell<T> = Option<GcCell<T>>;
 
 /// Type-safe region identifier for the **global (thread-safe)** garbage collector.
 /// Returned by [`GlobalGarbageCollector::new_region`]. Cannot be used with
@@ -40,7 +40,7 @@ impl GcInfo {
     }
 }
 
-/// Internal pointer wrapper used as the `Deref` target of `sync::Gc<T>` and `sync::GcRefCell<T>`.
+/// Internal pointer wrapper used as the `Deref` target of `sync::Gc<T>` and `sync::GcCell<T>`.
 /// This type is `pub` because it appears in the public `Deref` interface, but users
 /// should not need to name it directly — access `T` via double-deref (`**gc`).
 #[doc(hidden)]
@@ -189,6 +189,7 @@ where
     fn finalize(&self) {}
 }
 
+#[allow(dead_code)]
 pub(crate) struct GcInternal<T>
 where
     T: 'static + Sized + Trace,
@@ -252,6 +253,15 @@ where
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
         children.push(self.ptr as *const dyn Trace);
+    }
+
+    unsafe fn relocate(&self, old_ptr: *const u8, new_ptr: *const u8) {
+        if self.ptr as *const u8 == old_ptr {
+            // SAFETY: Called during STW compaction. The stw_lock write guard
+            // guarantees no concurrent access to this field.
+            let self_mut = self as *const Self as *mut Self;
+            unsafe { (*self_mut).ptr = new_ptr as *const GcPtr<T> };
+        }
     }
 }
 
@@ -443,7 +453,8 @@ where
     fn finalize(&self) {}
 }
 
-pub(crate) struct GcRefCellInternal<T>
+#[allow(dead_code)]
+pub(crate) struct GcCellInternal<T>
 where
     T: 'static + Sized + Trace,
 {
@@ -453,7 +464,7 @@ where
     pub(crate) object_id: ObjectId,
 }
 
-impl<T> GcRefCellInternal<T>
+impl<T> GcCellInternal<T>
 where
     T: 'static + Sized + Trace,
 {
@@ -461,8 +472,8 @@ where
         ptr: *const RefCell<GcPtr<T>>,
         tracer_id: TracerId,
         object_id: ObjectId,
-    ) -> GcRefCellInternal<T> {
-        GcRefCellInternal {
+    ) -> GcCellInternal<T> {
+        GcCellInternal {
             is_root: AtomicBool::new(true),
             ptr,
             tracer_id,
@@ -471,7 +482,7 @@ where
     }
 }
 
-impl<T> Trace for GcRefCellInternal<T>
+impl<T> Trace for GcCellInternal<T>
 where
     T: Sized + Trace,
 {
@@ -483,7 +494,7 @@ where
         if self.is_root.load(Ordering::Acquire) {
             self.is_root.store(false, Ordering::Release);
             unsafe {
-                // SAFETY: Pointer is valid for the lifetime of this GcRefCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
+                // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
                 (*self.ptr).borrow().reset_root();
             }
         }
@@ -491,20 +502,20 @@ where
 
     fn trace(&self) {
         unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcRefCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
+            // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcRefCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
+            // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        // SAFETY: Pointer is valid for the lifetime of this GcRefCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
+        // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
@@ -513,7 +524,7 @@ where
     }
 }
 
-impl<T> Finalize for GcRefCellInternal<T>
+impl<T> Finalize for GcCellInternal<T>
 where
     T: Sized + Trace,
 {
@@ -522,25 +533,25 @@ where
 
 /// A garbage-collected mutable cell that can be shared across threads.
 ///
-/// The thread-safe counterpart of the local `GcRefCell<T>`. `borrow_mut()`
+/// The thread-safe counterpart of the local `GcCell<T>`. `borrow_mut()`
 /// triggers the write barrier for generational collection.
-pub struct GcRefCell<T>
+pub struct GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
-    internal_ptr: *mut GcRefCellInternal<T>,
+    internal_ptr: *mut GcCellInternal<T>,
     ptr: *const RefCell<GcPtr<T>>,
     tracer_id: TracerId,
     object_id: ObjectId,
 }
 
-// SAFETY: GcRefCell uses atomic ref-counting internally. All structural mutations
+// SAFETY: GcCell uses atomic ref-counting internally. All structural mutations
 // go through the global GC's Mutex. The RefCell itself is only accessed while
 // holding the STW read lock, preventing data races.
-unsafe impl<T> Sync for GcRefCell<T> where T: 'static + Sized + Trace + Sync {}
-unsafe impl<T> Send for GcRefCell<T> where T: 'static + Sized + Trace + Send {}
+unsafe impl<T> Sync for GcCell<T> where T: 'static + Sized + Trace + Sync {}
+unsafe impl<T> Send for GcCell<T> where T: 'static + Sized + Trace + Send {}
 
-impl<T> Drop for GcRefCell<T>
+impl<T> Drop for GcCell<T>
 where
     T: Sized + Trace,
 {
@@ -554,33 +565,33 @@ where
     }
 }
 
-impl<T> Deref for GcRefCell<T>
+impl<T> Deref for GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
     type Target = RefCell<GcPtr<T>>;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { &(*self.ptr) }
     }
 }
 
-impl<T> std::fmt::Debug for GcRefCell<T>
+impl<T> std::fmt::Debug for GcCell<T>
 where
     T: 'static + Sized + Trace + std::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("GcRefCell").field(&**self.borrow()).finish()
+        f.debug_tuple("GcCell").field(&**self.borrow()).finish()
     }
 }
 
-impl<T> GcRefCell<T>
+impl<T> GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
     /// Allocate a new thread-safe GC-managed interior-mutable cell on the global collector.
-    pub fn new(t: T) -> GcRefCell<T> {
+    pub fn new(t: T) -> GcCell<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe {
@@ -590,7 +601,7 @@ where
     }
 
     /// Allocate a new thread-safe GC-managed interior-mutable cell in the specified region.
-    pub fn new_in(t: T, region: SyncRegionId) -> GcRefCell<T> {
+    pub fn new_in(t: T, region: SyncRegionId) -> GcCell<T> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).create_gc_cell(t, region.0) }
@@ -598,7 +609,7 @@ where
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     /// On OOM, triggers an emergency GC collection and retries once before failing.
-    pub fn try_new(t: T) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
+    pub fn try_new(t: T) -> Result<GcCell<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe {
@@ -608,7 +619,7 @@ where
     }
 
     /// Fallible allocation in a specified region.
-    pub fn try_new_in(t: T, region: SyncRegionId) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
+    pub fn try_new_in(t: T, region: SyncRegionId) -> Result<GcCell<T>, crate::gc::GcAllocError> {
         basic_gc_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).try_create_gc_cell(t, region.0) }
@@ -620,7 +631,7 @@ where
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
         unsafe {
             // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-            // self.ptr is valid for the lifetime of this GcRefCell handle.
+            // self.ptr is valid for the lifetime of this GcCell handle.
             let _stw = GLOBAL_GC
                 .core
                 .stw_lock
@@ -632,7 +643,7 @@ where
     }
 }
 
-impl<T> Clone for GcRefCell<T>
+impl<T> Clone for GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
@@ -642,38 +653,38 @@ where
     }
 }
 
-impl<T> Trace for GcRefCell<T>
+impl<T> Trace for GcCell<T>
 where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
-        // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle.
+        // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
         unsafe { (*self.internal_ptr).is_root() }
     }
 
     fn reset_root(&self) {
         unsafe {
-            // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle.
+            // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
             (*self.internal_ptr).reset_root();
         }
     }
 
     fn trace(&self) {
         unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+            // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+            // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
@@ -682,7 +693,7 @@ where
     }
 }
 
-impl<T> Finalize for GcRefCell<T>
+impl<T> Finalize for GcCell<T>
 where
     T: Sized + Trace,
 {
@@ -735,6 +746,11 @@ impl<T> GcWeak<T>
 where
     T: 'static + Sized + Trace,
 {
+    /// Returns `true` if the referenced object is still alive (not yet collected).
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     /// Attempt to upgrade the weak reference to a strong `Gc<T>`.
     /// Returns `None` if the object has been collected.
     pub fn upgrade(&self) -> Option<Gc<T>> {
@@ -921,7 +937,7 @@ impl GlobalGarbageCollector {
         }
     }
 
-    unsafe fn create_gc_cell<T>(&self, t: T, region: crate::generation::RegionId) -> GcRefCell<T>
+    unsafe fn create_gc_cell<T>(&self, t: T, region: crate::generation::RegionId) -> GcCell<T>
     where
         T: Sized + Trace,
     {
@@ -929,7 +945,7 @@ impl GlobalGarbageCollector {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<RefCell<GcPtr<T>>>();
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                self.core.alloc_mem::<GcRefCellInternal<T>>();
+                self.core.alloc_mem::<GcCellInternal<T>>();
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
@@ -978,11 +994,11 @@ impl GlobalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
-                GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
+                GcCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
             drop(gc_maps);
 
-            let gc = GcRefCell {
+            let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
                 tracer_id,
@@ -995,14 +1011,14 @@ impl GlobalGarbageCollector {
         }
     }
 
-    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T>
+    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcCell<T>) -> GcCell<T>
     where
         T: Sized + Trace,
     {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcRefCellInternal<T>>();
-            // SAFETY: internal_ptr is valid; the source GcRefCell handle is alive during clone.
+            let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcCellInternal<T>>();
+            // SAFETY: internal_ptr is valid; the source GcCell handle is alive during clone.
             let object_id = (*gc.internal_ptr).object_id;
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
@@ -1020,10 +1036,10 @@ impl GlobalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_inter_ptr,
-                GcRefCellInternal::new(gc.ptr, tracer_id, object_id),
+                GcCellInternal::new(gc.ptr, tracer_id, object_id),
             );
             drop(gc_maps);
-            let gc = GcRefCell {
+            let gc = GcCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
                 tracer_id,
@@ -1118,7 +1134,7 @@ impl GlobalGarbageCollector {
         &self,
         t: T,
         region: crate::generation::RegionId,
-    ) -> Result<GcRefCell<T>, crate::gc::GcAllocError>
+    ) -> Result<GcCell<T>, crate::gc::GcAllocError>
     where
         T: Sized + Trace,
     {
@@ -1127,7 +1143,7 @@ impl GlobalGarbageCollector {
             let (gc_ptr, mem_info_gc_ptr) =
                 self.core.try_alloc_mem_with_gc::<RefCell<GcPtr<T>>>()?;
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem_with_gc::<GcRefCellInternal<T>>() {
+                match self.core.try_alloc_mem_with_gc::<GcCellInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
@@ -1183,10 +1199,10 @@ impl GlobalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
-                GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
+                GcCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
             drop(gc_maps);
-            let gc = GcRefCell {
+            let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
                 tracer_id,
@@ -1275,9 +1291,21 @@ impl GlobalGarbageCollector {
         unsafe { self.core.collect_parallel(max_gen) }
     }
 
+    /// Collection with parallel mark AND parallel sweep using rayon.
+    ///
+    /// # Safety
+    /// Must not be called while any GC references are being dereferenced.
+    #[cfg(feature = "parallel")]
+    pub unsafe fn collect_parallel_mark(
+        &self,
+        max_gen: crate::generation::Generation,
+    ) -> crate::generation::CollectionStats {
+        unsafe { self.core.collect_parallel_mark(max_gen) }
+    }
+
     pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
         unsafe {
-            // SAFETY: Caller provides valid tracer_id and object_id from a live Gc/GcRefCell handle.
+            // SAFETY: Caller provides valid tracer_id and object_id from a live Gc/GcCell handle.
             self.core.remove_tracer(tracer_id, object_id);
         }
     }
@@ -1460,6 +1488,18 @@ impl GlobalGarbageCollector {
     pub fn clear_on_collection(&self) {
         self.core.clear_on_collection();
     }
+
+    /// Compact the heap by copying all live objects into a contiguous buffer.
+    /// Runs a full collection first, then relocates surviving objects.
+    ///
+    /// Returns the number of objects compacted.
+    ///
+    /// # Safety
+    /// Must not be called while any GC references are being dereferenced.
+    /// Acquires STW write lock internally.
+    pub unsafe fn compact(&self) -> usize {
+        unsafe { self.core.compact() }
+    }
 }
 
 // ---- SyncRegionId helpers for global (sync) GC ----
@@ -1478,17 +1518,17 @@ impl SyncRegionId {
         Gc::try_new_in(t, self)
     }
 
-    /// Allocate a new `sync::GcRefCell<T>` in this region (global collector).
-    pub fn gc_cell<T: 'static + Sized + Trace>(self, t: T) -> GcRefCell<T> {
-        GcRefCell::new_in(t, self)
+    /// Allocate a new `sync::GcCell<T>` in this region (global collector).
+    pub fn gc_cell<T: 'static + Sized + Trace>(self, t: T) -> GcCell<T> {
+        GcCell::new_in(t, self)
     }
 
-    /// Fallible `sync::GcRefCell<T>` allocation in this region (global collector).
+    /// Fallible `sync::GcCell<T>` allocation in this region (global collector).
     pub fn try_gc_cell<T: 'static + Sized + Trace>(
         self,
         t: T,
-    ) -> Result<GcRefCell<T>, crate::gc::GcAllocError> {
-        GcRefCell::try_new_in(t, self)
+    ) -> Result<GcCell<T>, crate::gc::GcAllocError> {
+        GcCell::try_new_in(t, self)
     }
 }
 

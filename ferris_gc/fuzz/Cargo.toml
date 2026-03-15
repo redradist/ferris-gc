@@ -32,3 +32,15 @@ name = "fuzz_incremental"
 path = "fuzz_targets/fuzz_incremental.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_weak_refs"
+path = "fuzz_targets/fuzz_weak_refs.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ephemeron"
+path = "fuzz_targets/fuzz_ephemeron.rs"
+test = false
+doc = false

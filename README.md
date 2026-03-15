@@ -31,19 +31,19 @@ ferris-gc = { version = "0.2.0", features = ["proc-macro"] }
 ### Basic Usage
 
 ```rust
-use ferris_gc::{Gc, GcRefCell, Trace, Finalize, ApplicationCleanup};
+use ferris_gc::{Gc, GcCell, Trace, Finalize, ApplicationCleanup};
 
 #[derive(Trace, Finalize)]
 struct Node {
     value: i32,
-    next: GcRefCell<Option<Gc<Node>>>,
+    next: GcCell<Option<Gc<Node>>>,
 }
 
 #[ferris_gc::ferris_gc_main]
 fn main() {
     // Thread-local GC
-    let a = Gc::new(Node { value: 1, next: GcRefCell::new(None) });
-    let b = Gc::new(Node { value: 2, next: GcRefCell::new(Some(a.clone())) });
+    let a = Gc::new(Node { value: 1, next: GcCell::new(None) });
+    let b = Gc::new(Node { value: 2, next: GcCell::new(Some(a.clone())) });
 
     // Create a cycle — the GC will detect and collect it
     *a.next.borrow_mut() = Some(b.clone());
@@ -290,7 +290,7 @@ sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
 | | Thread-local | Thread-safe |
 |---|---|---|
 | Pointer | `Gc<T>` | `sync::Gc<T>` |
-| Mutable cell | `GcRefCell<T>` | `sync::GcRefCell<T>` |
+| Mutable cell | `GcCell<T>` | `sync::GcCell<T>` |
 | Collector | `LocalGarbageCollector` | `GlobalGarbageCollector` |
 | Weak ref | `GcWeak<T>` | `sync::GcWeak<T>` |
 

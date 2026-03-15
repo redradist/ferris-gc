@@ -7,6 +7,7 @@ pub trait SlotKey: Copy + Eq {
     fn index(self) -> u32;
     fn slot_generation(self) -> u32;
 
+    #[allow(dead_code)]
     fn raw(self) -> u64 {
         ((self.slot_generation() as u64) << 32) | (self.index() as u64)
     }
@@ -81,6 +82,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Returns `true` if there are no occupied slots.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -113,6 +115,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
 
     /// Insert with access to the key during construction.
     /// The closure receives the key that will be assigned, and must return the value.
+    #[allow(dead_code)]
     pub fn insert_with_key(&mut self, f: impl FnOnce(K) -> V) -> K {
         self.len += 1;
         if self.free_head != SENTINEL {
@@ -203,6 +206,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Returns `true` if the key refers to a currently occupied slot.
+    #[allow(dead_code)]
     pub fn contains_key(&self, key: K) -> bool {
         self.get(key).is_some()
     }
@@ -218,6 +222,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Iterate over all occupied `(key, &mut value)` pairs.
+    #[allow(dead_code)]
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         IterMut {
             slots: self.slots.as_mut_slice(),
@@ -236,6 +241,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Iterate over all occupied values mutably.
+    #[allow(dead_code)]
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
         self.slots
             .iter_mut()
@@ -246,6 +252,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Remove all entries. Frees all slots.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.slots.clear();
         self.free_head = SENTINEL;
@@ -305,6 +312,7 @@ impl<'a, K: SlotKey, V> Iterator for Iter<'a, K, V> {
 }
 
 /// Mutable iterator over occupied `(key, &mut value)` pairs in a `SlotMap`.
+#[allow(dead_code)]
 pub struct IterMut<'a, K: SlotKey, V> {
     slots: &'a mut [Slot<V>],
     idx: usize,

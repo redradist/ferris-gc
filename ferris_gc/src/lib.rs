@@ -32,6 +32,8 @@ mod card_table;
 #[cfg(feature = "std")]
 mod default_trace;
 #[cfg(feature = "std")]
+pub mod ephemeron;
+#[cfg(feature = "std")]
 mod g1_strategy;
 #[cfg(feature = "std")]
 mod gc;
@@ -55,6 +57,8 @@ pub use basic_gc_strategy::{
 #[cfg(feature = "std")]
 #[allow(unused_imports)]
 pub use default_trace::*;
+#[cfg(feature = "std")]
+pub use ephemeron::EphemeronTable;
 #[cfg(feature = "std")]
 pub use g1_strategy::{G1Config, g1_global_start, g1_local_start};
 #[cfg(feature = "std")]

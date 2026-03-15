@@ -5,13 +5,13 @@
 
 use ferris_gc::sync;
 use ferris_gc::{
-    Finalize, Gc, GcRefCell, Generation, LOCAL_GC, LocalRegionId, PromotionConfig, Trace,
+    Finalize, Gc, GcCell, Generation, LOCAL_GC, LocalRegionId, PromotionConfig, Trace,
 };
 use std::time::Duration;
 
 struct Node {
     value: i32,
-    next: GcRefCell<Option<Gc<Node>>>,
+    next: GcCell<Option<Gc<Node>>>,
 }
 
 impl Finalize for Node {
@@ -85,11 +85,11 @@ fn main() {
     // Allocate in specific region using the helper
     let a = region.gc(Node {
         value: 1,
-        next: GcRefCell::new(None),
+        next: GcCell::new(None),
     });
     let b = region.gc(Node {
         value: 2,
-        next: GcRefCell::new(None),
+        next: GcCell::new(None),
     });
     // Create a cycle
     **a.next.borrow_mut() = Some(b.clone());
@@ -123,7 +123,7 @@ fn main() {
     for i in 0..1_000 {
         objects.push(Gc::new(Node {
             value: i,
-            next: GcRefCell::new(None),
+            next: GcCell::new(None),
         }));
     }
     let _alive: Vec<_> = objects.drain(..500).collect();

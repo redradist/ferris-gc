@@ -30,7 +30,7 @@ Both share the same API surface but differ in synchronization:
 | | Thread-local (`gc.rs`) | Thread-safe (`gc/sync.rs`) |
 |---|---|---|
 | Pointer type | `Gc<T>` | `sync::Gc<T>` |
-| Mutable cell | `GcRefCell<T>` | `sync::GcRefCell<T>` |
+| Mutable cell | `GcCell<T>` | `sync::GcCell<T>` |
 | Collector | `LocalGarbageCollector` (thread_local!) | `GlobalGarbageCollector` (lazy_static + Mutex/RwLock) |
 | Ref counting | `Cell<usize>` | `AtomicUsize` |
 | Strategy | `LocalStrategy` | `GlobalStrategy` |

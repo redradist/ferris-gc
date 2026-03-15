@@ -312,6 +312,118 @@ fn bench_alloc_varying_large(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Compaction & generational benchmarks
+// ---------------------------------------------------------------------------
+
+/// Allocate 10,000 objects, compact, and measure compaction time.
+fn bench_compact_10k(c: &mut Criterion) {
+    let n = 10_000usize;
+    c.bench_function("local/compact_10k", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let mut v = Vec::with_capacity(n);
+                for i in 0..n {
+                    v.push(Gc::new(i as i32));
+                }
+                // Drop half to create fragmentation
+                for i in (0..n).step_by(2) {
+                    v[i] = Gc::new(0);
+                }
+                let start = std::time::Instant::now();
+                LOCAL_GC.with(|gc| unsafe { gc.borrow().compact() });
+                total += start.elapsed();
+                drop(v);
+                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect() });
+            }
+            total
+        });
+    });
+}
+
+/// Compare Gen0-only vs full collection on 50,000 objects.
+fn bench_gen0_vs_full_50k(c: &mut Criterion) {
+    let n = 50_000usize;
+    let mut group = c.benchmark_group("local/gen_comparison_50k");
+    group.sample_size(10);
+
+    group.bench_function("gen0_only", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let mut v = Vec::with_capacity(n);
+                for i in 0..n {
+                    v.push(Gc::new(i as i32));
+                }
+                for i in (0..n).step_by(2) {
+                    v[i] = Gc::new(0);
+                }
+                let start = std::time::Instant::now();
+                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect_generation(Generation::Gen0) });
+                total += start.elapsed();
+                drop(v);
+                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect() });
+            }
+            total
+        });
+    });
+
+    group.bench_function("full_gen2", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let mut v = Vec::with_capacity(n);
+                for i in 0..n {
+                    v.push(Gc::new(i as i32));
+                }
+                for i in (0..n).step_by(2) {
+                    v[i] = Gc::new(0);
+                }
+                let start = std::time::Instant::now();
+                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect_generation(Generation::Gen2) });
+                total += start.elapsed();
+                drop(v);
+                LOCAL_GC.with(|gc| unsafe { gc.borrow().collect() });
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark deref throughput after compaction vs before.
+fn bench_deref_after_compact(c: &mut Criterion) {
+    let n = 10_000usize;
+    let mut group = c.benchmark_group("local/deref_compact");
+
+    group.bench_function("before_compact", |b| {
+        let v: Vec<Gc<i32>> = (0..n as i32).map(|i| Gc::new(i)).collect();
+        b.iter(|| {
+            let mut sum = 0i64;
+            for gc in &v {
+                sum += ***gc as i64;
+            }
+            black_box(sum);
+        });
+    });
+
+    group.bench_function("after_compact", |b| {
+        let v: Vec<Gc<i32>> = (0..n as i32).map(|i| Gc::new(i)).collect();
+        LOCAL_GC.with(|gc| unsafe { gc.borrow().compact() });
+        b.iter(|| {
+            let mut sum = 0i64;
+            for gc in &v {
+                sum += ***gc as i64;
+            }
+            black_box(sum);
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion groups
 // ---------------------------------------------------------------------------
 
@@ -341,6 +453,9 @@ criterion_group!(
         bench_sync_alloc_1m,
         bench_sync_collection_100k,
         bench_alloc_varying_large,
+        bench_compact_10k,
+        bench_gen0_vs_full_50k,
+        bench_deref_after_compact,
 );
 
 criterion_main!(small_benches, large_benches);

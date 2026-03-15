@@ -15,7 +15,7 @@
 
 ### Fixed
 - **Cyclic mark-sweep correctness** — `root_ref_count` no longer leaks in cyclic object graphs; replaced cascade-based reset with unconditional `clear_trace()`.
-- **Re-entrant drop panic** — `Gc`/`GcRefCell` drop uses `try_borrow_mut()` to handle nested RC hybrid deallocation gracefully.
+- **Re-entrant drop panic** — `Gc`/`GcCell` drop uses `try_borrow_mut()` to handle nested RC hybrid deallocation gracefully.
 - **Use-after-free** in deallocation ordering — objects now freed before tracers in all collection methods.
 - **Data races** on `Cell`/`RefCell` internals — switched to allocation-triggered collection for thread-local GC (no background thread access).
 - **Stacked Borrows violations** (Miri) — fixed raw pointer provenance, finalizer fat pointer invalidation, and uninitialized memory races.
@@ -48,8 +48,8 @@
 
 ## [0.1.0] - Initial release
 
-- Thread-local `Gc<T>` and `GcRefCell<T>`.
-- Thread-safe `sync::Gc<T>` and `sync::GcRefCell<T>`.
+- Thread-local `Gc<T>` and `GcCell<T>`.
+- Thread-safe `sync::Gc<T>` and `sync::GcCell<T>`.
 - Mark-and-sweep collection with background strategy.
 - `#[derive(Trace, Finalize)]` proc macros.
 - `#[ferris_gc_main]` for graceful shutdown.

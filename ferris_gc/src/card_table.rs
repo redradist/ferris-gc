@@ -17,6 +17,7 @@ use crate::slot_map::ObjectId;
 const CARD_SHIFT: usize = 9;
 
 /// Byte value for a clean card.
+#[allow(dead_code)]
 const CARD_CLEAN: u8 = 0;
 /// Byte value for a dirty card.
 const CARD_DIRTY: u8 = 1;
@@ -102,6 +103,7 @@ impl CardTable {
 
     /// Collect all [`ObjectId`]s from dirty cards, then clean those cards.
     /// Called during collection while the caller already holds `gc_maps`.
+    #[allow(dead_code)]
     pub(crate) fn drain_dirty_objects(&self) -> Vec<ObjectId> {
         let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
         let co = self.card_objects.lock().unwrap_or_else(|e| e.into_inner());
@@ -160,12 +162,14 @@ impl CardTable {
     }
 
     /// Returns true if there are any dirty cards.
+    #[allow(dead_code)]
     pub(crate) fn has_dirty(&self) -> bool {
         let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
         cards.values().any(|&f| f == CARD_DIRTY)
     }
 
     /// Returns true if there are no dirty cards.
+    #[allow(dead_code)]
     pub(crate) fn is_clean(&self) -> bool {
         !self.has_dirty()
     }

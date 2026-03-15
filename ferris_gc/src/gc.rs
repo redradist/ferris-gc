@@ -55,7 +55,7 @@ impl ThinPtr for *const dyn Trace {
 /// the collector to miss live objects (leading to use-after-free) or loop
 /// infinitely. Follow these rules:
 ///
-/// - **`trace()`** must call `trace()` on every `Gc<T>`/`GcRefCell<T>` field.
+/// - **`trace()`** must call `trace()` on every `Gc<T>`/`GcCell<T>` field.
 ///   Missing a field means the collector may free a live object.
 /// - **`reset()`** must mirror `trace()` exactly — every field traced must
 ///   also be reset.
@@ -84,6 +84,14 @@ pub trait Trace: Finalize {
     /// Unconditionally clear mark-phase state without cascading.
     /// Used after sweep to reset surviving objects for the next collection cycle.
     fn clear_trace(&self) {}
+    /// Update internal pointers after object relocation during compaction.
+    /// Called during STW on each tracer; `old_ptr` is the original object address
+    /// and `new_ptr` is the new address after copying.
+    ///
+    /// # Safety
+    /// Must only be called during stop-the-world compaction. No concurrent access
+    /// to the relocated fields is permitted.
+    unsafe fn relocate(&self, _old_ptr: *const u8, _new_ptr: *const u8) {}
 }
 
 /// Destructor callback invoked by the collector before an object is deallocated.
@@ -104,7 +112,7 @@ pub trait Finalize {
 /// Convenience alias for an optional GC-managed pointer.
 pub type OptGc<T> = Option<Gc<T>>;
 /// Convenience alias for an optional GC-managed interior-mutable cell.
-pub type OptGcCell<T> = Option<GcRefCell<T>>;
+pub type OptGcCell<T> = Option<GcCell<T>>;
 
 struct GcInfo {
     root_ref_count: AtomicUsize,
@@ -118,7 +126,7 @@ impl GcInfo {
     }
 }
 
-/// Internal pointer wrapper used as the `Deref` target of `Gc<T>` and `GcRefCell<T>`.
+/// Internal pointer wrapper used as the `Deref` target of `Gc<T>` and `GcCell<T>`.
 /// This type is `pub` because it appears in the public `Deref` interface, but users
 /// should not need to name it directly — access `T` via double-deref (`**gc`).
 #[doc(hidden)]
@@ -267,6 +275,7 @@ where
     fn finalize(&self) {}
 }
 
+#[allow(dead_code)]
 pub(crate) struct GcInternal<T>
 where
     T: 'static + Sized + Trace,
@@ -330,6 +339,17 @@ where
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
         children.push(self.ptr as *const dyn Trace);
+    }
+
+    unsafe fn relocate(&self, old_ptr: *const u8, new_ptr: *const u8) {
+        if self.ptr as *const u8 == old_ptr {
+            // SAFETY: Called during STW compaction. The stw_lock write guard
+            // guarantees no concurrent access to this field. We mutate through
+            // a raw pointer because GcInternal is heap-allocated and we have
+            // exclusive access during STW.
+            let self_mut = self as *const Self as *mut Self;
+            unsafe { (*self_mut).ptr = new_ptr as *const GcPtr<T> };
+        }
     }
 }
 
@@ -546,7 +566,8 @@ where
     fn finalize(&self) {}
 }
 
-pub(crate) struct GcRefCellInternal<T>
+#[allow(dead_code)]
+pub(crate) struct GcCellInternal<T>
 where
     T: 'static + Sized + Trace,
 {
@@ -556,7 +577,7 @@ where
     pub(crate) object_id: ObjectId,
 }
 
-impl<T> GcRefCellInternal<T>
+impl<T> GcCellInternal<T>
 where
     T: 'static + Sized + Trace,
 {
@@ -564,8 +585,8 @@ where
         ptr: *const RefCell<GcPtr<T>>,
         tracer_id: TracerId,
         object_id: ObjectId,
-    ) -> GcRefCellInternal<T> {
-        GcRefCellInternal {
+    ) -> GcCellInternal<T> {
+        GcCellInternal {
             is_root: AtomicBool::new(true),
             ptr,
             tracer_id,
@@ -574,7 +595,7 @@ where
     }
 }
 
-impl<T> Trace for GcRefCellInternal<T>
+impl<T> Trace for GcCellInternal<T>
 where
     T: Sized + Trace,
 {
@@ -586,7 +607,7 @@ where
         if self.is_root.load(Ordering::Acquire) {
             self.is_root.store(false, Ordering::Release);
             unsafe {
-                // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+                // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
                 (*self.ptr).borrow().reset_root();
             }
         }
@@ -594,20 +615,20 @@ where
 
     fn trace(&self) {
         unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+            // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+            // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
@@ -616,7 +637,7 @@ where
     }
 }
 
-impl<T> Finalize for GcRefCellInternal<T>
+impl<T> Finalize for GcCellInternal<T>
 where
     T: Sized + Trace,
 {
@@ -630,18 +651,18 @@ where
 /// cross-generation references so that young-generation collections can
 /// discover pointers from old objects to young objects.
 ///
-/// Thread-local only — for a cross-thread variant, use [`sync::GcRefCell<T>`].
-pub struct GcRefCell<T>
+/// Thread-local only — for a cross-thread variant, use [`sync::GcCell<T>`].
+pub struct GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
-    internal_ptr: *mut GcRefCellInternal<T>,
+    internal_ptr: *mut GcCellInternal<T>,
     ptr: *const RefCell<GcPtr<T>>,
     tracer_id: TracerId,
     object_id: ObjectId,
 }
 
-impl<T> Drop for GcRefCell<T>
+impl<T> Drop for GcCell<T>
 where
     T: Sized + Trace,
 {
@@ -658,34 +679,34 @@ where
     }
 }
 
-impl<T> Deref for GcRefCell<T>
+impl<T> Deref for GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
     type Target = RefCell<GcPtr<T>>;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { &(*self.ptr) }
     }
 }
 
-impl<T> std::fmt::Debug for GcRefCell<T>
+impl<T> std::fmt::Debug for GcCell<T>
 where
     T: 'static + Sized + Trace + std::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("GcRefCell").field(&**self.borrow()).finish()
+        f.debug_tuple("GcCell").field(&**self.borrow()).finish()
     }
 }
 
-impl<T> GcRefCell<T>
+impl<T> GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
     /// Allocate a new GC-managed interior-mutable cell on the thread-local collector.
     /// The contained value can be borrowed mutably via `borrow_mut()`.
-    pub fn new(t: T) -> GcRefCell<T> {
+    pub fn new(t: T) -> GcCell<T> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
@@ -702,7 +723,7 @@ where
     }
 
     /// Allocate a new GC-managed interior-mutable cell in the specified region.
-    pub fn new_in(t: T, region: LocalRegionId) -> GcRefCell<T> {
+    pub fn new_in(t: T, region: LocalRegionId) -> GcCell<T> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
@@ -715,7 +736,7 @@ where
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     /// On OOM, triggers an emergency GC collection and retries once before failing.
-    pub fn try_new(t: T) -> Result<GcRefCell<T>, GcAllocError> {
+    pub fn try_new(t: T) -> Result<GcCell<T>, GcAllocError> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
@@ -732,7 +753,7 @@ where
     }
 
     /// Fallible allocation in a specified region.
-    pub fn try_new_in(t: T, region: LocalRegionId) -> Result<GcRefCell<T>, GcAllocError> {
+    pub fn try_new_in(t: T, region: LocalRegionId) -> Result<GcCell<T>, GcAllocError> {
         basic_gc_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
@@ -750,12 +771,12 @@ where
         LOCAL_GC.with(|gc| {
             gc.borrow().core.write_barrier(self.ptr as *const dyn Trace);
         });
-        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow_mut() }
     }
 }
 
-impl<T> Clone for GcRefCell<T>
+impl<T> Clone for GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
@@ -765,38 +786,38 @@ where
     }
 }
 
-impl<T> Trace for GcRefCell<T>
+impl<T> Trace for GcCell<T>
 where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
-        // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+        // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.internal_ptr).is_root() }
     }
 
     fn reset_root(&self) {
         unsafe {
-            // SAFETY: internal_ptr is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+            // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.internal_ptr).reset_root();
         }
     }
 
     fn trace(&self) {
         unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+            // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+            // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        // SAFETY: Pointer is valid for the lifetime of this GcRefCell handle; the GC guarantees the allocation is not freed while any handle exists.
+        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
         unsafe { (*self.ptr).borrow().is_traceable() }
     }
 
@@ -805,7 +826,7 @@ where
     }
 }
 
-impl<T> Finalize for GcRefCell<T>
+impl<T> Finalize for GcCell<T>
 where
     T: Sized + Trace,
 {
@@ -863,6 +884,11 @@ impl<T> GcWeak<T>
 where
     T: 'static + Sized + Trace,
 {
+    /// Returns `true` if the referenced object is still alive (not yet collected).
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     /// Try to upgrade this weak reference to a strong `Gc<T>`.
     /// Returns `None` if the object has been collected.
     pub fn upgrade(&self) -> Option<Gc<T>> {
@@ -955,6 +981,9 @@ pub(crate) enum GcObjMem {
     /// TLAB sub-allocation. The `Arc<crate::tlab::TlabBlock>` keeps the
     /// backing block alive until all objects in it are collected.
     Tlab(*mut u8, Arc<crate::tlab::TlabBlock>),
+    /// Compacted memory sub-allocation. The `Arc<CompactBlock>` keeps the
+    /// contiguous buffer alive until all compacted objects are collected.
+    Compact(*mut u8, Arc<CompactBlock>),
 }
 
 impl GcObjMem {
@@ -964,6 +993,7 @@ impl GcObjMem {
         match self {
             GcObjMem::Mem(p) => *p,
             GcObjMem::Tlab(p, _) => *p,
+            GcObjMem::Compact(p, _) => *p,
         }
     }
 
@@ -983,6 +1013,10 @@ impl GcObjMem {
                 // Dropping the Arc<TlabBlock>. When all Arcs for this block
                 // are dropped, the TlabBlock::drop frees the entire buffer.
                 // Individual sub-allocations within the block cannot be freed.
+            }
+            GcObjMem::Compact(_ptr, _block) => {
+                // Dropping the Arc<CompactBlock>. When all Arcs for this block
+                // are dropped, the CompactBlock::drop frees the entire buffer.
             }
         }
     }
@@ -1865,6 +1899,236 @@ impl GarbageCollector {
             self.track_dealloc(stats.bytes_freed);
 
             // Record diagnostics
+            stats.duration = start.elapsed();
+            self.total_collections.fetch_add(1, Ordering::Relaxed);
+            *self
+                .last_collection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(stats);
+            self.fire_on_collection(&stats);
+
+            stats
+        }
+    }
+
+    /// Collection with parallel mark AND parallel sweep.
+    ///
+    /// Uses rayon to parallelize the mark phase (root tracing) and the sweep phase
+    /// (deallocation). The mark phase partitions root tracers across worker threads;
+    /// each worker traces its assigned roots independently. This works because
+    /// `GcInfo::root_ref_count` uses `AtomicUsize` — concurrent mark is safe when
+    /// multiple threads call `trace()` on overlapping subgraphs.
+    ///
+    /// Best for large heaps with many root objects. For small heaps, the serial
+    /// `collect_generation()` is faster due to lower overhead.
+    ///
+    /// # Safety
+    /// Caller must ensure no references to GC-managed objects are being
+    /// actively dereferenced. STW write lock is acquired internally.
+    #[cfg(feature = "parallel")]
+    pub unsafe fn collect_parallel_mark(&self, max_gen: Generation) -> CollectionStats {
+        use rayon::prelude::*;
+
+        unsafe {
+            let start = std::time::Instant::now();
+            let mut stats = CollectionStats {
+                generation: max_gen,
+                objects_scanned: 0,
+                objects_collected: 0,
+                objects_promoted: 0,
+                tracers_collected: 0,
+                bytes_freed: 0,
+                duration: std::time::Duration::ZERO,
+            };
+
+            let (tracer_deallocs, object_deallocs) = {
+                let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
+                let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+
+                // Root discovery (serial — must complete before marking)
+                for entry in gc_maps.objects.values() {
+                    (&*entry.ptr).reset_root();
+                }
+
+                // Parallel mark phase: collect root tracers, then trace in parallel.
+                // SAFETY: GcInfo uses AtomicUsize for root_ref_count, so concurrent
+                // trace() calls on overlapping subgraphs are safe. During STW no
+                // mutator threads are running.
+                struct SendTracePtr(*const dyn Trace);
+                unsafe impl Send for SendTracePtr {}
+                unsafe impl Sync for SendTracePtr {}
+
+                let root_tracers: Vec<SendTracePtr> = gc_maps
+                    .tracers
+                    .values()
+                    .filter(|e| (&*e.tracer_ptr).is_root())
+                    .map(|e| SendTracePtr(e.tracer_ptr))
+                    .collect();
+
+                root_tracers.par_iter().for_each(|stp| {
+                    (&*stp.0).trace();
+                });
+
+                // Card table entries (serial, typically few entries)
+                if max_gen < Generation::Gen2 {
+                    let dirty_ids = self.card_table.dirty_objects();
+                    for obj_id in &dirty_ids {
+                        if let Some(entry) = gc_maps.objects.get(*obj_id) {
+                            (&*entry.ptr).trace();
+                        }
+                    }
+                }
+
+                // Build set of in-scope objects
+                let in_scope_objs: HashSet<ObjectId> = gc_maps
+                    .objects
+                    .iter()
+                    .filter(|(_, e)| e.generation <= max_gen)
+                    .map(|(id, _)| id)
+                    .collect();
+                stats.objects_scanned = in_scope_objs.len();
+
+                let in_scope_tracers: HashSet<TracerId> = gc_maps
+                    .tracers
+                    .iter()
+                    .filter(|(_, e)| in_scope_objs.contains(&e.object_id))
+                    .map(|(id, _)| id)
+                    .collect();
+
+                // Sweep tracers
+                let collected_tracers: Vec<TracerId> = gc_maps
+                    .tracers
+                    .iter()
+                    .filter(|(id, e)| {
+                        in_scope_tracers.contains(id) && !(&*e.tracer_ptr).is_traceable()
+                    })
+                    .map(|(id, _)| id)
+                    .collect();
+
+                let mut tracer_deallocs = Vec::new();
+                for tracer_id in &collected_tracers {
+                    if let Some(entry) = gc_maps.tracers.remove(*tracer_id) {
+                        tracer_deallocs.push((entry.mem, entry.layout));
+                    }
+                }
+                stats.tracers_collected = collected_tracers.len();
+
+                // Sweep objects
+                let collected_objects: Vec<ObjectId> = gc_maps
+                    .objects
+                    .iter()
+                    .filter(|(id, e)| in_scope_objs.contains(id) && !(&*e.ptr).is_traceable())
+                    .map(|(id, _)| id)
+                    .collect();
+                stats.objects_collected = collected_objects.len();
+
+                // Clear marks
+                for entry in gc_maps.objects.values() {
+                    (&*entry.ptr).clear_trace();
+                }
+
+                // Remove collected objects
+                let mut object_deallocs = Vec::new();
+                for &obj_id in &collected_objects {
+                    if let Some(entry) = gc_maps.objects.remove(obj_id) {
+                        let thin = entry.ptr.get_thin_ptr();
+                        gc_maps.ptr_to_object.remove(&thin);
+                        self.card_table.remove_object(thin, obj_id);
+                        stats.bytes_freed += entry.layout.size();
+                        if let Some(bytes) = gc_maps.region_total_bytes.get_mut(&entry.region) {
+                            *bytes = bytes.saturating_sub(entry.layout.size());
+                        }
+                        if let Some(count) = gc_maps.region_object_count.get_mut(&entry.region) {
+                            *count = count.saturating_sub(1);
+                        }
+                        if let Some(alive) = &entry.weak_alive {
+                            alive.store(false, Ordering::Release);
+                        }
+                        object_deallocs.push(entry);
+                    }
+                }
+
+                if max_gen >= Generation::Gen2 {
+                    self.card_table.clear_dirty();
+                }
+
+                // Promotion
+                let surviving_objs: Vec<ObjectId> = in_scope_objs
+                    .iter()
+                    .filter(|id| !collected_objects.contains(id))
+                    .copied()
+                    .collect();
+                for obj_id in surviving_objs {
+                    if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
+                        if entry.generation <= max_gen {
+                            let cur_gen = entry.generation;
+                            entry.survive_count += 1;
+                            let promo_cfg = self.promotion_config();
+                            if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
+                                entry.survive_count = 0;
+                                if let Some(next_gen) = cur_gen.next() {
+                                    entry.generation = next_gen;
+                                    stats.objects_promoted += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                (tracer_deallocs, object_deallocs)
+            };
+
+            if max_gen >= Generation::Gen0 {
+                self.allocation_count.store(0, Ordering::Relaxed);
+            }
+
+            // Parallel dealloc (same as collect_parallel)
+            struct SendObjectDealloc {
+                mem: GcObjMem,
+                layout: Layout,
+                finalize_fn: FinalizeFn,
+                drop_fn: DropFn,
+            }
+            unsafe impl Send for SendObjectDealloc {}
+            unsafe impl Sync for SendObjectDealloc {}
+
+            struct SendTracerDealloc {
+                mem: GcObjMem,
+                layout: Layout,
+            }
+            unsafe impl Send for SendTracerDealloc {}
+            unsafe impl Sync for SendTracerDealloc {}
+
+            let obj_dealloc_items: Vec<SendObjectDealloc> = object_deallocs
+                .into_iter()
+                .map(|entry| SendObjectDealloc {
+                    mem: entry.mem,
+                    layout: entry.layout,
+                    finalize_fn: entry.finalize_fn,
+                    drop_fn: entry.drop_fn,
+                })
+                .collect();
+
+            let tracer_dealloc_items: Vec<SendTracerDealloc> = tracer_deallocs
+                .into_iter()
+                .map(|(mem, layout)| SendTracerDealloc { mem, layout })
+                .collect();
+
+            obj_dealloc_items.into_par_iter().for_each(|item| {
+                let mem_ptr = item.mem.ptr();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (item.finalize_fn)(mem_ptr);
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (item.drop_fn)(mem_ptr);
+                }));
+                unsafe { item.mem.dealloc_mem(item.layout) };
+            });
+            tracer_dealloc_items.into_par_iter().for_each(|item| {
+                unsafe { item.mem.dealloc_mem(item.layout) };
+            });
+
+            self.track_dealloc(stats.bytes_freed);
             stats.duration = start.elapsed();
             self.total_collections.fetch_add(1, Ordering::Relaxed);
             *self
@@ -2772,6 +3036,195 @@ impl GarbageCollector {
             stats
         }
     }
+
+    /// Compact the heap by copying all live objects into a contiguous buffer.
+    ///
+    /// Performs a full collection first (to free dead objects), then:
+    /// 1. Allocates a single contiguous buffer for all live objects.
+    /// 2. Copies each live object (GcPtr) into the buffer at aligned offsets.
+    /// 3. Updates tracer pointers via `Trace::relocate()`.
+    /// 4. Updates ObjectEntry metadata.
+    /// 5. Frees old individual allocations.
+    ///
+    /// Returns the number of objects compacted.
+    ///
+    /// # Safety
+    /// Must not be called while any GC references are being dereferenced.
+    /// For thread-local GC this is trivially safe (single-threaded).
+    /// For global GC, STW write lock is acquired internally.
+    pub unsafe fn compact(&self) -> usize {
+        unsafe {
+            // Full collection first to free dead objects
+            self.collect();
+
+            let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+
+            let num_objects = gc_maps.objects.len();
+            if num_objects == 0 {
+                return 0;
+            }
+
+            // Calculate total size needed with proper alignment
+            let mut total_size: usize = 0;
+            let mut obj_layouts: Vec<(ObjectId, Layout)> = Vec::with_capacity(num_objects);
+            for (id, entry) in gc_maps.objects.iter() {
+                let layout = entry.layout;
+                // Align up
+                let align_offset = total_size % layout.align();
+                if align_offset != 0 {
+                    total_size += layout.align() - align_offset;
+                }
+                obj_layouts.push((id, layout));
+                total_size += layout.size();
+            }
+
+            if total_size == 0 {
+                return 0;
+            }
+
+            // Allocate contiguous buffer with max alignment
+            let max_align = obj_layouts
+                .iter()
+                .map(|(_, l)| l.align())
+                .max()
+                .unwrap_or(1);
+            let compact_layout = match Layout::from_size_align(total_size, max_align) {
+                Ok(l) => l,
+                Err(_) => return 0,
+            };
+            let compact_buf = alloc(compact_layout);
+            if compact_buf.is_null() {
+                return 0; // allocation failed, skip compaction
+            }
+
+            // Copy each object into the contiguous buffer
+            let mut offset: usize = 0;
+            let mut relocations: Vec<(ObjectId, *const u8, *mut u8, GcObjMem, Layout)> =
+                Vec::with_capacity(num_objects);
+
+            for (id, layout) in &obj_layouts {
+                // Align offset
+                let align_offset = offset % layout.align();
+                if align_offset != 0 {
+                    offset += layout.align() - align_offset;
+                }
+
+                let entry = gc_maps.objects.get(*id).unwrap();
+                let old_ptr = entry.mem.ptr();
+                let new_ptr = compact_buf.add(offset);
+
+                // Copy object data
+                std::ptr::copy_nonoverlapping(old_ptr, new_ptr, layout.size());
+
+                let old_mem = std::ptr::read(&entry.mem as *const GcObjMem);
+                relocations.push((*id, old_ptr as *const u8, new_ptr, old_mem, *layout));
+
+                offset += layout.size();
+            }
+
+            // Update ObjectEntry pointers and create new GcObjMem for each object.
+            // All objects now live in the compact buffer. We use Mem variant pointing
+            // into the buffer. Only the LAST object "owns" the buffer for dealloc;
+            // others use a Tlab-like scheme. For simplicity, we track the buffer
+            // separately and never dealloc individual objects from it.
+            // Instead, we store a shared Arc that owns the compact buffer.
+            let compact_block = Arc::new(CompactBlock {
+                ptr: compact_buf,
+                layout: compact_layout,
+            });
+
+            for (id, _old_raw, new_raw, _old_mem, layout) in &relocations {
+                // Two-phase update: first update ObjectEntry (needs &mut objects),
+                // then update ptr_to_object (needs &mut ptr_to_object).
+                // We collect the old/new thin ptrs to avoid overlapping borrows.
+                let (old_thin, new_thin) = {
+                    let entry = match gc_maps.objects.get_mut(*id) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    let old_thin = entry.ptr.get_thin_ptr();
+
+                    // Reconstruct fat pointer: preserve vtable, update data pointer.
+                    // SAFETY: new_raw points to a valid copy of the original object
+                    // within the compact buffer. The object was fully copied above.
+                    let mut fat_ptr_bytes = [0u8; std::mem::size_of::<*const dyn Trace>()];
+                    std::ptr::copy_nonoverlapping(
+                        &entry.ptr as *const *const dyn Trace as *const u8,
+                        fat_ptr_bytes.as_mut_ptr(),
+                        fat_ptr_bytes.len(),
+                    );
+                    // Overwrite data pointer (first pointer-sized field)
+                    std::ptr::copy_nonoverlapping(
+                        &(*new_raw as *const u8) as *const *const u8 as *const u8,
+                        fat_ptr_bytes.as_mut_ptr(),
+                        std::mem::size_of::<*const u8>(),
+                    );
+                    let new_fat_ptr: *const dyn Trace =
+                        std::ptr::read(fat_ptr_bytes.as_ptr() as *const *const dyn Trace);
+                    entry.ptr = new_fat_ptr;
+                    let new_thin = entry.ptr.get_thin_ptr();
+
+                    // Replace memory tracking with compact block reference
+                    entry.mem = GcObjMem::Compact(*new_raw, compact_block.clone());
+                    entry.layout = *layout;
+
+                    (old_thin, new_thin)
+                };
+
+                // Update ptr_to_object mapping (borrows gc_maps, not gc_maps.objects)
+                gc_maps.ptr_to_object.remove(&old_thin);
+                gc_maps.ptr_to_object.insert(new_thin, *id);
+
+                // Update card table
+                self.card_table.remove_object(old_thin, *id);
+                self.card_table.register_object(new_thin, *id);
+            }
+
+            // Relocate tracer pointers: tell each GcInternal to update its gc_ptr field
+            for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
+                for (_, old_raw, new_raw, _, _) in &relocations {
+                    (&*tracer_entry.tracer_ptr).relocate(*old_raw, *new_raw);
+                }
+            }
+
+            // Free old allocations (the original scattered memory)
+            // Drop happens outside gc_maps lock
+            let old_mems: Vec<(GcObjMem, Layout)> = relocations
+                .into_iter()
+                .map(|(_, _, _, old_mem, layout)| (old_mem, layout))
+                .collect();
+
+            drop(gc_maps);
+
+            for (mem, layout) in old_mems {
+                mem.dealloc_mem(layout);
+            }
+
+            num_objects
+        }
+    }
+}
+
+/// RAII guard for a compacted memory block.
+/// Frees the contiguous buffer when all objects in it have been collected.
+pub(crate) struct CompactBlock {
+    ptr: *mut u8,
+    layout: Layout,
+}
+
+// SAFETY: The block is only freed when all Arc references are dropped (during sweep),
+// and the GC ensures no references exist at that point.
+unsafe impl Send for CompactBlock {}
+unsafe impl Sync for CompactBlock {}
+
+impl Drop for CompactBlock {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.layout.size() > 0 {
+            // SAFETY: ptr was allocated with this layout via alloc().
+            unsafe { dealloc(self.ptr, self.layout) };
+        }
+    }
 }
 
 /// Thread-local garbage collector wrapper.
@@ -2990,14 +3443,14 @@ impl LocalGarbageCollector {
         }
     }
 
-    unsafe fn create_gc_cell<T>(&mut self, t: T, region: RegionId) -> GcRefCell<T>
+    unsafe fn create_gc_cell<T>(&mut self, t: T, region: RegionId) -> GcCell<T>
     where
         T: Sized + Trace,
     {
         unsafe {
             let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem_tlab::<RefCell<GcPtr<T>>>();
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                self.core.alloc_mem::<GcRefCellInternal<T>>();
+                self.core.alloc_mem::<GcCellInternal<T>>();
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
@@ -3046,11 +3499,11 @@ impl LocalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
-                GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
+                GcCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
             drop(gc_maps);
 
-            let gc = GcRefCell {
+            let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
                 tracer_id,
@@ -3064,13 +3517,13 @@ impl LocalGarbageCollector {
         }
     }
 
-    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcRefCell<T>) -> GcRefCell<T>
+    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcCell<T>) -> GcCell<T>
     where
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcRefCellInternal<T>>();
-            // SAFETY: internal_ptr is valid for the lifetime of the source GcRefCell handle.
+            let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcCellInternal<T>>();
+            // SAFETY: internal_ptr is valid for the lifetime of the source GcCell handle.
             let object_id = (*gc.internal_ptr).object_id;
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
@@ -3088,16 +3541,16 @@ impl LocalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_inter_ptr,
-                GcRefCellInternal::new(gc.ptr, tracer_id, object_id),
+                GcCellInternal::new(gc.ptr, tracer_id, object_id),
             );
             drop(gc_maps);
-            let gc = GcRefCell {
+            let gc = GcCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
                 tracer_id,
                 object_id,
             };
-            // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source GcRefCell.
+            // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source GcCell.
             (*(*gc.internal_ptr).ptr).reset_root();
             gc
         }
@@ -3185,14 +3638,14 @@ impl LocalGarbageCollector {
         &mut self,
         t: T,
         region: RegionId,
-    ) -> Result<GcRefCell<T>, GcAllocError>
+    ) -> Result<GcCell<T>, GcAllocError>
     where
         T: Sized + Trace,
     {
         unsafe {
             let (gc_ptr, mem_info_gc_ptr) = self.try_alloc_mem_tlab::<RefCell<GcPtr<T>>>()?;
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem_with_gc::<GcRefCellInternal<T>>() {
+                match self.core.try_alloc_mem_with_gc::<GcCellInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
@@ -3248,11 +3701,11 @@ impl LocalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
-                GcRefCellInternal::new(gc_ptr, tracer_id, obj_id),
+                GcCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
             drop(gc_maps);
 
-            let gc = GcRefCell {
+            let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
                 tracer_id,
@@ -3335,6 +3788,17 @@ impl LocalGarbageCollector {
     pub unsafe fn collect_parallel(&self, max_gen: Generation) -> CollectionStats {
         // SAFETY: Caller upholds the safety contract; delegates to core.collect_parallel().
         unsafe { self.core.collect_parallel(max_gen) }
+    }
+
+    /// Collection with parallel mark AND parallel sweep using rayon.
+    /// Parallelizes root tracing across worker threads for faster marking
+    /// on large heaps with many roots.
+    ///
+    /// # Safety
+    /// Must not be called while any GC references are being dereferenced.
+    #[cfg(feature = "parallel")]
+    pub unsafe fn collect_parallel_mark(&self, max_gen: Generation) -> CollectionStats {
+        unsafe { self.core.collect_parallel_mark(max_gen) }
     }
 
     pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
@@ -3522,6 +3986,18 @@ impl LocalGarbageCollector {
     pub fn clear_on_collection(&self) {
         self.core.clear_on_collection();
     }
+
+    /// Compact the heap by copying all live objects into a contiguous buffer.
+    /// Runs a full collection first, then relocates surviving objects for
+    /// improved cache locality and reduced fragmentation.
+    ///
+    /// Returns the number of objects compacted.
+    ///
+    /// # Safety
+    /// Must not be called while any GC references are being dereferenced.
+    pub unsafe fn compact(&self) -> usize {
+        unsafe { self.core.compact() }
+    }
 }
 
 // ---- LocalRegionId helpers for thread-local GC ----
@@ -3537,17 +4013,14 @@ impl LocalRegionId {
         Gc::try_new_in(t, self)
     }
 
-    /// Allocate a new `GcRefCell<T>` in this region (thread-local collector).
-    pub fn gc_cell<T: 'static + Sized + Trace>(self, t: T) -> GcRefCell<T> {
-        GcRefCell::new_in(t, self)
+    /// Allocate a new `GcCell<T>` in this region (thread-local collector).
+    pub fn gc_cell<T: 'static + Sized + Trace>(self, t: T) -> GcCell<T> {
+        GcCell::new_in(t, self)
     }
 
-    /// Fallible `GcRefCell<T>` allocation in this region (thread-local collector).
-    pub fn try_gc_cell<T: 'static + Sized + Trace>(
-        self,
-        t: T,
-    ) -> Result<GcRefCell<T>, GcAllocError> {
-        GcRefCell::try_new_in(t, self)
+    /// Fallible `GcCell<T>` allocation in this region (thread-local collector).
+    pub fn try_gc_cell<T: 'static + Sized + Trace>(self, t: T) -> Result<GcCell<T>, GcAllocError> {
+        GcCell::try_new_in(t, self)
     }
 }
 
@@ -3681,7 +4154,7 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
-    use crate::gc::{Gc, GcRefCell, LOCAL_GC};
+    use crate::gc::{Gc, GcCell, LOCAL_GC};
     use crate::{Finalize, Trace};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4265,8 +4738,8 @@ mod tests {
     #[test]
     fn write_barrier_marks_old_gen_object_card_dirty() {
         clean_gc_state();
-        use crate::gc::GcRefCell;
-        let cell = GcRefCell::new(Option::<Gc<i32>>::None);
+        use crate::gc::GcCell;
+        let cell = GcCell::new(Option::<Gc<i32>>::None);
 
         // Promote cell's object to Gen1 (survive 3 Gen0 collections)
         LOCAL_GC.with(|gc| {
@@ -4321,8 +4794,8 @@ mod tests {
     #[test]
     fn card_table_cleared_on_full_collection() {
         clean_gc_state();
-        use crate::gc::GcRefCell;
-        let cell = GcRefCell::new(Option::<Gc<i32>>::None);
+        use crate::gc::GcCell;
+        let cell = GcCell::new(Option::<Gc<i32>>::None);
 
         // Promote to Gen1
         LOCAL_GC.with(|gc| {
@@ -4364,8 +4837,8 @@ mod tests {
         // Key correctness test: an old-gen object holds a reference to a young
         // object. Without write barrier, the young object would be collected.
         clean_gc_state();
-        use crate::gc::GcRefCell;
-        let cell = GcRefCell::new(Option::<Gc<i32>>::None);
+        use crate::gc::GcCell;
+        let cell = GcCell::new(Option::<Gc<i32>>::None);
 
         // Promote cell to Gen1
         LOCAL_GC.with(|gc| {
@@ -4417,8 +4890,8 @@ mod tests {
     #[test]
     fn no_write_barrier_for_gen0_objects() {
         clean_gc_state();
-        use crate::gc::GcRefCell;
-        let cell = GcRefCell::new(Option::<Gc<i32>>::None);
+        use crate::gc::GcCell;
+        let cell = GcCell::new(Option::<Gc<i32>>::None);
 
         // Cell is still in Gen0 — borrow_mut should NOT mark card dirty
         **cell.borrow_mut() = Some(Gc::new(1));
@@ -4660,8 +5133,8 @@ mod tests {
     fn incremental_with_child_references() {
         // Test that trace_children discovers object graph correctly
         clean_gc_state();
-        use crate::gc::GcRefCell;
-        let parent = GcRefCell::new(Option::<Gc<i32>>::None);
+        use crate::gc::GcCell;
+        let parent = GcCell::new(Option::<Gc<i32>>::None);
         let child = Gc::new(42);
         **parent.borrow_mut() = Some(child.clone());
         drop(child); // only reference is from parent
@@ -4798,9 +5271,9 @@ mod tests {
     #[test]
     fn try_new_gc_ref_cell_succeeds() {
         clean_gc_state();
-        use crate::gc::GcRefCell;
-        let result = GcRefCell::try_new(100);
-        assert!(result.is_ok(), "try_new should succeed for GcRefCell");
+        use crate::gc::GcCell;
+        let result = GcCell::try_new(100);
+        assert!(result.is_ok(), "try_new should succeed for GcCell");
         let cell = result.unwrap();
         assert_eq!(**cell.borrow(), 100);
     }
@@ -4966,9 +5439,9 @@ mod tests {
     #[test]
     fn debug_gc_ref_cell_prints_value() {
         clean_gc_state();
-        let cell = GcRefCell::new(7);
+        let cell = GcCell::new(7);
         let s = format!("{:?}", cell);
-        assert_eq!(s, "GcRefCell(7)");
+        assert_eq!(s, "GcCell(7)");
     }
 
     #[test]
@@ -5610,10 +6083,10 @@ mod tests {
         clean_gc_state();
         // Create two objects forming a cycle so RC hybrid does NOT eagerly free them.
         // Only mark-sweep collection can reclaim cycles.
-        let a = Gc::new(GcRefCell::new(
-            Option::<Gc<GcRefCell<Option<Gc<GcRefCell<Option<i32>>>>>>>::None,
+        let a = Gc::new(GcCell::new(
+            Option::<Gc<GcCell<Option<Gc<GcCell<Option<i32>>>>>>>::None,
         ));
-        let b = Gc::new(GcRefCell::new(Some(a.clone())));
+        let b = Gc::new(GcCell::new(Some(a.clone())));
         // We just need objects that survive past drop for the collector to find them.
         // Instead, use a simpler approach: just allocate, drop, and collect in separate scopes.
         drop(a);
@@ -6059,9 +6532,9 @@ mod tests {
 
     #[test]
     fn tlab_gc_ref_cell_allocation() {
-        // GcRefCell should also use the TLAB for allocation.
+        // GcCell should also use the TLAB for allocation.
         clean_gc_state();
-        let cell = GcRefCell::new(String::from("hello"));
+        let cell = GcCell::new(String::from("hello"));
         {
             let borrowed = cell.borrow();
             assert_eq!(&***borrowed, "hello");
@@ -6087,7 +6560,7 @@ mod tests {
         for _ in 0..10 {
             let _a = Gc::new(42i32);
             let _b = Gc::new(String::from("test"));
-            let _c = GcRefCell::new(vec![1, 2, 3]);
+            let _c = GcCell::new(vec![1, 2, 3]);
             // Drop _a, _b, _c at end of iteration
         }
         // Force collection
