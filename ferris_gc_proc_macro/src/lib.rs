@@ -490,15 +490,15 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
                     ..ferris_gc::ThresholdConfig::default()
                 };
                 ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
-                    let (start, stop) = ferris_gc::threshold_local_start(ferris_gc::ThresholdConfig {
+                    let strategy = ferris_gc::threshold_local_strategy(ferris_gc::ThresholdConfig {
                         #(#overrides,)*
                         ..ferris_gc::ThresholdConfig::default()
                     });
-                    s.borrow().change_strategy(start, stop);
+                    s.borrow().set_strategy(strategy);
                 });
                 {
-                    let (start, stop) = ferris_gc::threshold_global_start(__ferris_gc_config);
-                    ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+                    let strategy = ferris_gc::threshold_global_strategy(__ferris_gc_config);
+                    ferris_gc::sync::GLOBAL_GC_STRATEGY.set_strategy(strategy);
                 }
             }
         }
@@ -549,15 +549,15 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
                     ..ferris_gc::AdaptiveConfig::default()
                 };
                 ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
-                    let (start, stop) = ferris_gc::adaptive_local_start(ferris_gc::AdaptiveConfig {
+                    let strategy = ferris_gc::adaptive_local_strategy(ferris_gc::AdaptiveConfig {
                         #(#overrides,)*
                         ..ferris_gc::AdaptiveConfig::default()
                     });
-                    s.borrow().change_strategy(start, stop);
+                    s.borrow().set_strategy(strategy);
                 });
                 {
-                    let (start, stop) = ferris_gc::adaptive_global_start(__ferris_gc_config);
-                    ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+                    let strategy = ferris_gc::adaptive_global_strategy(__ferris_gc_config);
+                    ferris_gc::sync::GLOBAL_GC_STRATEGY.set_strategy(strategy);
                 }
             }
         }
@@ -596,15 +596,15 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
                     ..ferris_gc::BackgroundConfig::default()
                 };
                 ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
-                    let (start, stop) = ferris_gc::background_local_start(ferris_gc::BackgroundConfig {
+                    let strategy = ferris_gc::background_local_strategy(ferris_gc::BackgroundConfig {
                         #(#overrides,)*
                         ..ferris_gc::BackgroundConfig::default()
                     });
-                    s.borrow().change_strategy(start, stop);
+                    s.borrow().set_strategy(strategy);
                 });
                 {
-                    let (start, stop) = ferris_gc::background_global_start(__ferris_gc_config);
-                    ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+                    let strategy = ferris_gc::background_global_strategy(__ferris_gc_config);
+                    ferris_gc::sync::GLOBAL_GC_STRATEGY.set_strategy(strategy);
                 }
             }
         }
@@ -639,15 +639,15 @@ pub fn ferris_gc_main(attrs: TokenStream, item: TokenStream) -> TokenStream {
                     ..ferris_gc::G1Config::default()
                 };
                 ferris_gc::LOCAL_GC_STRATEGY.with(|s| {
-                    let (start, stop) = ferris_gc::g1_local_start(ferris_gc::G1Config {
+                    let strategy = ferris_gc::g1_local_strategy(ferris_gc::G1Config {
                         #(#overrides,)*
                         ..ferris_gc::G1Config::default()
                     });
-                    s.borrow().change_strategy(start, stop);
+                    s.borrow().set_strategy(strategy);
                 });
                 {
-                    let (start, stop) = ferris_gc::g1_global_start(__ferris_gc_config);
-                    ferris_gc::sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+                    let strategy = ferris_gc::g1_global_strategy(__ferris_gc_config);
+                    ferris_gc::sync::GLOBAL_GC_STRATEGY.set_strategy(strategy);
                 }
             }
         }

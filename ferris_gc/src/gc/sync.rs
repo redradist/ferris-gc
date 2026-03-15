@@ -1522,19 +1522,16 @@ impl SyncRegionId {
     }
 }
 
-/// Callback to start a global collection strategy.
-pub type StartGlobalStrategyFn =
+/// Callback type for a global collection strategy.
+pub type GlobalStrategyFn =
     Box<dyn FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
-/// Callback to stop a global collection strategy.
-pub type StopGlobalStrategyFn = Box<dyn FnMut(&'static GlobalGarbageCollector)>;
 
 /// Pluggable collection strategy for the global (thread-safe) GC.
-/// Controls when and how garbage collection runs. Use `change_strategy` to swap at runtime.
+/// Controls when and how garbage collection runs. Use `set_strategy` to swap at runtime.
 pub struct GlobalStrategy {
     gc: Cell<&'static GlobalGarbageCollector>,
     is_active: AtomicBool,
-    start_func: Mutex<StartGlobalStrategyFn>,
-    stop_func: Mutex<StopGlobalStrategyFn>,
+    strategy_func: Mutex<GlobalStrategyFn>,
     join_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -1544,39 +1541,33 @@ unsafe impl Sync for GlobalStrategy {}
 unsafe impl Send for GlobalStrategy {}
 
 impl GlobalStrategy {
-    fn new<StartFn, StopFn>(
+    fn new<StrategyFn>(
         gc: &'static GlobalGarbageCollector,
-        start_fn: StartFn,
-        stop_fn: StopFn,
+        strategy_fn: StrategyFn,
     ) -> GlobalStrategy
     where
-        StartFn: 'static
+        StrategyFn: 'static
             + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
-        StopFn: 'static + FnMut(&'static GlobalGarbageCollector),
     {
         GlobalStrategy {
             gc: Cell::new(gc),
             is_active: AtomicBool::new(false),
-            start_func: Mutex::new(Box::new(start_fn)),
-            stop_func: Mutex::new(Box::new(stop_fn)),
+            strategy_func: Mutex::new(Box::new(strategy_fn)),
             join_handle: Mutex::new(None),
         }
     }
 
     /// Replace the current collection strategy. Stops the current strategy first if active.
-    pub fn change_strategy<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn)
+    pub fn set_strategy<StrategyFn>(&self, strategy_fn: StrategyFn)
     where
-        StartFn: 'static
+        StrategyFn: 'static
             + FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
-        StopFn: 'static + FnMut(&'static GlobalGarbageCollector),
     {
         if self.is_active() {
             self.stop();
         }
-        let mut start_func = self.start_func.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stop_func = self.stop_func.lock().unwrap_or_else(|e| e.into_inner());
-        *start_func = Box::new(start_fn);
-        *stop_func = Box::new(stop_fn);
+        let mut strategy_func = self.strategy_func.lock().unwrap_or_else(|e| e.into_inner());
+        *strategy_func = Box::new(strategy_fn);
     }
 
     /// Returns `true` if the strategy's background collection is currently running.
@@ -1591,18 +1582,18 @@ impl GlobalStrategy {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            let mut start_func = self.start_func.lock().unwrap_or_else(|e| e.into_inner());
+            let mut strategy_func = self.strategy_func.lock().unwrap_or_else(|e| e.into_inner());
             let mut join_handle = self.join_handle.lock().unwrap_or_else(|e| e.into_inner());
-            *join_handle = (*(start_func))(self.gc.get(), &self.is_active);
+            *join_handle = (*(strategy_func))(self.gc.get(), &self.is_active);
         }
     }
 
     /// Start the collection strategy (e.g., spawn a background collection thread).
     pub fn start(&'static self) {
         self.is_active.store(true, Ordering::Release);
-        let mut start_func = self.start_func.lock().unwrap_or_else(|e| e.into_inner());
+        let mut strategy_func = self.strategy_func.lock().unwrap_or_else(|e| e.into_inner());
         let mut join_handle = self.join_handle.lock().unwrap_or_else(|e| e.into_inner());
-        *join_handle = (*(start_func))(self.gc.get(), &self.is_active);
+        *join_handle = (*(strategy_func))(self.gc.get(), &self.is_active);
     }
 
     /// Stop the collection strategy and join any background thread.
@@ -1612,18 +1603,14 @@ impl GlobalStrategy {
         if let Some(join_handle) = join_handle.take() {
             join_handle
                 .join()
-                .expect("GlobalStrategy::stop, GlobalStrategy Thread being joined has panicked !!");
+                .expect("GlobalStrategy::stop: strategy thread panicked");
         }
-        let mut stop_func = self.stop_func.lock().unwrap_or_else(|e| e.into_inner());
-        (*(stop_func))(self.gc.get());
     }
 }
 
 impl Drop for GlobalStrategy {
     fn drop(&mut self) {
         self.is_active.store(false, Ordering::Release);
-        let mut stop_func = self.stop_func.lock().unwrap_or_else(|e| e.into_inner());
-        (*(stop_func))(self.gc.get());
     }
 }
 
@@ -1631,22 +1618,13 @@ lazy_static! {
     pub static ref GLOBAL_GC: GlobalGarbageCollector = GlobalGarbageCollector::new();
     pub static ref GLOBAL_GC_STRATEGY: GlobalStrategy = {
         let gc = &(*GLOBAL_GC);
-        GlobalStrategy::new(
-            gc,
-            move |global_gc, _| {
-                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                *basic_strategy_global_gc = Some(global_gc);
-                None
-            },
-            move |_global_gc| {
-                let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                *basic_strategy_global_gc = None;
-            },
-        )
+        GlobalStrategy::new(gc, move |global_gc, _| {
+            let mut basic_strategy_global_gc = BASIC_STRATEGY_GLOBAL_GC
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            *basic_strategy_global_gc = Some(global_gc);
+            None
+        })
     };
 }
 
@@ -1852,17 +1830,17 @@ mod tests {
     }
 
     #[test]
-    fn change_strategy_while_active_does_not_deadlock() {
+    fn set_strategy_while_active_does_not_deadlock() {
         let (_guard, _) = setup();
         let _gc = Gc::new(1); // ensures strategy is started
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use crate::gc::sync::GLOBAL_GC_STRATEGY;
-            GLOBAL_GC_STRATEGY.change_strategy(|_gc, _| None, |_gc| {});
+            GLOBAL_GC_STRATEGY.set_strategy(|_gc, _| None);
             tx.send(()).unwrap();
         });
         rx.recv_timeout(std::time::Duration::from_secs(3))
-            .expect("change_strategy deadlocked when called while active");
+            .expect("set_strategy deadlocked when called while active");
     }
 
     #[test]

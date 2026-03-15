@@ -35,9 +35,8 @@ fn main() {
     // Disable the default basic strategy and use threshold-based collection.
     ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
     {
-        let (start, stop) =
-            ferris_gc::threshold_global_start(ferris_gc::ThresholdConfig::default());
-        sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+        let strategy = ferris_gc::threshold_global_strategy(ferris_gc::ThresholdConfig::default());
+        sync::GLOBAL_GC_STRATEGY.set_strategy(strategy);
     }
 
     // --- Promotion config ---

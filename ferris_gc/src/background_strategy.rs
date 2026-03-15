@@ -42,34 +42,32 @@ impl Default for BackgroundConfig {
     }
 }
 
-/// Creates start/stop closures for a local background strategy.
+/// Creates a strategy closure for a local background collector.
 ///
-/// The start closure spawns **two** threads:
+/// The returned closure spawns **two** threads:
 /// - **Foreground thread**: polls `allocation_count` and triggers Gen0/Gen1 STW collections.
 /// - **Background Gen2 thread**: monitors heap occupancy and runs concurrent Gen2 collection
 ///   (`begin_concurrent_collection` → `concurrent_mark_step` loop → `finish_collection`).
 ///
 /// Both threads share the same `is_active` flag and exit when it becomes `false`.
-/// The background thread handle is stored in shared state so the stop closure can join it.
+/// The foreground thread joins the background thread on exit.
 #[allow(clippy::type_complexity)]
-pub fn background_local_start(
+pub fn background_local_strategy(
     config: BackgroundConfig,
-) -> (
-    impl FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> + 'static,
-    impl FnMut(&'static LocalGarbageCollector) + 'static,
-) {
+) -> impl FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> + 'static
+{
     let config = Arc::new(config);
-    let bg_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
-    let config_start = config.clone();
-    let bg_handle_start = bg_handle.clone();
-
-    let start_fn = move |gc: &'static LocalGarbageCollector,
-                         is_active: &'static AtomicBool|
+    move |gc: &'static LocalGarbageCollector,
+          is_active: &'static AtomicBool|
           -> Option<JoinHandle<()>> {
-        let config_bg = config_start.clone();
+        let config_bg = config.clone();
+        let config_fg = config.clone();
 
         // Spawn background Gen2 thread
+        let bg_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let bg_handle_fg = bg_handle.clone();
+
         let bg_thread = thread::spawn(move || {
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config_bg.poll_interval);
@@ -119,13 +117,11 @@ pub fn background_local_start(
             }
         });
 
-        // Store background thread handle for later joining
+        // Store background thread handle
         {
-            let mut handle = bg_handle_start.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handle = bg_handle.lock().unwrap_or_else(|e| e.into_inner());
             *handle = Some(bg_thread);
         }
-
-        let config_fg = config_start.clone();
 
         // Spawn foreground Gen0/Gen1 thread — returned as the main strategy handle
         Some(thread::spawn(move || {
@@ -157,43 +153,36 @@ pub fn background_local_start(
             unsafe {
                 gc.core.collect_generation(Generation::Gen1);
             }
+            // Join the background Gen2 thread before exiting
+            let mut handle = bg_handle_fg.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = handle.take() {
+                let _ = h.join();
+            }
         }))
-    };
-
-    let stop_fn = move |_gc: &'static LocalGarbageCollector| {
-        // Join the background Gen2 thread
-        let mut handle = bg_handle.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(h) = handle.take() {
-            let _ = h.join();
-        }
-    };
-
-    (start_fn, stop_fn)
+    }
 }
 
-/// Creates start/stop closures for a global background strategy.
+/// Creates a strategy closure for a global background collector.
 ///
 /// Same two-thread architecture as the local variant, but operates on the
 /// global (thread-safe) `GlobalGarbageCollector`.
 #[allow(clippy::type_complexity)]
-pub fn background_global_start(
+pub fn background_global_strategy(
     config: BackgroundConfig,
-) -> (
-    impl FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> + 'static,
-    impl FnMut(&'static GlobalGarbageCollector) + 'static,
-) {
+) -> impl FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> + 'static
+{
     let config = Arc::new(config);
-    let bg_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
-    let config_start = config.clone();
-    let bg_handle_start = bg_handle.clone();
-
-    let start_fn = move |gc: &'static GlobalGarbageCollector,
-                         is_active: &'static AtomicBool|
+    move |gc: &'static GlobalGarbageCollector,
+          is_active: &'static AtomicBool|
           -> Option<JoinHandle<()>> {
-        let config_bg = config_start.clone();
+        let config_bg = config.clone();
+        let config_fg = config.clone();
 
         // Spawn background Gen2 thread
+        let bg_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let bg_handle_fg = bg_handle.clone();
+
         let bg_thread = thread::spawn(move || {
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config_bg.poll_interval);
@@ -203,12 +192,10 @@ pub fn background_global_start(
                 let peak = gc.core.peak_heap_size.load(Ordering::Relaxed);
 
                 if peak > 0 && current as f64 > peak as f64 * config_bg.gen2_occupancy_trigger {
-                    // Begin concurrent Gen2 collection (brief STW for snapshot)
                     unsafe {
                         gc.core.begin_concurrent_collection(Generation::Gen2);
                     }
 
-                    // Concurrent mark steps — NO STW lock needed
                     loop {
                         if !is_active.load(Ordering::Acquire) {
                             break;
@@ -219,11 +206,9 @@ pub fn background_global_start(
                         if done {
                             break;
                         }
-                        // Yield between mark steps to allow foreground Gen0/Gen1 collections
                         thread::yield_now();
                     }
 
-                    // Finish collection (brief STW for re-mark + sweep)
                     unsafe {
                         gc.core.finish_collection();
                     }
@@ -243,56 +228,46 @@ pub fn background_global_start(
             }
         });
 
-        // Store background thread handle for later joining
         {
-            let mut handle = bg_handle_start.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handle = bg_handle.lock().unwrap_or_else(|e| e.into_inner());
             *handle = Some(bg_thread);
         }
 
-        let config_fg = config_start.clone();
+        let config_fg2 = config_fg.clone();
 
-        // Spawn foreground Gen0/Gen1 thread — returned as the main strategy handle
         Some(thread::spawn(move || {
             let mut gen0_count: u32 = 0;
             let mut gen1_count: u32 = 0;
             while is_active.load(Ordering::Acquire) {
-                thread::sleep(config_fg.poll_interval);
+                thread::sleep(config_fg2.poll_interval);
                 let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
-                if allocs >= config_fg.gen0_threshold {
+                if allocs >= config_fg2.gen0_threshold {
                     unsafe {
                         gc.core.collect_generation(Generation::Gen0);
                     }
                     gen0_count += 1;
-                    if gen0_count >= config_fg.gen0_collections_per_gen1 {
+                    if gen0_count >= config_fg2.gen0_collections_per_gen1 {
                         gen0_count = 0;
                         unsafe {
                             gc.core.collect_generation(Generation::Gen1);
                         }
                         gen1_count += 1;
-                        if gen1_count >= config_fg.gen1_collections_per_gen2 {
+                        if gen1_count >= config_fg2.gen1_collections_per_gen2 {
                             gen1_count = 0;
-                            // In background strategy, Gen2 is handled by the background
-                            // thread using concurrent marking. We skip STW Gen2 here.
                         }
                     }
                 }
             }
-            // Final STW Gen0/Gen1 collection on shutdown
             unsafe {
                 gc.core.collect_generation(Generation::Gen1);
             }
+            // Join the background Gen2 thread before exiting
+            let mut handle = bg_handle_fg.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = handle.take() {
+                let _ = h.join();
+            }
         }))
-    };
-
-    let stop_fn = move |_gc: &'static GlobalGarbageCollector| {
-        // Join the background Gen2 thread
-        let mut handle = bg_handle.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(h) = handle.take() {
-            let _ = h.join();
-        }
-    };
-
-    (start_fn, stop_fn)
+    }
 }
 
 #[cfg(test)]
@@ -327,16 +302,14 @@ mod tests {
     }
 
     #[test]
-    fn background_local_start_returns_closures() {
+    fn background_local_strategy_returns_closure() {
         let config = BackgroundConfig::default();
-        let (_start_fn, _stop_fn) = background_local_start(config);
-        // Verify closures are created without panic
+        let _strategy = background_local_strategy(config);
     }
 
     #[test]
-    fn background_global_start_returns_closures() {
+    fn background_global_strategy_returns_closure() {
         let config = BackgroundConfig::default();
-        let (_start_fn, _stop_fn) = background_global_start(config);
-        // Verify closures are created without panic
+        let _strategy = background_global_strategy(config);
     }
 }

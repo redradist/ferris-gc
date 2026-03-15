@@ -4045,59 +4045,51 @@ impl PartialEq for &LocalGarbageCollector {
     }
 }
 
-/// Callback to start a collection strategy. Receives the GC and an "active" flag;
+/// Callback type for a collection strategy. Receives the GC and an "active" flag;
 /// may spawn a background thread and return its `JoinHandle`.
-pub type StartLocalStrategyFn =
+pub type LocalStrategyFn =
     Box<dyn FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
-/// Callback to stop a collection strategy.
-pub type StopLocalStrategyFn = Box<dyn FnMut(&'static LocalGarbageCollector)>;
 
 /// Pluggable collection strategy for the thread-local GC.
 /// Controls when and how garbage collection runs (e.g., periodic background thread,
-/// allocation-triggered, or manual). Use `change_strategy` to swap at runtime.
+/// allocation-triggered, or manual). Use `set_strategy` to swap at runtime.
 ///
 /// Internally stores a raw pointer to the `LocalGarbageCollector` to avoid
 /// Stacked Borrows violations during thread-local destruction ordering.
 pub struct LocalStrategy {
     gc: Cell<*const LocalGarbageCollector>,
     is_active: AtomicBool,
-    start_func: RefCell<StartLocalStrategyFn>,
-    stop_func: RefCell<StopLocalStrategyFn>,
+    strategy_func: RefCell<LocalStrategyFn>,
     join_handle: RefCell<Option<JoinHandle<()>>>,
 }
 
 impl LocalStrategy {
-    fn new<StartFn, StopFn>(
+    fn new<StrategyFn>(
         gc_ptr: *const LocalGarbageCollector,
-        start_fn: StartFn,
-        stop_fn: StopFn,
+        strategy_fn: StrategyFn,
     ) -> LocalStrategy
     where
-        StartFn: 'static
+        StrategyFn: 'static
             + FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
-        StopFn: 'static + FnMut(&'static LocalGarbageCollector),
     {
         LocalStrategy {
             gc: Cell::new(gc_ptr),
             is_active: AtomicBool::new(false),
-            start_func: RefCell::new(Box::new(start_fn)),
-            stop_func: RefCell::new(Box::new(stop_fn)),
+            strategy_func: RefCell::new(Box::new(strategy_fn)),
             join_handle: RefCell::new(None),
         }
     }
 
     /// Replace the current collection strategy. Stops the current strategy first if active.
-    pub fn change_strategy<StartFn, StopFn>(&self, start_fn: StartFn, stop_fn: StopFn)
+    pub fn set_strategy<StrategyFn>(&self, strategy_fn: StrategyFn)
     where
-        StartFn: 'static
+        StrategyFn: 'static
             + FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>,
-        StopFn: 'static + FnMut(&'static LocalGarbageCollector),
     {
         if self.is_active() {
             self.stop();
         }
-        let _ = self.start_func.replace(Box::new(start_fn));
-        let _ = self.stop_func.replace(Box::new(stop_fn));
+        let _ = self.strategy_func.replace(Box::new(strategy_fn));
     }
 
     /// Returns `true` if the strategy's background collection is currently running.
@@ -4112,7 +4104,10 @@ impl LocalStrategy {
         // accessed from the owning thread.
         let gc_ref = unsafe { &*self.gc.get() };
         self.join_handle
-            .replace((*(self.start_func.borrow_mut()))(gc_ref, &self.is_active));
+            .replace((*(self.strategy_func.borrow_mut()))(
+                gc_ref,
+                &self.is_active,
+            ));
     }
 
     /// Stop the collection strategy and join any background thread.
@@ -4121,23 +4116,14 @@ impl LocalStrategy {
         if let Some(join_handle) = self.join_handle.borrow_mut().take() {
             join_handle
                 .join()
-                .expect("LocalStrategy::stop, LocalStrategy Thread being joined has panicked !!");
+                .expect("LocalStrategy::stop: strategy thread panicked");
         }
-        // SAFETY: gc pointer is valid for the lifetime of the thread-local and is only
-        // accessed from the owning thread.
-        let gc_ref = unsafe { &*self.gc.get() };
-        (*(self.stop_func.borrow_mut()))(gc_ref);
     }
 }
 
 impl Drop for LocalStrategy {
     fn drop(&mut self) {
         self.is_active.store(false, Ordering::Release);
-        // SAFETY: gc pointer is valid for the lifetime of the thread-local and is only
-        // accessed from the owning thread. Using a raw pointer avoids Stacked Borrows
-        // violations during thread-local destruction ordering.
-        let gc_ref = unsafe { &*self.gc.get() };
-        (*(self.stop_func.borrow_mut()))(gc_ref);
     }
 }
 
@@ -4154,11 +4140,8 @@ thread_local! {
             // background thread would be a data race because thread-local objects use
             // non-atomic Cell/RefCell internals. The background thread is only used
             // for the global/sync GC which uses atomic operations.
-            RefCell::new(LocalStrategy::new(gc_ptr,
-            move |_local_gc, _| {
+            RefCell::new(LocalStrategy::new(gc_ptr, move |_local_gc, _| {
                 None
-            },
-            move |_local_gc| {
             }))
         })
     };

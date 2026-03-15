@@ -29,20 +29,20 @@ impl Default for ThresholdConfig {
     }
 }
 
-/// Creates start/stop closures for a local threshold strategy.
+/// Creates a strategy closure for a local threshold-based collector.
+///
+/// The returned closure, when called, spawns a background thread that polls
+/// `allocation_count` and triggers generational collections based on the config.
 #[allow(clippy::type_complexity)]
-pub fn threshold_local_start(
+pub fn threshold_local_strategy(
     config: ThresholdConfig,
-) -> (
-    impl FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> + 'static,
-    impl FnMut(&'static LocalGarbageCollector) + 'static,
-) {
+) -> impl FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> + 'static
+{
     let config = std::sync::Arc::new(config);
-    let config_start = config.clone();
-    let start_fn = move |gc: &'static LocalGarbageCollector,
-                         is_active: &'static AtomicBool|
+    move |gc: &'static LocalGarbageCollector,
+          is_active: &'static AtomicBool|
           -> Option<JoinHandle<()>> {
-        let config = config_start.clone();
+        let config = config.clone();
         Some(thread::spawn(move || {
             let mut gen0_count: u32 = 0;
             let mut gen1_count: u32 = 0;
@@ -74,25 +74,23 @@ pub fn threshold_local_start(
                 gc.core.collect_generation(Generation::Gen2);
             }
         }))
-    };
-    let stop_fn = move |_gc: &'static LocalGarbageCollector| {};
-    (start_fn, stop_fn)
+    }
 }
 
-/// Creates start/stop closures for a global threshold strategy.
+/// Creates a strategy closure for a global threshold-based collector.
+///
+/// The returned closure, when called, spawns a background thread that polls
+/// `allocation_count` and triggers generational collections based on the config.
 #[allow(clippy::type_complexity)]
-pub fn threshold_global_start(
+pub fn threshold_global_strategy(
     config: ThresholdConfig,
-) -> (
-    impl FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> + 'static,
-    impl FnMut(&'static GlobalGarbageCollector) + 'static,
-) {
+) -> impl FnMut(&'static GlobalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> + 'static
+{
     let config = std::sync::Arc::new(config);
-    let config_start = config.clone();
-    let start_fn = move |gc: &'static GlobalGarbageCollector,
-                         is_active: &'static AtomicBool|
+    move |gc: &'static GlobalGarbageCollector,
+          is_active: &'static AtomicBool|
           -> Option<JoinHandle<()>> {
-        let config = config_start.clone();
+        let config = config.clone();
         Some(thread::spawn(move || {
             let mut gen0_count: u32 = 0;
             let mut gen1_count: u32 = 0;
@@ -124,7 +122,5 @@ pub fn threshold_global_start(
                 gc.core.collect_generation(Generation::Gen2);
             }
         }))
-    };
-    let stop_fn = move |_gc: &'static GlobalGarbageCollector| {};
-    (start_fn, stop_fn)
+    }
 }

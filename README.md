@@ -269,20 +269,20 @@ use ferris_gc::sync;
 ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
 
 // Threshold strategy
-let (start, stop) = ferris_gc::threshold_global_start(ferris_gc::ThresholdConfig::default());
-sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+let strategy = ferris_gc::threshold_global_strategy(ferris_gc::ThresholdConfig::default());
+sync::GLOBAL_GC_STRATEGY.set_strategy(strategy);
 
 // Adaptive strategy
-let (start, stop) = ferris_gc::adaptive_global_start(ferris_gc::AdaptiveConfig::default());
-sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+let strategy = ferris_gc::adaptive_global_strategy(ferris_gc::AdaptiveConfig::default());
+sync::GLOBAL_GC_STRATEGY.set_strategy(strategy);
 
 // Background GC
-let (start, stop) = ferris_gc::background_global_start(ferris_gc::BackgroundConfig::default());
-sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+let strategy = ferris_gc::background_global_strategy(ferris_gc::BackgroundConfig::default());
+sync::GLOBAL_GC_STRATEGY.set_strategy(strategy);
 
 // G1 strategy
-let (start, stop) = ferris_gc::g1_global_start(ferris_gc::G1Config::default());
-sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+let strategy = ferris_gc::g1_global_strategy(ferris_gc::G1Config::default());
+sync::GLOBAL_GC_STRATEGY.set_strategy(strategy);
 ```
 
 ## Architecture

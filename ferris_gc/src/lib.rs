@@ -46,9 +46,11 @@ mod threshold_strategy;
 pub(crate) mod tlab;
 
 #[cfg(feature = "std")]
-pub use adaptive_strategy::{AdaptiveConfig, adaptive_global_start, adaptive_local_start};
+pub use adaptive_strategy::{AdaptiveConfig, adaptive_global_strategy, adaptive_local_strategy};
 #[cfg(feature = "std")]
-pub use background_strategy::{BackgroundConfig, background_global_start, background_local_start};
+pub use background_strategy::{
+    BackgroundConfig, background_global_strategy, background_local_strategy,
+};
 #[cfg(feature = "std")]
 pub use basic_gc_strategy::{
     ApplicationCleanup, BASIC_POLL_INTERVAL_MS, BASIC_STRATEGY_DISABLED, BASIC_STRATEGY_GLOBAL_GC,
@@ -60,13 +62,15 @@ pub use default_trace::*;
 #[cfg(feature = "std")]
 pub use ephemeron::EphemeronTable;
 #[cfg(feature = "std")]
-pub use g1_strategy::{G1Config, g1_global_start, g1_local_start};
+pub use g1_strategy::{G1Config, g1_global_strategy, g1_local_strategy};
 #[cfg(feature = "std")]
 pub use gc::sync;
 #[cfg(feature = "std")]
 pub use gc::*;
 #[cfg(feature = "std")]
-pub use threshold_strategy::{ThresholdConfig, threshold_global_start, threshold_local_start};
+pub use threshold_strategy::{
+    ThresholdConfig, threshold_global_strategy, threshold_local_strategy,
+};
 
 pub use generation::*;
 
