@@ -1971,7 +1971,12 @@ mod tests {
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
         let after = (*GLOBAL_GC).stats().total_collections;
-        assert_eq!(after - before, 2);
+        // Use >= because the background basic-strategy thread may collect concurrently.
+        assert!(
+            after - before >= 2,
+            "expected at least 2 collections, got {}",
+            after - before
+        );
     }
 
     #[test]
