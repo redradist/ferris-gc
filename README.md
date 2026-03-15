@@ -145,7 +145,7 @@ use ferris_gc::{Gc, Trace, Finalize};
 #[derive(Trace, Finalize)]
 struct Data { value: i32 }
 
-// Default: basic periodic strategy (background thread every 500ms)
+// Default: basic periodic strategy (background thread every 50ms)
 #[ferris_gc::ferris_gc_main]
 fn main() {
     let _obj = Gc::new(Data { value: 1 });
@@ -163,6 +163,22 @@ fn main() {
 ```rust
 // Adaptive strategy: auto-tunes collection frequency based on allocation rate
 #[ferris_gc::ferris_gc_main(strategy = "adaptive")]
+fn main() {
+    let _obj = Gc::new(Data { value: 1 });
+}
+```
+
+```rust
+// Background GC (.NET-style): foreground Gen0/Gen1, concurrent background Gen2
+#[ferris_gc::ferris_gc_main(strategy = "background")]
+fn main() {
+    let _obj = Gc::new(Data { value: 1 });
+}
+```
+
+```rust
+// G1 (Garbage-First): pause-target collection with region prioritization
+#[ferris_gc::ferris_gc_main(strategy = "g1")]
 fn main() {
     let _obj = Gc::new(Data { value: 1 });
 }
@@ -203,6 +219,45 @@ fn main() {
 }
 ```
 
+Each strategy accepts per-strategy parameters directly in the macro.
+Unspecified parameters use their default values:
+
+```rust
+// Threshold strategy with custom gen0 threshold
+#[ferris_gc::ferris_gc_main(strategy = "threshold", gen0_threshold = 200, poll_interval_ms = 100)]
+fn main() { /* ... */ }
+
+// Adaptive strategy with custom tuning
+#[ferris_gc::ferris_gc_main(
+    strategy = "adaptive",
+    initial_gen0_threshold = 200,
+    min_threshold = 30,
+    max_threshold = 5000,
+)]
+fn main() { /* ... */ }
+
+// Background GC with custom Gen2 trigger
+#[ferris_gc::ferris_gc_main(
+    strategy = "background",
+    gen2_occupancy_trigger = 0.6,
+    gen2_mark_step_budget = 128,
+)]
+fn main() { /* ... */ }
+
+// G1 with custom pause target and heap occupancy threshold
+#[ferris_gc::ferris_gc_main(
+    strategy = "g1",
+    pause_target_ms = 20,
+    young_gen_threshold = 200,
+    initiating_heap_occupancy_percent = 0.6,
+)]
+fn main() { /* ... */ }
+
+// Basic strategy with custom poll interval
+#[ferris_gc::ferris_gc_main(poll_interval_ms = 100)]
+fn main() { /* ... */ }
+```
+
 ### Custom Collection Strategy (Manual)
 
 For fine-grained control without the macro, configure strategies manually:
@@ -210,13 +265,23 @@ For fine-grained control without the macro, configure strategies manually:
 ```rust
 use ferris_gc::sync;
 
-// Switch global GC to threshold-based strategy
+// Disable basic strategy first
 ferris_gc::BASIC_STRATEGY_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+
+// Threshold strategy
 let (start, stop) = ferris_gc::threshold_global_start(ferris_gc::ThresholdConfig::default());
 sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
 
-// Or use the adaptive auto-tuning strategy
+// Adaptive strategy
 let (start, stop) = ferris_gc::adaptive_global_start(ferris_gc::AdaptiveConfig::default());
+sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+
+// Background GC
+let (start, stop) = ferris_gc::background_global_start(ferris_gc::BackgroundConfig::default());
+sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
+
+// G1 strategy
+let (start, stop) = ferris_gc::g1_global_start(ferris_gc::G1Config::default());
 sync::GLOBAL_GC_STRATEGY.change_strategy(start, stop);
 ```
 
@@ -233,14 +298,117 @@ Internally uses slot-map arenas (`SlotMap<ObjectId, ObjectEntry>`) for O(1) inse
 
 ## Collection Strategies
 
-| Strategy | Method | Pause Profile |
-|----------|--------|---------------|
-| Full STW | `collect()` | Single long pause |
-| Generational | `collect_generation(gen)` | Shorter pauses (young gen only) |
-| Incremental | `collect_incremental(gen, budget)` | Multiple short pauses |
-| Time-budgeted | `collect_incremental_timed(gen, duration)` | Bounded pause time |
-| Concurrent | `collect_concurrent(gen, budget)` | Minimal STW (snapshot + sweep only) |
-| Region-based | `collect_region(region)` | Scoped collection |
+FerrisGC provides five macro-level strategies that control **when** and **how** garbage collection happens automatically. Each strategy is configured via `#[ferris_gc_main(strategy = "...")]`.
+
+### Basic (default)
+
+A simple periodic strategy. A background thread wakes every `poll_interval_ms` (default: 50ms) and calls `collect()` on all registered collectors. Minimal configuration, good for prototypes and small applications.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `poll_interval_ms` | 50 | Background thread wake interval (ms) |
+
+### Threshold
+
+Triggers collection when the number of allocations since the last Gen0 collection exceeds a threshold. Generational: Gen1 runs after N Gen0 collections, Gen2 after M Gen1 collections.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `gen0_threshold` | 100 | Allocations before triggering Gen0 collection |
+| `gen0_collections_per_gen1` | 10 | Gen0 cycles before triggering Gen1 |
+| `gen1_collections_per_gen2` | 5 | Gen1 cycles before triggering Gen2 |
+| `poll_interval_ms` | 50 | Strategy thread wake interval (ms) |
+
+### Adaptive
+
+Self-tuning strategy that adjusts the Gen0 threshold based on the ratio of collected objects to scanned objects. If collections reclaim a lot (high garbage ratio), the threshold decreases to collect sooner. If most objects survive (low ratio), the threshold increases to avoid wasted work.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `initial_gen0_threshold` | 100 | Starting Gen0 allocation threshold |
+| `min_threshold` | 50 | Minimum Gen0 threshold (lower bound) |
+| `max_threshold` | 10000 | Maximum Gen0 threshold (upper bound) |
+| `high_ratio` | 0.7 | Garbage ratio above which threshold decreases |
+| `low_ratio` | 0.3 | Garbage ratio below which threshold increases |
+| `adjust_factor` | 0.5 | Multiplicative factor for threshold adjustment |
+| `poll_interval_ms` | 50 | Strategy thread wake interval (ms) |
+
+### Background (.NET-style)
+
+Inspired by .NET's Background GC. Two threads work in parallel:
+- **Foreground thread** — handles Gen0/Gen1 collections with short stop-the-world pauses
+- **Background thread** — performs concurrent Gen2 marking using the existing incremental marking infrastructure, triggered when heap occupancy exceeds a configurable threshold
+
+Gen2 marking happens concurrently without stopping the application, only requiring a brief STW pause for the final sweep.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `gen0_threshold` | 100 | Allocations before triggering Gen0 collection |
+| `gen2_occupancy_trigger` | 0.75 | Heap occupancy ratio to start background Gen2 mark |
+| `gen2_mark_step_budget` | 64 | Objects to mark per concurrent step |
+| `poll_interval_ms` | 50 | Strategy thread wake interval (ms) |
+
+### G1 (Garbage-First)
+
+Inspired by Java's G1 collector. Combines region-based garbage-first selection with concurrent Gen2 marking and a configurable pause target:
+- Tracks per-region liveness statistics (bytes allocated, object count, estimated garbage ratio)
+- Collects the dirtiest regions first within the pause-time budget
+- Background thread concurrently marks Gen2 when heap occupancy crosses a threshold
+
+Best for large heaps where predictable pause times are critical.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `pause_target_ms` | 10 | Target max pause time per collection (ms) |
+| `young_gen_threshold` | 100 | Allocations before triggering young gen collection |
+| `initiating_heap_occupancy_percent` | 0.45 | Heap occupancy to start concurrent Gen2 mark |
+| `concurrent_mark_budget` | 64 | Objects to mark per concurrent step |
+| `poll_interval_ms` | 50 | Strategy thread wake interval (ms) |
+
+### Which Strategy to Choose?
+
+| Scenario | Recommended Strategy | Why |
+|----------|---------------------|-----|
+| Prototype / small app | **basic** | Zero configuration, just works |
+| Predictable allocation patterns | **threshold** | Direct control over collection frequency |
+| Variable workloads | **adaptive** | Auto-tunes to changing allocation rates |
+| Long-lived large heaps | **background** | Concurrent Gen2 avoids long pauses |
+| Latency-sensitive with large heap | **g1** | Pause-target + garbage-first region selection |
+| Maximum throughput | **threshold** or **adaptive** | Minimal overhead, no concurrent threads |
+
+### Low-Level Collection Methods
+
+In addition to automatic strategies, you can invoke collection manually:
+
+| Method | Pause Profile |
+|--------|---------------|
+| `collect()` | Full STW — single long pause |
+| `collect_generation(gen)` | Generational — shorter pauses (young gen only) |
+| `collect_incremental(gen, budget)` | Incremental — multiple short pauses |
+| `collect_incremental_timed(gen, duration)` | Time-budgeted — bounded pause time |
+| `collect_concurrent(gen, budget)` | Concurrent — minimal STW (snapshot + sweep only) |
+| `collect_region(region)` | Region-based — scoped collection |
+| `collect_garbage_first(pause_target)` | G1-style — dirtiest regions first within time budget |
+| `collect_parallel()` | Parallel sweep — uses rayon for deallocation (requires `parallel` feature) |
+
+## Performance Features
+
+### Card Table (Write Barrier)
+
+FerrisGC uses a sparse card table for the write barrier instead of a mutex-protected remembered set. The card table divides the address space into 512-byte cards and tracks dirty cards with a `HashMap<usize, u8>`. This provides O(1) write barrier operations without locking, making pointer updates in inner loops fast.
+
+### Thread-Local Allocation Buffers (TLAB)
+
+The thread-local collector uses bump-pointer allocation within 64KB TLAB blocks. New allocations simply increment a pointer — no system allocator call or lock needed. When a block fills up, a new one is allocated. TLAB blocks are freed automatically when all objects within them are collected (via `Arc<TlabBlock>` reference counting).
+
+### Parallel Sweep (requires `parallel` feature)
+
+With the `parallel` feature enabled, `collect_parallel()` uses [rayon](https://crates.io/crates/rayon) to parallelize the deallocation phase. The mark phase remains serial (single-threaded graph traversal is typically faster due to pointer-chasing), but dead objects are deallocated in parallel across CPU cores.
+
+```toml
+[dependencies]
+ferris-gc = { version = "0.2.0", features = ["parallel"] }
+```
 
 ## Feature Flags
 
@@ -248,6 +416,7 @@ Internally uses slot-map arenas (`SlotMap<ObjectId, ObjectEntry>`) for O(1) inse
 |---------|---------|-------------|
 | `std` | yes | Full GC runtime (collectors, strategies, threading) |
 | `proc-macro` | no | `#[derive(Trace, Finalize)]` and `#[ferris_gc_main]` |
+| `parallel` | no | Parallel sweep via rayon (`collect_parallel()`) |
 
 With `--no-default-features`, only core traits (`Trace`, `Finalize`) and generation types are exported (`no_std` compatible).
 
