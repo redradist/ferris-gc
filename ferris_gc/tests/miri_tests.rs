@@ -151,8 +151,10 @@ fn miri_gc_cell_borrow_mut() {
     }
 
     // Read back
-    let val = cell.borrow();
-    assert_eq!((**val).0, 99);
+    {
+        let val = cell.borrow();
+        assert_eq!((**val).0, 99);
+    }
 
     drop(cell);
     collect();
@@ -448,19 +450,21 @@ fn miri_weak_after_compact() {
 /// for building mutable graphs. Verify tracing and collection work.
 #[test]
 fn miri_gc_cell_with_nested_gc() {
-    let leaf = Gc::new(TestVal(1));
+    let leaf = Gc::new(CyclicNode {
+        next: RefCell::new(None),
+    });
     let cell = GcCell::new(CyclicNode {
         next: RefCell::new(Some(leaf.clone())),
     });
 
-    // Modify through GcCell
+    // Modify through GcCell — disconnect the nested Gc
     {
         let mut guard = cell.borrow_mut();
         (**guard).next = RefCell::new(None);
     }
 
     // leaf should still be alive (we hold a direct Gc to it)
-    assert_eq!((**leaf).0, 1);
+    assert!(leaf.next.borrow().is_none());
 
     drop(cell);
     drop(leaf);
