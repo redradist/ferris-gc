@@ -5,7 +5,7 @@ use crate::generation::{
 use crate::slot_map::{ObjectId, SlotMap, TracerId};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -1127,6 +1127,9 @@ pub(crate) struct GarbageCollector {
     /// Optional callback invoked after each collection cycle.
     #[allow(clippy::type_complexity)]
     pub(crate) on_collection: Mutex<Option<Box<dyn Fn(&CollectionStats) + Send + Sync>>>,
+    /// Adaptive allocation threshold for maybe_collect. Starts at
+    /// LOCAL_GC_ALLOC_THRESHOLD and adjusts based on collection efficiency.
+    pub(crate) alloc_threshold: AtomicUsize,
 }
 
 // SAFETY: All mutable state in GarbageCollector is behind Mutex or atomic types,
@@ -1157,6 +1160,7 @@ impl GarbageCollector {
             promotion_config: Mutex::new(PromotionConfig::default()),
             current_heap_size: AtomicUsize::new(0),
             peak_heap_size: AtomicUsize::new(0),
+            alloc_threshold: AtomicUsize::new(LOCAL_GC_ALLOC_THRESHOLD),
             on_collection: Mutex::new(None),
         }
     }
@@ -1452,15 +1456,26 @@ impl GarbageCollector {
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
                 let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
 
-                // Root discovery: walk all objects and cascade reset_root() into their
-                // fields. This marks Gc handles stored *inside* GC-managed objects as
-                // non-root (is_root = false), while stack-owned handles remain root.
-                for entry in gc_maps.objects.values() {
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    (&*entry.ptr).reset_root();
+                // Root discovery: cascade reset_root() into object fields.
+                // For partial collections (max_gen < Gen2), only walk in-scope objects.
+                // Gen1+ objects' Gc handles already have is_root=false from previous
+                // collections or create_gc's reset_root call.
+                if max_gen >= Generation::Gen2 {
+                    for entry in gc_maps.objects.values() {
+                        // SAFETY: Object pointer is valid while gc_maps lock is held.
+                        (&*entry.ptr).reset_root();
+                    }
+                } else {
+                    for (_id, entry) in gc_maps.objects.iter() {
+                        if entry.generation <= max_gen {
+                            // SAFETY: Object pointer is valid while gc_maps lock is held.
+                            (&*entry.ptr).reset_root();
+                        }
+                    }
                 }
 
-                // Mark phase: trace from ALL roots (needed for correctness)
+                // Mark phase: trace from ALL roots (needed for correctness —
+                // Gen1+ roots may reference Gen0 objects through pre-promotion edges).
                 for entry in gc_maps.tracers.values() {
                     // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                     let tracer = &(*entry.tracer_ptr);
@@ -1469,8 +1484,7 @@ impl GarbageCollector {
                     }
                 }
 
-                // For partial collections, also trace from dirty card table entries
-                // (equivalent to the old remembered set scan).
+                // For partial collections, also trace from dirty card table entries.
                 if max_gen < Generation::Gen2 {
                     let dirty_ids = self.card_table.dirty_objects();
                     for obj_id in &dirty_ids {
@@ -1481,30 +1495,25 @@ impl GarbageCollector {
                     }
                 }
 
-                // Build set of in-scope objects (in target generations)
-                let in_scope_objs: HashSet<ObjectId> = gc_maps
+                // Count in-scope objects directly (no HashSet allocation)
+                stats.objects_scanned = gc_maps
                     .objects
                     .iter()
                     .filter(|(_, e)| e.generation <= max_gen)
-                    .map(|(id, _)| id)
-                    .collect();
-                stats.objects_scanned = in_scope_objs.len();
+                    .count();
 
-                // Identify in-scope tracers (their object is in target generations)
-                let in_scope_tracers: HashSet<TracerId> = gc_maps
-                    .tracers
-                    .iter()
-                    .filter(|(_, e)| in_scope_objs.contains(&e.object_id))
-                    .map(|(id, _)| id)
-                    .collect();
-
-                // Sweep tracers: only collect unreachable in-scope tracers
+                // Sweep tracers: collect unreachable tracers whose object is in scope
                 let collected_tracers: Vec<TracerId> = gc_maps
                     .tracers
                     .iter()
-                    .filter(|(id, e)| {
+                    .filter(|(_, e)| {
+                        // Check if the tracer's object is in target generations
+                        let in_scope = gc_maps
+                            .objects
+                            .get(e.object_id)
+                            .is_some_and(|obj| obj.generation <= max_gen);
                         // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        in_scope_tracers.contains(id) && !(&*e.tracer_ptr).is_traceable()
+                        in_scope && !(&*e.tracer_ptr).is_traceable()
                     })
                     .map(|(id, _)| id)
                     .collect();
@@ -1517,12 +1526,12 @@ impl GarbageCollector {
                 }
                 stats.tracers_collected = collected_tracers.len();
 
-                // Sweep objects: only collect unreachable in-scope objects
+                // Sweep objects: collect unreachable in-scope objects (direct generation check)
                 let collected_objects: Vec<ObjectId> = gc_maps
                     .objects
                     .iter()
                     // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    .filter(|(id, e)| in_scope_objs.contains(id) && !(&*e.ptr).is_traceable())
+                    .filter(|(_, e)| e.generation <= max_gen && !(&*e.ptr).is_traceable())
                     .map(|(id, _)| id)
                     .collect();
                 stats.objects_collected = collected_objects.len();
@@ -1562,28 +1571,19 @@ impl GarbageCollector {
                     self.card_table.clear_dirty();
                 }
 
-                // Promotion: surviving in-scope objects may be promoted
-                let surviving_objs: Vec<ObjectId> = in_scope_objs
-                    .iter()
-                    .filter(|id| !collected_objects.contains(id))
-                    .copied()
-                    .collect();
-
-                for obj_id in surviving_objs {
-                    if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
-                        if entry.generation <= max_gen {
-                            let cur_gen = entry.generation;
-                            entry.survive_count += 1;
-                            let promo_cfg = self.promotion_config();
-                            let should_promote =
-                                entry.survive_count >= promo_cfg.threshold_for(cur_gen);
-                            if should_promote {
-                                entry.survive_count = 0;
-                                if let Some(next_gen) = cur_gen.next() {
-                                    entry.generation = next_gen;
-                                    stats.objects_promoted += 1;
-                                }
-                            }
+                // Promotion: surviving in-scope objects (already filtered by removal above)
+                let promo_cfg = self.promotion_config();
+                for (_obj_id, entry) in gc_maps.objects.iter_mut() {
+                    if entry.generation > max_gen {
+                        continue;
+                    }
+                    let cur_gen = entry.generation;
+                    entry.survive_count += 1;
+                    if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
+                        entry.survive_count = 0;
+                        if let Some(next_gen) = cur_gen.next() {
+                            entry.generation = next_gen;
+                            stats.objects_promoted += 1;
                         }
                     }
                 }
@@ -1696,15 +1696,22 @@ impl GarbageCollector {
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
                 let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
 
-                // Root discovery: walk all objects and cascade reset_root() into their
-                // fields. This marks Gc handles stored *inside* GC-managed objects as
-                // non-root (is_root = false), while stack-owned handles remain root.
-                for entry in gc_maps.objects.values() {
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    (&*entry.ptr).reset_root();
+                // Root discovery: for partial collections, only walk in-scope objects.
+                if max_gen >= Generation::Gen2 {
+                    for entry in gc_maps.objects.values() {
+                        // SAFETY: Object pointer is valid while gc_maps lock is held.
+                        (&*entry.ptr).reset_root();
+                    }
+                } else {
+                    for (_id, entry) in gc_maps.objects.iter() {
+                        if entry.generation <= max_gen {
+                            // SAFETY: Object pointer is valid while gc_maps lock is held.
+                            (&*entry.ptr).reset_root();
+                        }
+                    }
                 }
 
-                // Mark phase (serial): trace from ALL roots
+                // Mark phase: trace from ALL roots.
                 for entry in gc_maps.tracers.values() {
                     // SAFETY: Tracer pointer is valid while gc_maps lock is held.
                     let tracer = &(*entry.tracer_ptr);
@@ -1713,7 +1720,7 @@ impl GarbageCollector {
                     }
                 }
 
-                // For partial collections, also trace from dirty card table entries
+                // For partial collections, also trace from dirty card table entries.
                 if max_gen < Generation::Gen2 {
                     let dirty_ids = self.card_table.dirty_objects();
                     for obj_id in &dirty_ids {
@@ -1724,30 +1731,24 @@ impl GarbageCollector {
                     }
                 }
 
-                // Build set of in-scope objects (in target generations)
-                let in_scope_objs: HashSet<ObjectId> = gc_maps
+                // Count in-scope objects directly (no HashSet allocation)
+                stats.objects_scanned = gc_maps
                     .objects
                     .iter()
                     .filter(|(_, e)| e.generation <= max_gen)
-                    .map(|(id, _)| id)
-                    .collect();
-                stats.objects_scanned = in_scope_objs.len();
+                    .count();
 
-                // Identify in-scope tracers (their object is in target generations)
-                let in_scope_tracers: HashSet<TracerId> = gc_maps
-                    .tracers
-                    .iter()
-                    .filter(|(_, e)| in_scope_objs.contains(&e.object_id))
-                    .map(|(id, _)| id)
-                    .collect();
-
-                // Sweep tracers: only collect unreachable in-scope tracers
+                // Sweep tracers: collect unreachable tracers whose object is in scope
                 let collected_tracers: Vec<TracerId> = gc_maps
                     .tracers
                     .iter()
-                    .filter(|(id, e)| {
+                    .filter(|(_, e)| {
+                        let in_scope = gc_maps
+                            .objects
+                            .get(e.object_id)
+                            .is_some_and(|obj| obj.generation <= max_gen);
                         // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        in_scope_tracers.contains(id) && !(&*e.tracer_ptr).is_traceable()
+                        in_scope && !(&*e.tracer_ptr).is_traceable()
                     })
                     .map(|(id, _)| id)
                     .collect();
@@ -1760,12 +1761,12 @@ impl GarbageCollector {
                 }
                 stats.tracers_collected = collected_tracers.len();
 
-                // Sweep objects: only collect unreachable in-scope objects
+                // Sweep objects: collect unreachable in-scope objects (direct generation check)
                 let collected_objects: Vec<ObjectId> = gc_maps
                     .objects
                     .iter()
                     // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    .filter(|(id, e)| in_scope_objs.contains(id) && !(&*e.ptr).is_traceable())
+                    .filter(|(_, e)| e.generation <= max_gen && !(&*e.ptr).is_traceable())
                     .map(|(id, _)| id)
                     .collect();
                 stats.objects_collected = collected_objects.len();
@@ -1803,28 +1804,19 @@ impl GarbageCollector {
                     self.card_table.clear_dirty();
                 }
 
-                // Promotion: surviving in-scope objects may be promoted
-                let surviving_objs: Vec<ObjectId> = in_scope_objs
-                    .iter()
-                    .filter(|id| !collected_objects.contains(id))
-                    .copied()
-                    .collect();
-
-                for obj_id in surviving_objs {
-                    if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
-                        if entry.generation <= max_gen {
-                            let cur_gen = entry.generation;
-                            entry.survive_count += 1;
-                            let promo_cfg = self.promotion_config();
-                            let should_promote =
-                                entry.survive_count >= promo_cfg.threshold_for(cur_gen);
-                            if should_promote {
-                                entry.survive_count = 0;
-                                if let Some(next_gen) = cur_gen.next() {
-                                    entry.generation = next_gen;
-                                    stats.objects_promoted += 1;
-                                }
-                            }
+                // Promotion: surviving in-scope objects (already filtered by removal above)
+                let promo_cfg = self.promotion_config();
+                for (_obj_id, entry) in gc_maps.objects.iter_mut() {
+                    if entry.generation > max_gen {
+                        continue;
+                    }
+                    let cur_gen = entry.generation;
+                    entry.survive_count += 1;
+                    if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
+                        entry.survive_count = 0;
+                        if let Some(next_gen) = cur_gen.next() {
+                            entry.generation = next_gen;
+                            stats.objects_promoted += 1;
                         }
                     }
                 }
@@ -1987,29 +1979,24 @@ impl GarbageCollector {
                     }
                 }
 
-                // Build set of in-scope objects
-                let in_scope_objs: HashSet<ObjectId> = gc_maps
+                // Count in-scope objects directly (no HashSet allocation)
+                stats.objects_scanned = gc_maps
                     .objects
                     .iter()
                     .filter(|(_, e)| e.generation <= max_gen)
-                    .map(|(id, _)| id)
-                    .collect();
-                stats.objects_scanned = in_scope_objs.len();
+                    .count();
 
-                let in_scope_tracers: HashSet<TracerId> = gc_maps
-                    .tracers
-                    .iter()
-                    .filter(|(_, e)| in_scope_objs.contains(&e.object_id))
-                    .map(|(id, _)| id)
-                    .collect();
-
-                // Sweep tracers
+                // Sweep tracers: collect unreachable tracers whose object is in scope
                 // SAFETY: Tracer pointers are valid while gc_maps lock is held.
                 let collected_tracers: Vec<TracerId> = gc_maps
                     .tracers
                     .iter()
-                    .filter(|(id, e)| {
-                        in_scope_tracers.contains(id) && !(&*e.tracer_ptr).is_traceable()
+                    .filter(|(_, e)| {
+                        let in_scope = gc_maps
+                            .objects
+                            .get(e.object_id)
+                            .is_some_and(|obj| obj.generation <= max_gen);
+                        in_scope && !(&*e.tracer_ptr).is_traceable()
                     })
                     .map(|(id, _)| id)
                     .collect();
@@ -2022,12 +2009,12 @@ impl GarbageCollector {
                 }
                 stats.tracers_collected = collected_tracers.len();
 
-                // Sweep objects
+                // Sweep objects: collect unreachable in-scope objects (direct generation check)
                 // SAFETY: Object pointers are valid while gc_maps lock is held.
                 let collected_objects: Vec<ObjectId> = gc_maps
                     .objects
                     .iter()
-                    .filter(|(id, e)| in_scope_objs.contains(id) && !(&*e.ptr).is_traceable())
+                    .filter(|(_, e)| e.generation <= max_gen && !(&*e.ptr).is_traceable())
                     .map(|(id, _)| id)
                     .collect();
                 stats.objects_collected = collected_objects.len();
@@ -2063,25 +2050,19 @@ impl GarbageCollector {
                     self.card_table.clear_dirty();
                 }
 
-                // Promotion
-                let surviving_objs: Vec<ObjectId> = in_scope_objs
-                    .iter()
-                    .filter(|id| !collected_objects.contains(id))
-                    .copied()
-                    .collect();
-                for obj_id in surviving_objs {
-                    if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
-                        if entry.generation <= max_gen {
-                            let cur_gen = entry.generation;
-                            entry.survive_count += 1;
-                            let promo_cfg = self.promotion_config();
-                            if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
-                                entry.survive_count = 0;
-                                if let Some(next_gen) = cur_gen.next() {
-                                    entry.generation = next_gen;
-                                    stats.objects_promoted += 1;
-                                }
-                            }
+                // Promotion: surviving in-scope objects (already filtered by removal above)
+                let promo_cfg = self.promotion_config();
+                for (_obj_id, entry) in gc_maps.objects.iter_mut() {
+                    if entry.generation > max_gen {
+                        continue;
+                    }
+                    let cur_gen = entry.generation;
+                    entry.survive_count += 1;
+                    if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
+                        entry.survive_count = 0;
+                        if let Some(next_gen) = cur_gen.next() {
+                            entry.generation = next_gen;
+                            stats.objects_promoted += 1;
                         }
                     }
                 }
@@ -2326,7 +2307,7 @@ impl GarbageCollector {
                     duration: std::time::Duration::ZERO,
                 };
 
-                let white_objects: HashSet<ObjectId> = incr
+                let white_objects: Vec<ObjectId> = incr
                     .colors
                     .iter()
                     .filter(|(_, color)| **color == MarkColor::White)
@@ -2334,11 +2315,15 @@ impl GarbageCollector {
                     .collect();
                 stats.objects_collected = white_objects.len();
 
-                // Sweep dead tracers (those pointing to white objects)
+                // Sweep dead tracers (those pointing to white objects — check color directly)
                 let dead_tracers: Vec<TracerId> = gc_maps
                     .tracers
                     .iter()
-                    .filter(|(_, e)| white_objects.contains(&e.object_id))
+                    .filter(|(_, e)| {
+                        incr.colors
+                            .get(&e.object_id)
+                            .is_some_and(|c| *c == MarkColor::White)
+                    })
                     .map(|(id, _)| id)
                     .collect();
                 stats.tracers_collected = dead_tracers.len();
@@ -2762,30 +2747,24 @@ impl GarbageCollector {
                     }
                 }
 
-                // Objects in target region
-                let in_region: HashSet<ObjectId> = gc_maps
+                // Count objects in target region directly (no HashSet allocation)
+                stats.objects_scanned = gc_maps
                     .objects
                     .iter()
                     .filter(|(_, e)| e.region == region)
-                    .map(|(id, _)| id)
-                    .collect();
-                stats.objects_scanned = in_region.len();
+                    .count();
 
-                // Tracers pointing to objects in this region
-                let region_tracers: HashSet<TracerId> = gc_maps
-                    .tracers
-                    .iter()
-                    .filter(|(_, e)| in_region.contains(&e.object_id))
-                    .map(|(id, _)| id)
-                    .collect();
-
-                // Sweep unreachable tracers in this region
+                // Sweep unreachable tracers whose object is in this region
                 let collected_tracers: Vec<TracerId> = gc_maps
                     .tracers
                     .iter()
-                    .filter(|(id, e)| {
+                    .filter(|(_, e)| {
+                        let in_region = gc_maps
+                            .objects
+                            .get(e.object_id)
+                            .is_some_and(|obj| obj.region == region);
                         // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        region_tracers.contains(id) && !(&*e.tracer_ptr).is_traceable()
+                        in_region && !(&*e.tracer_ptr).is_traceable()
                     })
                     .map(|(id, _)| id)
                     .collect();
@@ -2797,12 +2776,12 @@ impl GarbageCollector {
                 }
                 stats.tracers_collected = collected_tracers.len();
 
-                // Sweep unreachable objects in this region
+                // Sweep unreachable objects in this region (direct region check)
                 let collected_objects: Vec<ObjectId> = gc_maps
                     .objects
                     .iter()
                     // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    .filter(|(id, e)| in_region.contains(id) && !(&*e.ptr).is_traceable())
+                    .filter(|(_, e)| e.region == region && !(&*e.ptr).is_traceable())
                     .map(|(id, _)| id)
                     .collect();
                 stats.objects_collected = collected_objects.len();
@@ -2868,13 +2847,12 @@ impl GarbageCollector {
     /// Return per-region liveness statistics without running a collection.
     pub fn region_stats(&self) -> Vec<crate::generation::RegionStats> {
         let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
-        // Collect all region IDs from both maps
-        let mut region_ids: HashSet<RegionId> = HashSet::new();
-        for key in gc_maps.region_total_bytes.keys() {
-            region_ids.insert(*key);
-        }
+        // Collect all unique region IDs from both maps
+        let mut region_ids: Vec<RegionId> = gc_maps.region_total_bytes.keys().copied().collect();
         for key in gc_maps.region_object_count.keys() {
-            region_ids.insert(*key);
+            if !region_ids.contains(key) {
+                region_ids.push(*key);
+            }
         }
         region_ids
             .into_iter()
@@ -2984,11 +2962,11 @@ impl GarbageCollector {
                     }
 
                     // Sweep tracers pointing to dead objects in this region
-                    let dead_obj_set: HashSet<ObjectId> = dead_in_region.iter().copied().collect();
+                    // Use direct lookup: if tracer's object is in dead_in_region list
                     let dead_tracers: Vec<TracerId> = gc_maps
                         .tracers
                         .iter()
-                        .filter(|(_id, e)| dead_obj_set.contains(&e.object_id))
+                        .filter(|(_id, e)| dead_in_region.contains(&e.object_id))
                         .map(|(id, _)| id)
                         .collect();
                     for tracer_id in &dead_tracers {
@@ -3359,11 +3337,28 @@ impl LocalGarbageCollector {
     }
 
     /// Check allocation count and trigger Gen0 collection if threshold exceeded.
+    /// The threshold adapts based on collection efficiency: if a collection frees
+    /// little garbage, the threshold doubles (up to 100K) to avoid wasteful scans
+    /// of a mostly-live heap. If a collection frees a lot, the threshold shrinks
+    /// (down to 1K) to reclaim memory promptly.
     unsafe fn maybe_collect(&self) {
         let count = self.core.allocation_count.load(Ordering::Relaxed);
-        if count >= LOCAL_GC_ALLOC_THRESHOLD {
-            unsafe {
-                self.core.collect_generation(Generation::Gen0);
+        let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
+        if count >= threshold {
+            let stats = unsafe { self.core.collect_generation(Generation::Gen0) };
+            // Adapt threshold based on collection efficiency
+            if stats.objects_scanned > 0 {
+                let collected_ratio =
+                    stats.objects_collected as f64 / stats.objects_scanned as f64;
+                if collected_ratio < 0.05 {
+                    // Less than 5% garbage — heap is mostly live, double threshold
+                    let new = (threshold * 2).min(100_000);
+                    self.core.alloc_threshold.store(new, Ordering::Relaxed);
+                } else if collected_ratio > 0.25 {
+                    // More than 25% garbage — shrink threshold to collect sooner
+                    let new = (threshold / 2).max(LOCAL_GC_ALLOC_THRESHOLD);
+                    self.core.alloc_threshold.store(new, Ordering::Relaxed);
+                }
             }
         }
     }
