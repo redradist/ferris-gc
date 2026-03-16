@@ -788,7 +788,9 @@ where
         // Go through internal_ptr→ptr so compaction relocation is transparent.
         let ptr = unsafe { (*self.internal_ptr).ptr.get() };
         LOCAL_GC.with(|gc| {
-            gc.borrow().core.write_barrier(ptr as *const dyn Trace);
+            gc.borrow()
+                .core
+                .write_barrier(self.object_id, ptr as *const dyn Trace);
         });
         // SAFETY: ptr is valid for the lifetime of this GcCell handle.
         unsafe { (*ptr).borrow_mut() }
@@ -860,6 +862,7 @@ where
 {
     alive: Arc<AtomicBool>,
     ptr: *const GcPtr<T>,
+    object_id: ObjectId,
 }
 
 // SAFETY: GcWeak contains only an Arc<AtomicBool> (thread-safe) and a raw pointer
@@ -877,6 +880,7 @@ where
         GcWeak {
             alive: self.alive.clone(),
             ptr: self.ptr,
+            object_id: self.object_id,
         }
     }
 }
@@ -941,10 +945,11 @@ where
             let gc_ref = gc.borrow();
             let alive = gc_ref
                 .core
-                .get_or_create_weak_alive(this.ptr as *const dyn Trace);
+                .get_or_create_weak_alive(this.object_id);
             GcWeak {
                 alive,
                 ptr: this.ptr,
+                object_id: this.object_id,
             }
         })
     }
@@ -1056,6 +1061,10 @@ pub(crate) struct ObjectEntry {
     pub(crate) ref_count: usize,
     /// Region assignment for region-based collection.
     pub(crate) region: RegionId,
+    /// Raw pointer to the object's `root_ref_count` atomic inside GcInfo.
+    /// Allows inline mark-bit checks (is_traceable / clear_trace) without
+    /// virtual dispatch through `*const dyn Trace`.
+    pub(crate) root_ref_count_ptr: *const AtomicUsize,
 }
 
 /// Per-tracer metadata stored in a contiguous SlotMap.
@@ -1073,10 +1082,32 @@ pub(crate) struct GcMaps {
     pub(crate) tracers: SlotMap<TracerId, TracerEntry>,
     /// Maps thin object pointer → ObjectId for trace_children resolution.
     pub(crate) ptr_to_object: HashMap<usize, ObjectId>,
-    /// Per-region total allocated bytes (object data only).
-    pub(crate) region_total_bytes: HashMap<RegionId, usize>,
-    /// Per-region live object count.
-    pub(crate) region_object_count: HashMap<RegionId, usize>,
+}
+
+impl GcMaps {
+    /// Compute per-region total bytes and object counts on demand from the objects SlotMap.
+    pub(crate) fn compute_region_stats(
+        &self,
+    ) -> (HashMap<RegionId, usize>, HashMap<RegionId, usize>) {
+        let mut total_bytes: HashMap<RegionId, usize> = HashMap::new();
+        let mut object_count: HashMap<RegionId, usize> = HashMap::new();
+        for (_id, entry) in self.objects.iter() {
+            *total_bytes.entry(entry.region).or_insert(0) += entry.layout.size();
+            *object_count.entry(entry.region).or_insert(0) += 1;
+        }
+        (total_bytes, object_count)
+    }
+
+    /// Rebuild ptr_to_object from the current objects SlotMap.
+    /// Called lazily before incremental/concurrent marking that needs
+    /// pointer-to-ObjectId resolution.
+    pub(crate) fn rebuild_ptr_to_object(&mut self) {
+        self.ptr_to_object.clear();
+        for (id, entry) in self.objects.iter() {
+            let thin = entry.ptr.get_thin_ptr();
+            self.ptr_to_object.insert(thin, id);
+        }
+    }
 }
 
 /// State for incremental tri-color marking.
@@ -1146,8 +1177,6 @@ impl GarbageCollector {
                 objects: SlotMap::new(),
                 tracers: SlotMap::new(),
                 ptr_to_object: HashMap::new(),
-                region_total_bytes: HashMap::new(),
-                region_object_count: HashMap::new(),
             }),
             allocation_count: AtomicUsize::new(0),
             card_table: CardTable::new(),
@@ -1326,16 +1355,13 @@ impl GarbageCollector {
     }
 
     /// Get or create the alive flag for an object (used by weak references).
-    pub(crate) fn get_or_create_weak_alive(&self, obj_ptr: *const dyn Trace) -> Arc<AtomicBool> {
-        let thin = obj_ptr.get_thin_ptr();
+    pub(crate) fn get_or_create_weak_alive(&self, obj_id: ObjectId) -> Arc<AtomicBool> {
         let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&obj_id) = gc_maps.ptr_to_object.get(&thin) {
-            if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
-                return entry
-                    .weak_alive
-                    .get_or_insert_with(|| Arc::new(AtomicBool::new(true)))
-                    .clone();
-            }
+        if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
+            return entry
+                .weak_alive
+                .get_or_insert_with(|| Arc::new(AtomicBool::new(true)))
+                .clone();
         }
         Arc::new(AtomicBool::new(false))
     }
@@ -1344,30 +1370,24 @@ impl GarbageCollector {
     /// card table so that young-generation collections trace through it.
     /// During incremental marking, also re-grays Black objects to maintain
     /// the tri-color invariant (no Black->White edges).
-    pub(crate) fn write_barrier(&self, obj_ptr: *const dyn Trace) {
+    pub(crate) fn write_barrier(&self, obj_id: ObjectId, obj_ptr: *const dyn Trace) {
         let thin = obj_ptr.get_thin_ptr();
         let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&obj_id) = gc_maps.ptr_to_object.get(&thin) {
-            if let Some(entry) = gc_maps.objects.get(obj_id) {
-                if entry.generation > Generation::Gen0 {
-                    // Mark the card dirty — no separate remembered_set lock needed.
-                    self.card_table.mark_dirty(thin);
-                }
+        if let Some(entry) = gc_maps.objects.get(obj_id) {
+            if entry.generation > Generation::Gen0 {
+                self.card_table.mark_dirty(thin);
             }
         }
-        let obj_id_opt = gc_maps.ptr_to_object.get(&thin).copied();
         drop(gc_maps);
 
         // During incremental marking, re-gray Black objects so their
         // new children are discovered in subsequent mark steps.
-        if let Some(obj_id) = obj_id_opt {
-            let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-            if incr.phase == CollectionPhase::Marking {
-                if let Some(color) = incr.colors.get_mut(&obj_id) {
-                    if *color == MarkColor::Black {
-                        *color = MarkColor::Gray;
-                        incr.gray_stack.push(obj_id);
-                    }
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+        if incr.phase == CollectionPhase::Marking {
+            if let Some(color) = incr.colors.get_mut(&obj_id) {
+                if *color == MarkColor::Black {
+                    *color = MarkColor::Gray;
+                    incr.gray_stack.push(obj_id);
                 }
             }
         }
@@ -1392,14 +1412,7 @@ impl GarbageCollector {
                         let thin = obj_entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, object_id);
-                        // Decrement region counters
-                        if let Some(bytes) = gc_maps.region_total_bytes.get_mut(&obj_entry.region) {
-                            *bytes = bytes.saturating_sub(obj_entry.layout.size());
-                        }
-                        if let Some(count) = gc_maps.region_object_count.get_mut(&obj_entry.region)
-                        {
-                            *count = count.saturating_sub(1);
-                        }
+                        // Region stats are computed on-demand; no counters to decrement.
                         if let Some(alive) = &obj_entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
@@ -1495,25 +1508,19 @@ impl GarbageCollector {
                     }
                 }
 
-                // Count in-scope objects directly (no HashSet allocation)
-                stats.objects_scanned = gc_maps
-                    .objects
-                    .iter()
-                    .filter(|(_, e)| e.generation <= max_gen)
-                    .count();
-
-                // Sweep tracers: collect unreachable tracers whose object is in scope
+                // Sweep tracers: collect unreachable tracers whose object is in scope.
+                // Uses inline root_ref_count check instead of vtable dispatch.
                 let collected_tracers: Vec<TracerId> = gc_maps
                     .tracers
                     .iter()
                     .filter(|(_, e)| {
-                        // Check if the tracer's object is in target generations
-                        let in_scope = gc_maps
+                        gc_maps
                             .objects
                             .get(e.object_id)
-                            .is_some_and(|obj| obj.generation <= max_gen);
-                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        in_scope && !(&*e.tracer_ptr).is_traceable()
+                            .is_some_and(|obj| {
+                                obj.generation <= max_gen
+                                    && (*obj.root_ref_count_ptr).load(Ordering::Acquire) == 0
+                            })
                     })
                     .map(|(id, _)| id)
                     .collect();
@@ -1526,23 +1533,45 @@ impl GarbageCollector {
                 }
                 stats.tracers_collected = collected_tracers.len();
 
-                // Sweep objects: collect unreachable in-scope objects (direct generation check)
-                let collected_objects: Vec<ObjectId> = gc_maps
-                    .objects
-                    .iter()
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    .filter(|(_, e)| e.generation <= max_gen && !(&*e.ptr).is_traceable())
-                    .map(|(id, _)| id)
-                    .collect();
-                stats.objects_collected = collected_objects.len();
+                // Combined pass: sweep + count + clear_trace + promotion in a single
+                // iteration over objects. Avoids 3 extra full iterations and uses
+                // inline root_ref_count access instead of vtable dispatch.
+                let promo_cfg = self.promotion_config();
+                let mut collected_objects: Vec<ObjectId> = Vec::new();
+                for (id, entry) in gc_maps.objects.iter_mut() {
+                    let in_scope = entry.generation <= max_gen;
+                    // SAFETY: root_ref_count_ptr points into a valid GcInfo allocation.
+                    let marked = (*entry.root_ref_count_ptr).load(Ordering::Acquire) > 0;
 
-                // Unconditionally clear mark state for ALL objects.
-                // This replaces the old cascade-based reset which failed on cycles
-                // (root_ref_count leaked due to trace/reset guard asymmetry).
-                for entry in gc_maps.objects.values() {
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    (&*entry.ptr).clear_trace();
+                    if in_scope {
+                        stats.objects_scanned += 1;
+                        if !marked {
+                            collected_objects.push(id);
+                            // Dead object — skip clear_trace and promotion.
+                            continue;
+                        }
+                        // Surviving in-scope object: promote.
+                        let cur_gen = entry.generation;
+                        entry.survive_count += 1;
+                        if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
+                            entry.survive_count = 0;
+                            if let Some(next_gen) = cur_gen.next() {
+                                if cur_gen == Generation::Gen0 {
+                                    // Register with card table on first promotion
+                                    // so write barriers can track old→young references.
+                                    let thin = entry.ptr.get_thin_ptr();
+                                    self.card_table.register_object(thin, id);
+                                }
+                                entry.generation = next_gen;
+                                stats.objects_promoted += 1;
+                            }
+                        }
+                    }
+                    // Clear mark state for all surviving objects (in-scope survivors
+                    // + out-of-scope objects that may have been marked transitively).
+                    (*entry.root_ref_count_ptr).store(0, Ordering::Release);
                 }
+                stats.objects_collected = collected_objects.len();
 
                 // Remove collected objects
                 let mut object_deallocs = Vec::new();
@@ -1552,13 +1581,7 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        // Decrement region counters
-                        if let Some(bytes) = gc_maps.region_total_bytes.get_mut(&entry.region) {
-                            *bytes = bytes.saturating_sub(entry.layout.size());
-                        }
-                        if let Some(count) = gc_maps.region_object_count.get_mut(&entry.region) {
-                            *count = count.saturating_sub(1);
-                        }
+                        // Region stats are computed on-demand; no counters to decrement.
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
@@ -1569,23 +1592,6 @@ impl GarbageCollector {
                 // On full collection, clear dirty flags in the card table
                 if max_gen >= Generation::Gen2 {
                     self.card_table.clear_dirty();
-                }
-
-                // Promotion: surviving in-scope objects (already filtered by removal above)
-                let promo_cfg = self.promotion_config();
-                for (_obj_id, entry) in gc_maps.objects.iter_mut() {
-                    if entry.generation > max_gen {
-                        continue;
-                    }
-                    let cur_gen = entry.generation;
-                    entry.survive_count += 1;
-                    if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
-                        entry.survive_count = 0;
-                        if let Some(next_gen) = cur_gen.next() {
-                            entry.generation = next_gen;
-                            stats.objects_promoted += 1;
-                        }
-                    }
                 }
 
                 (tracer_deallocs, object_deallocs)
@@ -1642,8 +1648,6 @@ impl GarbageCollector {
 
                 let obj_entries = gc_maps.objects.drain();
                 gc_maps.ptr_to_object.clear();
-                gc_maps.region_total_bytes.clear();
-                gc_maps.region_object_count.clear();
                 let object_deallocs: Vec<_> = obj_entries
                     .into_iter()
                     .map(|(_, entry)| {
@@ -1785,13 +1789,7 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        // Decrement region counters
-                        if let Some(bytes) = gc_maps.region_total_bytes.get_mut(&entry.region) {
-                            *bytes = bytes.saturating_sub(entry.layout.size());
-                        }
-                        if let Some(count) = gc_maps.region_object_count.get_mut(&entry.region) {
-                            *count = count.saturating_sub(1);
-                        }
+                        // Region stats are computed on-demand; no counters to decrement.
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
@@ -1806,7 +1804,7 @@ impl GarbageCollector {
 
                 // Promotion: surviving in-scope objects (already filtered by removal above)
                 let promo_cfg = self.promotion_config();
-                for (_obj_id, entry) in gc_maps.objects.iter_mut() {
+                for (obj_id, entry) in gc_maps.objects.iter_mut() {
                     if entry.generation > max_gen {
                         continue;
                     }
@@ -1815,6 +1813,10 @@ impl GarbageCollector {
                     if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
                         entry.survive_count = 0;
                         if let Some(next_gen) = cur_gen.next() {
+                            if cur_gen == Generation::Gen0 {
+                                let thin = entry.ptr.get_thin_ptr();
+                                self.card_table.register_object(thin, obj_id);
+                            }
                             entry.generation = next_gen;
                             stats.objects_promoted += 1;
                         }
@@ -2033,12 +2035,6 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        if let Some(bytes) = gc_maps.region_total_bytes.get_mut(&entry.region) {
-                            *bytes = bytes.saturating_sub(entry.layout.size());
-                        }
-                        if let Some(count) = gc_maps.region_object_count.get_mut(&entry.region) {
-                            *count = count.saturating_sub(1);
-                        }
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
@@ -2052,7 +2048,7 @@ impl GarbageCollector {
 
                 // Promotion: surviving in-scope objects (already filtered by removal above)
                 let promo_cfg = self.promotion_config();
-                for (_obj_id, entry) in gc_maps.objects.iter_mut() {
+                for (obj_id, entry) in gc_maps.objects.iter_mut() {
                     if entry.generation > max_gen {
                         continue;
                     }
@@ -2061,6 +2057,10 @@ impl GarbageCollector {
                     if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
                         entry.survive_count = 0;
                         if let Some(next_gen) = cur_gen.next() {
+                            if cur_gen == Generation::Gen0 {
+                                let thin = entry.ptr.get_thin_ptr();
+                                self.card_table.register_object(thin, obj_id);
+                            }
                             entry.generation = next_gen;
                             stats.objects_promoted += 1;
                         }
@@ -2142,7 +2142,10 @@ impl GarbageCollector {
     pub unsafe fn begin_collection(&self, max_gen: Generation) {
         let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Lazily rebuild ptr_to_object for mark_step's trace_children resolution.
+        gc_maps.rebuild_ptr_to_object();
 
         incr.phase = CollectionPhase::Marking;
         incr.max_gen = max_gen;
@@ -2278,16 +2281,9 @@ impl GarbageCollector {
                     }
                 }
 
-                // Count in-scope objects
-                let objects_scanned = gc_maps
-                    .objects
-                    .iter()
-                    .filter(|(_, e)| e.generation <= max_gen)
-                    .count();
-
                 let mut stats = CollectionStats {
                     generation: max_gen,
-                    objects_scanned,
+                    objects_scanned: 0,
                     objects_collected: 0,
                     objects_promoted: 0,
                     tracers_collected: 0,
@@ -2295,17 +2291,19 @@ impl GarbageCollector {
                     duration: std::time::Duration::ZERO,
                 };
 
-                // Sweep tracers: collect unreachable tracers whose object is in scope
+                // Sweep tracers: collect unreachable tracers whose object is in scope.
+                // Uses inline root_ref_count check instead of vtable dispatch.
                 let collected_tracers: Vec<TracerId> = gc_maps
                     .tracers
                     .iter()
                     .filter(|(_, e)| {
-                        let in_scope = gc_maps
+                        gc_maps
                             .objects
                             .get(e.object_id)
-                            .is_some_and(|obj| obj.generation <= max_gen);
-                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        in_scope && !(&*e.tracer_ptr).is_traceable()
+                            .is_some_and(|obj| {
+                                obj.generation <= max_gen
+                                    && (*obj.root_ref_count_ptr).load(Ordering::Acquire) == 0
+                            })
                     })
                     .map(|(id, _)| id)
                     .collect();
@@ -2318,21 +2316,36 @@ impl GarbageCollector {
                 }
                 stats.tracers_collected = collected_tracers.len();
 
-                // Sweep objects: collect unreachable in-scope objects
-                let collected_objects: Vec<ObjectId> = gc_maps
-                    .objects
-                    .iter()
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    .filter(|(_, e)| e.generation <= max_gen && !(&*e.ptr).is_traceable())
-                    .map(|(id, _)| id)
-                    .collect();
-                stats.objects_collected = collected_objects.len();
+                // Combined pass: sweep + count + clear_trace + promotion.
+                let promo_cfg = self.promotion_config();
+                let mut collected_objects: Vec<ObjectId> = Vec::new();
+                for (id, entry) in gc_maps.objects.iter_mut() {
+                    let in_scope = entry.generation <= max_gen;
+                    let marked = (*entry.root_ref_count_ptr).load(Ordering::Acquire) > 0;
 
-                // Clear mark state for ALL objects before deallocation.
-                for entry in gc_maps.objects.values() {
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    (&*entry.ptr).clear_trace();
+                    if in_scope {
+                        stats.objects_scanned += 1;
+                        if !marked {
+                            collected_objects.push(id);
+                            continue;
+                        }
+                        let cur_gen = entry.generation;
+                        entry.survive_count += 1;
+                        if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
+                            entry.survive_count = 0;
+                            if let Some(next_gen) = cur_gen.next() {
+                                if cur_gen == Generation::Gen0 {
+                                    let thin = entry.ptr.get_thin_ptr();
+                                    self.card_table.register_object(thin, id);
+                                }
+                                entry.generation = next_gen;
+                                stats.objects_promoted += 1;
+                            }
+                        }
+                    }
+                    (*entry.root_ref_count_ptr).store(0, Ordering::Release);
                 }
+                stats.objects_collected = collected_objects.len();
 
                 // Remove collected objects
                 let mut object_deallocs = Vec::new();
@@ -2342,13 +2355,7 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        // Decrement region counters
-                        if let Some(bytes) = gc_maps.region_total_bytes.get_mut(&entry.region) {
-                            *bytes = bytes.saturating_sub(entry.layout.size());
-                        }
-                        if let Some(count) = gc_maps.region_object_count.get_mut(&entry.region) {
-                            *count = count.saturating_sub(1);
-                        }
+                        // Region stats are computed on-demand; no counters to decrement.
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
@@ -2359,23 +2366,6 @@ impl GarbageCollector {
                 // Clear card table dirty flags on full collection
                 if max_gen >= Generation::Gen2 {
                     self.card_table.clear_dirty();
-                }
-
-                // Promote surviving in-scope objects
-                let promo_cfg = self.promotion_config();
-                for (_obj_id, entry) in gc_maps.objects.iter_mut() {
-                    if entry.generation > max_gen {
-                        continue;
-                    }
-                    let cur_gen = entry.generation;
-                    entry.survive_count += 1;
-                    if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
-                        entry.survive_count = 0;
-                        if let Some(next_gen) = cur_gen.next() {
-                            entry.generation = next_gen;
-                            stats.objects_promoted += 1;
-                        }
-                    }
                 }
 
                 // Reset incremental state
@@ -2520,7 +2510,10 @@ impl GarbageCollector {
     pub unsafe fn begin_concurrent_collection(&self, max_gen: Generation) {
         let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Lazily rebuild ptr_to_object for edge snapshot resolution.
+        gc_maps.rebuild_ptr_to_object();
 
         incr.phase = CollectionPhase::Marking;
         incr.max_gen = max_gen;
@@ -2736,24 +2729,18 @@ impl GarbageCollector {
                     }
                 }
 
-                // Count objects in target region directly (no HashSet allocation)
-                stats.objects_scanned = gc_maps
-                    .objects
-                    .iter()
-                    .filter(|(_, e)| e.region == region)
-                    .count();
-
-                // Sweep unreachable tracers whose object is in this region
+                // Sweep unreachable tracers whose object is in this region.
                 let collected_tracers: Vec<TracerId> = gc_maps
                     .tracers
                     .iter()
                     .filter(|(_, e)| {
-                        let in_region = gc_maps
+                        gc_maps
                             .objects
                             .get(e.object_id)
-                            .is_some_and(|obj| obj.region == region);
-                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        in_region && !(&*e.tracer_ptr).is_traceable()
+                            .is_some_and(|obj| {
+                                obj.region == region
+                                    && (*obj.root_ref_count_ptr).load(Ordering::Acquire) == 0
+                            })
                     })
                     .map(|(id, _)| id)
                     .collect();
@@ -2765,21 +2752,22 @@ impl GarbageCollector {
                 }
                 stats.tracers_collected = collected_tracers.len();
 
-                // Sweep unreachable objects in this region (direct region check)
-                let collected_objects: Vec<ObjectId> = gc_maps
-                    .objects
-                    .iter()
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    .filter(|(_, e)| e.region == region && !(&*e.ptr).is_traceable())
-                    .map(|(id, _)| id)
-                    .collect();
-                stats.objects_collected = collected_objects.len();
+                // Combined pass: sweep + count + clear_trace in a single iteration.
+                let mut collected_objects: Vec<ObjectId> = Vec::new();
+                for (id, entry) in gc_maps.objects.iter_mut() {
+                    let in_region = entry.region == region;
+                    let marked = (*entry.root_ref_count_ptr).load(Ordering::Acquire) > 0;
 
-                // Unconditionally clear mark state for ALL objects.
-                for entry in gc_maps.objects.values() {
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    (&*entry.ptr).clear_trace();
+                    if in_region {
+                        stats.objects_scanned += 1;
+                        if !marked {
+                            collected_objects.push(id);
+                            continue;
+                        }
+                    }
+                    (*entry.root_ref_count_ptr).store(0, Ordering::Release);
                 }
+                stats.objects_collected = collected_objects.len();
 
                 // Remove collected objects
                 let mut object_deallocs = Vec::new();
@@ -2789,13 +2777,7 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        // Decrement region counters
-                        if let Some(bytes) = gc_maps.region_total_bytes.get_mut(&entry.region) {
-                            *bytes = bytes.saturating_sub(entry.layout.size());
-                        }
-                        if let Some(count) = gc_maps.region_object_count.get_mut(&entry.region) {
-                            *count = count.saturating_sub(1);
-                        }
+                        // Region stats are computed on-demand; no counters to decrement.
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
@@ -2836,9 +2818,9 @@ impl GarbageCollector {
     /// Return per-region liveness statistics without running a collection.
     pub fn region_stats(&self) -> Vec<crate::generation::RegionStats> {
         let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
-        // Collect all unique region IDs from both maps
-        let mut region_ids: Vec<RegionId> = gc_maps.region_total_bytes.keys().copied().collect();
-        for key in gc_maps.region_object_count.keys() {
+        let (total_bytes, object_count) = gc_maps.compute_region_stats();
+        let mut region_ids: Vec<RegionId> = total_bytes.keys().copied().collect();
+        for key in object_count.keys() {
             if !region_ids.contains(key) {
                 region_ids.push(*key);
             }
@@ -2847,8 +2829,8 @@ impl GarbageCollector {
             .into_iter()
             .map(|rid| crate::generation::RegionStats {
                 region_id: rid,
-                total_bytes: gc_maps.region_total_bytes.get(&rid).copied().unwrap_or(0),
-                object_count: gc_maps.region_object_count.get(&rid).copied().unwrap_or(0),
+                total_bytes: total_bytes.get(&rid).copied().unwrap_or(0),
+                object_count: object_count.get(&rid).copied().unwrap_or(0),
                 estimated_garbage_ratio: 0.0,
             })
             .collect()
@@ -2898,15 +2880,13 @@ impl GarbageCollector {
 
                 stats.objects_scanned = gc_maps.objects.len();
 
-                // ---- Compute per-region garbage ratio ----
-                // Count total and reachable (marked) objects per region.
+                // ---- Compute per-region garbage ratio using inline mark bits ----
                 let mut region_total: HashMap<RegionId, usize> = HashMap::new();
                 let mut region_marked: HashMap<RegionId, usize> = HashMap::new();
 
                 for (_id, entry) in gc_maps.objects.iter() {
                     *region_total.entry(entry.region).or_insert(0) += 1;
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    if (&*entry.ptr).is_traceable() {
+                    if (*entry.root_ref_count_ptr).load(Ordering::Acquire) > 0 {
                         *region_marked.entry(entry.region).or_insert(0) += 1;
                     }
                 }
@@ -2937,12 +2917,14 @@ impl GarbageCollector {
                         break;
                     }
 
-                    // Find unreachable objects in this region
-                    // SAFETY: Object pointers are valid while gc_maps lock is held.
+                    // Find unreachable objects in this region using inline mark bits
                     let dead_in_region: Vec<ObjectId> = gc_maps
                         .objects
                         .iter()
-                        .filter(|(_id, e)| e.region == *region && !(&*e.ptr).is_traceable())
+                        .filter(|(_id, e)| {
+                            e.region == *region
+                                && (*e.root_ref_count_ptr).load(Ordering::Acquire) == 0
+                        })
                         .map(|(id, _)| id)
                         .collect();
 
@@ -2951,7 +2933,6 @@ impl GarbageCollector {
                     }
 
                     // Sweep tracers pointing to dead objects in this region
-                    // Use direct lookup: if tracer's object is in dead_in_region list
                     let dead_tracers: Vec<TracerId> = gc_maps
                         .tracers
                         .iter()
@@ -2972,14 +2953,6 @@ impl GarbageCollector {
                             gc_maps.ptr_to_object.remove(&thin);
                             self.card_table.remove_object(thin, *obj_id);
                             stats.bytes_freed += entry.layout.size();
-                            // Decrement region counters
-                            if let Some(bytes) = gc_maps.region_total_bytes.get_mut(&entry.region) {
-                                *bytes = bytes.saturating_sub(entry.layout.size());
-                            }
-                            if let Some(count) = gc_maps.region_object_count.get_mut(&entry.region)
-                            {
-                                *count = count.saturating_sub(1);
-                            }
                             if let Some(alive) = &entry.weak_alive {
                                 alive.store(false, Ordering::Release);
                             }
@@ -2989,10 +2962,9 @@ impl GarbageCollector {
                     stats.objects_collected += dead_in_region.len();
                 }
 
-                // Clear mark state for ALL objects
+                // Clear mark state for ALL surviving objects using inline access.
                 for entry in gc_maps.objects.values() {
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    (&*entry.ptr).clear_trace();
+                    (*entry.root_ref_count_ptr).store(0, Ordering::Release);
                 }
 
                 (tracer_deallocs, object_deallocs)
@@ -3159,6 +3131,10 @@ impl GarbageCollector {
                     entry.ptr = new_fat_ptr;
                     let new_thin = entry.ptr.get_thin_ptr();
 
+                    // Update root_ref_count_ptr: same offset, new base address.
+                    let rrc_offset = entry.root_ref_count_ptr as usize - old_thin;
+                    entry.root_ref_count_ptr = (new_thin + rrc_offset) as *const AtomicUsize;
+
                     // Replace memory tracking with compact block reference.
                     // Use std::mem::replace to properly move the old GcObjMem out,
                     // avoiding double-drop of Arc refs in Compact/Tlab variants.
@@ -3229,7 +3205,7 @@ impl Drop for CompactBlock {
 /// Allocation threshold for triggering automatic Gen0 collection on the owning thread.
 /// Local GCs collect on allocation (not from a background thread) to avoid data races
 /// on non-atomic Cell/RefCell internals.
-const LOCAL_GC_ALLOC_THRESHOLD: usize = 1000;
+const LOCAL_GC_ALLOC_THRESHOLD: usize = 1_000;
 
 /// Thread-local garbage collector.
 ///
@@ -3358,7 +3334,7 @@ impl LocalGarbageCollector {
     {
         unsafe {
             let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem_tlab::<GcPtr<T>>();
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
+            let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem_tlab::<GcInternal<T>>();
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
@@ -3376,6 +3352,8 @@ impl LocalGarbageCollector {
                     (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
+            // SAFETY: gc_ptr was just initialized; root_ref_count lives at a fixed offset in GcInfo.
+            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -3387,12 +3365,10 @@ impl LocalGarbageCollector {
                 weak_alive: None,
                 ref_count: 1,
                 region,
+                root_ref_count_ptr,
             });
-            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
-            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
-            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
-            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
-            self.core.card_table.register_object(thin_ptr, obj_id);
+            // ptr_to_object, region stats, and card table are populated lazily
+            // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -3463,7 +3439,7 @@ impl LocalGarbageCollector {
         unsafe {
             let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem_tlab::<RefCell<GcPtr<T>>>();
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                self.core.alloc_mem::<GcCellInternal<T>>();
+                self.alloc_mem_tlab::<GcCellInternal<T>>();
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
@@ -3483,6 +3459,9 @@ impl LocalGarbageCollector {
                         .finalize();
                 }
             }
+            // SAFETY: gc_ptr was just initialized; as_ptr() gives stable pointer to inner GcPtr<T>.
+            let root_ref_count_ptr =
+                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -3494,12 +3473,10 @@ impl LocalGarbageCollector {
                 weak_alive: None,
                 ref_count: 1,
                 region,
+                root_ref_count_ptr,
             });
-            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
-            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
-            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
-            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
-            self.core.card_table.register_object(thin_ptr, obj_id);
+            // ptr_to_object, region stats, and card table are populated lazily
+            // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -3577,7 +3554,7 @@ impl LocalGarbageCollector {
         unsafe {
             let (gc_ptr, mem_info_gc_ptr) = self.try_alloc_mem_tlab::<GcPtr<T>>()?;
             let (gc_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem_with_gc::<GcInternal<T>>() {
+                match self.try_alloc_mem_tlab::<GcInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
@@ -3602,6 +3579,8 @@ impl LocalGarbageCollector {
                     (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
+            // SAFETY: gc_ptr was just initialized; root_ref_count lives at a fixed offset in GcInfo.
+            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -3613,12 +3592,10 @@ impl LocalGarbageCollector {
                 weak_alive: None,
                 ref_count: 1,
                 region,
+                root_ref_count_ptr,
             });
-            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
-            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
-            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
-            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
-            self.core.card_table.register_object(thin_ptr, obj_id);
+            // ptr_to_object, region stats, and card table are populated lazily
+            // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -3658,7 +3635,7 @@ impl LocalGarbageCollector {
         unsafe {
             let (gc_ptr, mem_info_gc_ptr) = self.try_alloc_mem_tlab::<RefCell<GcPtr<T>>>()?;
             let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem_with_gc::<GcCellInternal<T>>() {
+                match self.try_alloc_mem_tlab::<GcCellInternal<T>>() {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
@@ -3685,6 +3662,9 @@ impl LocalGarbageCollector {
                         .finalize();
                 }
             }
+            // SAFETY: gc_ptr was just initialized; as_ptr() gives stable pointer to inner GcPtr<T>.
+            let root_ref_count_ptr =
+                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -3696,12 +3676,10 @@ impl LocalGarbageCollector {
                 weak_alive: None,
                 ref_count: 1,
                 region,
+                root_ref_count_ptr,
             });
-            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
-            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
-            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
-            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
-            self.core.card_table.register_object(thin_ptr, obj_id);
+            // ptr_to_object, region stats, and card table are populated lazily
+            // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -3739,13 +3717,9 @@ impl LocalGarbageCollector {
     {
         unsafe {
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
-            let thin = (weak.ptr as *const dyn Trace).get_thin_ptr();
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
-            let object_id = *gc_maps
-                .ptr_to_object
-                .get(&thin)
-                .expect("upgrade_weak: object not found");
+            let object_id = weak.object_id;
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
                 mem: mem_info_internal_ptr.0,

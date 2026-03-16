@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::basic_gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
-use crate::gc::{Finalize, GarbageCollector, ObjectEntry, ThinPtr, Trace, TracerEntry};
+use crate::gc::{Finalize, GarbageCollector, ObjectEntry, Trace, TracerEntry};
 use crate::generation::Generation;
 use crate::slot_map::{ObjectId, TracerId};
 
@@ -627,7 +627,9 @@ where
                 .stw_lock
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            GLOBAL_GC.core.write_barrier(self.ptr as *const dyn Trace);
+            GLOBAL_GC
+                .core
+                .write_barrier(self.object_id, self.ptr as *const dyn Trace);
             (*self.ptr).borrow_mut()
         }
     }
@@ -700,6 +702,7 @@ where
 {
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ptr: *const GcPtr<T>,
+    object_id: ObjectId,
 }
 
 // SAFETY: GcWeak holds only an Arc<AtomicBool> (thread-safe) and a raw pointer
@@ -715,6 +718,7 @@ where
         GcWeak {
             alive: self.alive.clone(),
             ptr: self.ptr,
+            object_id: self.object_id,
         }
     }
 }
@@ -772,10 +776,11 @@ where
     pub fn downgrade(this: &Gc<T>) -> GcWeak<T> {
         let alive = GLOBAL_GC
             .core
-            .get_or_create_weak_alive(this.ptr as *const dyn Trace);
+            .get_or_create_weak_alive(this.object_id);
         GcWeak {
             alive,
             ptr: this.ptr,
+            object_id: this.object_id,
         }
     }
 }
@@ -847,6 +852,7 @@ impl GlobalGarbageCollector {
                     (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
+            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -858,12 +864,10 @@ impl GlobalGarbageCollector {
                 weak_alive: None,
                 ref_count: 1,
                 region,
+                root_ref_count_ptr,
             });
-            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
-            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
-            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
-            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
-            self.core.card_table.register_object(thin_ptr, obj_id);
+            // ptr_to_object, region stats, and card table are populated lazily
+            // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -956,6 +960,8 @@ impl GlobalGarbageCollector {
                         .finalize();
                 }
             }
+            let root_ref_count_ptr =
+                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -967,12 +973,10 @@ impl GlobalGarbageCollector {
                 weak_alive: None,
                 ref_count: 1,
                 region,
+                root_ref_count_ptr,
             });
-            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
-            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
-            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
-            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
-            self.core.card_table.register_object(thin_ptr, obj_id);
+            // ptr_to_object, region stats, and card table are populated lazily
+            // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -1079,6 +1083,7 @@ impl GlobalGarbageCollector {
                     (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
+            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -1090,12 +1095,10 @@ impl GlobalGarbageCollector {
                 weak_alive: None,
                 ref_count: 1,
                 region,
+                root_ref_count_ptr,
             });
-            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
-            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
-            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
-            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
-            self.core.card_table.register_object(thin_ptr, obj_id);
+            // ptr_to_object, region stats, and card table are populated lazily
+            // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -1161,6 +1164,8 @@ impl GlobalGarbageCollector {
                         .finalize();
                 }
             }
+            let root_ref_count_ptr =
+                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -1172,12 +1177,10 @@ impl GlobalGarbageCollector {
                 weak_alive: None,
                 ref_count: 1,
                 region,
+                root_ref_count_ptr,
             });
-            let thin_ptr = (gc_ptr as *const dyn Trace).get_thin_ptr();
-            gc_maps.ptr_to_object.insert(thin_ptr, obj_id);
-            *gc_maps.region_total_bytes.entry(region).or_insert(0) += mem_info_gc_ptr.1.size();
-            *gc_maps.region_object_count.entry(region).or_insert(0) += 1;
-            self.core.card_table.register_object(thin_ptr, obj_id);
+            // ptr_to_object, region stats, and card table are populated lazily
+            // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
 
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
@@ -1214,15 +1217,14 @@ impl GlobalGarbageCollector {
     {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let thin = (weak.ptr as *const dyn Trace).get_thin_ptr();
 
             let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
             // Re-check under gc_maps lock: the object may have been freed by a
             // concurrent drop (RC hybrid) between the alive check and this point.
-            let object_id = match gc_maps.ptr_to_object.get(&thin) {
-                Some(&id) => id,
-                None => return None,
-            };
+            let object_id = weak.object_id;
+            if gc_maps.objects.get(object_id).is_none() {
+                return None;
+            }
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
