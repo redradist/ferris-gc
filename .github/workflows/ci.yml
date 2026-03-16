@@ -59,6 +59,7 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
       - run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo miri test -p ferris-gc --lib
+      - run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo miri test -p ferris-gc --test miri_tests --features _internal
 
   msrv:
     name: MSRV (1.85.0)
