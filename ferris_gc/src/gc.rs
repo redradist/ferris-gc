@@ -2243,63 +2243,51 @@ impl GarbageCollector {
                 max_gen = incr.max_gen;
                 incr.phase = CollectionPhase::Sweeping;
 
-                // Root discovery for objects allocated during concurrent marking.
+                // Full STW re-mark using trace() instead of trace_children().
+                // This is necessary because:
+                // 1. Types may not implement trace_children (default is empty),
+                //    making the concurrent edge snapshot incomplete.
+                // 2. Objects allocated during concurrent marking are not in the
+                //    snapshot and would be incorrectly swept.
+                // The concurrent marking phase serves as a performance hint —
+                // this re-mark guarantees correctness.
+
+                // Root discovery: cascade reset_root into objects.
                 for entry in gc_maps.objects.values() {
                     // SAFETY: Object pointer is valid while gc_maps lock is held.
                     (&*entry.ptr).reset_root();
                 }
 
-                // Re-gray any dirty card table entries that were already Black.
-                let dirty_ids = self.card_table.dirty_objects();
-                for obj_id in &dirty_ids {
-                    if let Some(color) = incr.colors.get_mut(obj_id) {
-                        if *color == MarkColor::Black {
-                            *color = MarkColor::Gray;
-                            incr.gray_stack.push(*obj_id);
-                        }
-                    }
-                }
-
-                // Also gray objects reachable from NEW root tracers (allocated during marking).
-                for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
+                // Mark from all root tracers using trace() (same as collect_generation).
+                for entry in gc_maps.tracers.values() {
                     // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    let tracer = &(*tracer_entry.tracer_ptr);
+                    let tracer = &(*entry.tracer_ptr);
                     if tracer.is_root() {
-                        if let Some(color) = incr.colors.get_mut(&tracer_entry.object_id) {
-                            if *color == MarkColor::White {
-                                *color = MarkColor::Gray;
-                                incr.gray_stack.push(tracer_entry.object_id);
-                            }
+                        tracer.trace();
+                    }
+                }
+
+                // For partial collections, also trace from dirty card table entries.
+                if max_gen < Generation::Gen2 {
+                    let dirty_ids = self.card_table.dirty_objects();
+                    for obj_id in &dirty_ids {
+                        if let Some(entry) = gc_maps.objects.get(*obj_id) {
+                            // SAFETY: Object pointer is valid while gc_maps lock is held.
+                            (&*entry.ptr).trace();
                         }
                     }
                 }
 
-                // Drain remaining gray (from re-graying + new roots)
-                let mut children_buf = Vec::new();
-                while let Some(obj_id) = incr.gray_stack.pop() {
-                    children_buf.clear();
-                    if let Some(entry) = gc_maps.objects.get(obj_id) {
-                        // SAFETY: Object pointer is valid while gc_maps lock is held.
-                        (&*entry.ptr).trace_children(&mut children_buf);
-                    }
-                    for &child_ptr in &children_buf {
-                        let thin = child_ptr.get_thin_ptr();
-                        if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin) {
-                            if let Some(color) = incr.colors.get_mut(&child_id) {
-                                if *color == MarkColor::White {
-                                    *color = MarkColor::Gray;
-                                    incr.gray_stack.push(child_id);
-                                }
-                            }
-                        }
-                    }
-                    incr.colors.insert(obj_id, MarkColor::Black);
-                }
+                // Count in-scope objects
+                let objects_scanned = gc_maps
+                    .objects
+                    .iter()
+                    .filter(|(_, e)| e.generation <= max_gen)
+                    .count();
 
-                // Sweep: collect White objects
                 let mut stats = CollectionStats {
                     generation: max_gen,
-                    objects_scanned: incr.colors.len(),
+                    objects_scanned,
                     objects_collected: 0,
                     objects_promoted: 0,
                     tracers_collected: 0,
@@ -2307,37 +2295,48 @@ impl GarbageCollector {
                     duration: std::time::Duration::ZERO,
                 };
 
-                let white_objects: Vec<ObjectId> = incr
-                    .colors
-                    .iter()
-                    .filter(|(_, color)| **color == MarkColor::White)
-                    .map(|(id, _)| *id)
-                    .collect();
-                stats.objects_collected = white_objects.len();
-
-                // Sweep dead tracers (those pointing to white objects — check color directly)
-                let dead_tracers: Vec<TracerId> = gc_maps
+                // Sweep tracers: collect unreachable tracers whose object is in scope
+                let collected_tracers: Vec<TracerId> = gc_maps
                     .tracers
                     .iter()
                     .filter(|(_, e)| {
-                        incr.colors
-                            .get(&e.object_id)
-                            .is_some_and(|c| *c == MarkColor::White)
+                        let in_scope = gc_maps
+                            .objects
+                            .get(e.object_id)
+                            .is_some_and(|obj| obj.generation <= max_gen);
+                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
+                        in_scope && !(&*e.tracer_ptr).is_traceable()
                     })
                     .map(|(id, _)| id)
                     .collect();
-                stats.tracers_collected = dead_tracers.len();
 
                 let mut tracer_deallocs = Vec::new();
-                for tracer_id in &dead_tracers {
+                for tracer_id in &collected_tracers {
                     if let Some(entry) = gc_maps.tracers.remove(*tracer_id) {
                         tracer_deallocs.push((entry.mem, entry.layout));
                     }
                 }
+                stats.tracers_collected = collected_tracers.len();
 
-                // Sweep dead objects
+                // Sweep objects: collect unreachable in-scope objects
+                let collected_objects: Vec<ObjectId> = gc_maps
+                    .objects
+                    .iter()
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
+                    .filter(|(_, e)| e.generation <= max_gen && !(&*e.ptr).is_traceable())
+                    .map(|(id, _)| id)
+                    .collect();
+                stats.objects_collected = collected_objects.len();
+
+                // Clear mark state for ALL objects before deallocation.
+                for entry in gc_maps.objects.values() {
+                    // SAFETY: Object pointer is valid while gc_maps lock is held.
+                    (&*entry.ptr).clear_trace();
+                }
+
+                // Remove collected objects
                 let mut object_deallocs = Vec::new();
-                for &obj_id in &white_objects {
+                for &obj_id in &collected_objects {
                     if let Some(entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
@@ -2363,28 +2362,18 @@ impl GarbageCollector {
                 }
 
                 // Promote surviving in-scope objects
-                let surviving: Vec<ObjectId> = incr
-                    .colors
-                    .iter()
-                    .filter(|(_, color)| **color != MarkColor::White)
-                    .map(|(id, _)| *id)
-                    .collect();
-
-                for obj_id in surviving {
-                    if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
-                        if entry.generation <= max_gen {
-                            let cur_gen = entry.generation;
-                            entry.survive_count += 1;
-                            let promo_cfg = self.promotion_config();
-                            let should_promote =
-                                entry.survive_count >= promo_cfg.threshold_for(cur_gen);
-                            if should_promote {
-                                entry.survive_count = 0;
-                                if let Some(next_gen) = cur_gen.next() {
-                                    entry.generation = next_gen;
-                                    stats.objects_promoted += 1;
-                                }
-                            }
+                let promo_cfg = self.promotion_config();
+                for (_obj_id, entry) in gc_maps.objects.iter_mut() {
+                    if entry.generation > max_gen {
+                        continue;
+                    }
+                    let cur_gen = entry.generation;
+                    entry.survive_count += 1;
+                    if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
+                        entry.survive_count = 0;
+                        if let Some(next_gen) = cur_gen.next() {
+                            entry.generation = next_gen;
+                            stats.objects_promoted += 1;
                         }
                     }
                 }
