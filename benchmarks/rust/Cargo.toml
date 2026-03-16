@@ -1,0 +1,30 @@
+[package]
+name = "ferris-gc-benchmarks"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ferris-gc = { path = "../../ferris_gc", features = ["_internal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "alloc_bench"
+path = "src/bin/alloc_bench.rs"
+
+[[bin]]
+name = "churn_bench"
+path = "src/bin/churn_bench.rs"
+
+[[bin]]
+name = "tree_bench"
+path = "src/bin/tree_bench.rs"
+
+[[bin]]
+name = "generational_bench"
+path = "src/bin/generational_bench.rs"
+
+[[bin]]
+name = "concurrent_bench"
+path = "src/bin/concurrent_bench.rs"

@@ -1,0 +1,3 @@
+rust/target/
+results/go_bin/
+results/*.json
