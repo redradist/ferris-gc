@@ -992,14 +992,14 @@ impl std::error::Error for GcAllocError {}
 /// Tracks the origin of a GC allocation so it can be correctly freed.
 ///
 /// - `Mem` — allocated via `std::alloc::alloc`; freed with `std::alloc::dealloc`.
-/// - `Tlab` — sub-allocated from a TLAB block; freed by dropping the `Arc<TlabBlock>`,
-///   which frees the entire block once all sub-allocations are collected.
+/// - `Tlab` — sub-allocated from a TLAB block; freed by releasing the block's
+///   non-atomic ref_count, which frees the entire block once all refs are gone.
 pub(crate) enum GcObjMem {
     /// System-allocated memory.
     Mem(*mut u8),
-    /// TLAB sub-allocation. The `Arc<crate::tlab::TlabBlock>` keeps the
-    /// backing block alive until all objects in it are collected.
-    Tlab(*mut u8, Arc<crate::tlab::TlabBlock>),
+    /// TLAB sub-allocation. The `*mut TlabBlock` holds a ref_count reference
+    /// to the backing block. Call `TlabBlock::release` to decrement.
+    Tlab(*mut u8, *mut crate::tlab::TlabBlock),
     /// Compacted memory sub-allocation. The `Arc<CompactBlock>` keeps the
     /// contiguous buffer alive until all compacted objects are collected.
     Compact(*mut u8, Arc<CompactBlock>),
@@ -1017,7 +1017,7 @@ impl GcObjMem {
     }
 
     /// Deallocate this memory. For `Mem`, calls `std::alloc::dealloc`.
-    /// For `Tlab`, drops the Arc (the block is freed when all Arcs are dropped).
+    /// For `Tlab`, releases the block's ref_count (block freed when count hits 0).
     ///
     /// # Safety
     /// For `Mem` variant, the pointer must have been allocated with the given layout.
@@ -1028,10 +1028,10 @@ impl GcObjMem {
                 // SAFETY: Caller guarantees ptr was allocated with this layout.
                 unsafe { dealloc(ptr, layout) };
             }
-            GcObjMem::Tlab(_ptr, _block) => {
-                // Dropping the Arc<TlabBlock>. When all Arcs for this block
-                // are dropped, the TlabBlock::drop frees the entire buffer.
-                // Individual sub-allocations within the block cannot be freed.
+            GcObjMem::Tlab(_ptr, block) => {
+                // SAFETY: block pointer is valid; decrement ref_count.
+                // When ref_count reaches 0, the block buffer is freed.
+                unsafe { crate::tlab::TlabBlock::release(block) };
             }
             GcObjMem::Compact(_ptr, _block) => {
                 // Dropping the Arc<CompactBlock>. When all Arcs for this block
@@ -6474,7 +6474,7 @@ mod tests {
         assert_eq!(**a, 1);
         assert_eq!(**b, 2);
         assert_eq!(**c, 3);
-        // Drop all and collect — the TLAB block's Arc refcount should reach 0
+        // Drop all and collect — the TLAB block's ref_count should reach 0
         drop(a);
         drop(b);
         drop(c);

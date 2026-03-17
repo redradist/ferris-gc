@@ -9,23 +9,54 @@
 //!
 //! Individual objects within a TLAB block cannot be freed independently (they
 //! are sub-allocations of a larger buffer). Instead, each block is reference-
-//! counted via `Arc<TlabBlock>`. When all objects in a block have been
-//! collected (all `Arc` clones dropped), the entire block is freed.
+//! counted via a non-atomic `ref_count`. When all sub-allocations in a block
+//! have been collected (ref_count drops to 0), the entire block is freed.
+//! This avoids the ~5ns overhead of `Arc` atomic operations on the hot path.
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::sync::Arc;
 
 /// Default TLAB block size: 64 KiB.
 const TLAB_DEFAULT_SIZE: usize = 64 * 1024;
 
 /// A contiguous memory block backing TLAB sub-allocations.
 ///
-/// The block owns its allocation and frees it on drop. Individual objects
-/// within the block hold `Arc<TlabBlock>` to keep the block alive until
-/// all objects are collected.
+/// The block owns its allocation and frees it on drop. Each sub-allocation
+/// increments `ref_count`; deallocation decrements it. When `ref_count`
+/// reaches 0, the block is freed via [`TlabBlock::release`].
 pub(crate) struct TlabBlock {
     buffer: *mut u8,
     layout: Layout,
+    /// Non-atomic reference count. Safe because TLAB is thread-local and
+    /// all cross-thread access (background GC) is under a Mutex.
+    ref_count: usize,
+}
+
+impl TlabBlock {
+    /// Increment the reference count (one ref per sub-allocation).
+    #[inline]
+    pub(crate) unsafe fn add_ref(block: *mut TlabBlock) {
+        unsafe {
+            (*block).ref_count += 1;
+        }
+    }
+
+    /// Decrement the reference count. If it reaches 0, frees the block.
+    ///
+    /// # Safety
+    /// `block` must be a valid pointer from a previous `alloc_block` call.
+    /// Must not be called more times than `add_ref` + 1 (the initial ref).
+    #[inline]
+    pub(crate) unsafe fn release(block: *mut TlabBlock) {
+        unsafe {
+            (*block).ref_count -= 1;
+            if (*block).ref_count == 0 {
+                // Free buffer, then free the TlabBlock struct itself.
+                let b = Box::from_raw(block);
+                // b's Drop frees the buffer
+                drop(b);
+            }
+        }
+    }
 }
 
 impl Drop for TlabBlock {
@@ -43,8 +74,8 @@ impl Drop for TlabBlock {
 // SAFETY: The buffer is only accessed via properly aligned sub-pointers.
 // The TlabBlock owns the allocation and frees it on drop.
 // No mutable aliasing occurs — once a sub-region is handed out, only the
-// recipient uses it. The TlabBlock itself is behind an Arc and is never
-// mutated after creation.
+// recipient uses it. The ref_count is only mutated under the gc_maps_lock
+// Mutex or from the owning thread (thread-local GC).
 unsafe impl Send for TlabBlock {}
 unsafe impl Sync for TlabBlock {}
 
@@ -52,11 +83,11 @@ unsafe impl Sync for TlabBlock {}
 ///
 /// Manages a current `TlabBlock` and a bump-pointer (`cursor`) within it.
 /// Allocations advance the cursor; when the block is exhausted, a new one
-/// is allocated. Old blocks are kept alive via `Arc<TlabBlock>` references
-/// held by the objects allocated from them.
+/// is allocated. Old blocks are kept alive via `ref_count` tracking in
+/// the `TlabBlock` itself.
 pub(crate) struct Tlab {
-    /// The current block being allocated from.
-    current_block: Arc<TlabBlock>,
+    /// The current block being allocated from. Holds one ref_count.
+    current_block: *mut TlabBlock,
     /// Byte offset from the start of the current block's buffer.
     cursor: usize,
     /// Total capacity of the current block in bytes.
@@ -75,77 +106,72 @@ impl Tlab {
     pub(crate) fn with_capacity(capacity: usize) -> Option<Tlab> {
         let block = Self::alloc_block(capacity)?;
         Some(Tlab {
-            current_block: Arc::new(block),
+            current_block: block,
             cursor: 0,
             capacity,
         })
     }
 
-    /// Allocate a new `TlabBlock` of the given size.
-    fn alloc_block(size: usize) -> Option<TlabBlock> {
-        // Use max alignment of 16 bytes to satisfy most type alignments.
-        // Individual allocations will further align within the block.
+    /// Allocate a new `TlabBlock` of the given size, returning a raw pointer.
+    /// The block starts with ref_count = 1 (the Tlab's own reference).
+    fn alloc_block(size: usize) -> Option<*mut TlabBlock> {
         let layout = Layout::from_size_align(size, 16).ok()?;
         // SAFETY: Layout is valid (non-zero size, power-of-two alignment).
         let buffer = unsafe { alloc(layout) };
         if buffer.is_null() {
             return None;
         }
-        Some(TlabBlock { buffer, layout })
+        let block = Box::new(TlabBlock {
+            buffer,
+            layout,
+            ref_count: 1, // Tlab owns one reference
+        });
+        Some(Box::into_raw(block))
     }
 
     /// Try to allocate `layout.size()` bytes with `layout.align()` alignment
     /// from the current TLAB block.
     ///
-    /// Returns `Some((ptr, block_arc))` on success, where `ptr` is the
-    /// sub-allocation pointer and `block_arc` is an `Arc` reference to the
-    /// backing block (the caller must keep this alive until the object is
-    /// collected).
+    /// Returns `Some((ptr, block_ptr))` on success, where `ptr` is the
+    /// sub-allocation pointer and `block_ptr` is a raw pointer to the
+    /// backing block (the caller must call `TlabBlock::release` when the
+    /// object is collected).
     ///
     /// Returns `None` if the current block doesn't have enough space.
-    /// The caller should call `alloc_slow` to get a new block and retry,
-    /// or fall back to the system allocator.
-    pub(crate) fn alloc(&mut self, layout: Layout) -> Option<(*mut u8, Arc<TlabBlock>)> {
+    pub(crate) fn alloc(&mut self, layout: Layout) -> Option<(*mut u8, *mut TlabBlock)> {
         let align = layout.align();
         let size = layout.size();
 
         if size == 0 {
-            // Zero-sized types don't need real memory, fall back to system allocator.
             return None;
         }
 
-        // Align cursor up to the required alignment.
         let aligned_cursor = align_up(self.cursor, align);
 
         if aligned_cursor + size <= self.capacity {
             // SAFETY: `current_block.buffer` is valid for `self.capacity` bytes.
-            // `aligned_cursor + size <= self.capacity` ensures the sub-region is
-            // within bounds. The alignment is correct because `aligned_cursor` is
-            // a multiple of `align`.
-            let ptr = unsafe { self.current_block.buffer.add(aligned_cursor) };
+            let ptr = unsafe { (*self.current_block).buffer.add(aligned_cursor) };
             self.cursor = aligned_cursor + size;
-            Some((ptr, Arc::clone(&self.current_block)))
+            // SAFETY: current_block is valid; increment ref for this sub-allocation.
+            unsafe { TlabBlock::add_ref(self.current_block) };
+            Some((ptr, self.current_block))
         } else {
             None
         }
     }
 
     /// Allocate from a fresh TLAB block when the current one is exhausted.
-    ///
-    /// Allocates a new block (at least `TLAB_DEFAULT_SIZE` or large enough for
-    /// the requested layout), replaces the current block, and performs the
-    /// allocation from the new block.
-    ///
-    /// Returns `None` if the system allocator fails to provide a new block.
-    pub(crate) fn alloc_slow(&mut self, layout: Layout) -> Option<(*mut u8, Arc<TlabBlock>)> {
+    pub(crate) fn alloc_slow(&mut self, layout: Layout) -> Option<(*mut u8, *mut TlabBlock)> {
         let size = layout.size();
-        // New block must be at least TLAB_DEFAULT_SIZE, but also large enough
-        // for this specific allocation (including worst-case alignment padding).
         let min_block_size = TLAB_DEFAULT_SIZE.max(size + layout.align());
         let new_block = Self::alloc_block(min_block_size)?;
         let capacity = min_block_size;
 
-        self.current_block = Arc::new(new_block);
+        // Release Tlab's reference on the old block.
+        // SAFETY: current_block is valid; Tlab holds one ref.
+        unsafe { TlabBlock::release(self.current_block) };
+
+        self.current_block = new_block;
         self.cursor = 0;
         self.capacity = capacity;
 
@@ -153,7 +179,7 @@ impl Tlab {
     }
 
     /// Convenience: try the fast path, then the slow path.
-    pub(crate) fn alloc_or_grow(&mut self, layout: Layout) -> Option<(*mut u8, Arc<TlabBlock>)> {
+    pub(crate) fn alloc_or_grow(&mut self, layout: Layout) -> Option<(*mut u8, *mut TlabBlock)> {
         self.alloc(layout).or_else(|| self.alloc_slow(layout))
     }
 
@@ -161,6 +187,14 @@ impl Tlab {
     #[allow(dead_code)]
     pub(crate) fn remaining(&self) -> usize {
         self.capacity.saturating_sub(self.cursor)
+    }
+}
+
+impl Drop for Tlab {
+    fn drop(&mut self) {
+        // Release Tlab's reference on the current block.
+        // SAFETY: current_block is valid; Tlab holds one ref.
+        unsafe { TlabBlock::release(self.current_block) };
     }
 }
 
@@ -181,10 +215,11 @@ mod tests {
         let layout = Layout::new::<u64>();
         let result = tlab.alloc(layout);
         assert!(result.is_some());
-        let (ptr, _block) = result.unwrap();
+        let (ptr, block) = result.unwrap();
         assert!(!ptr.is_null());
-        // Pointer should be aligned for u64
         assert_eq!(ptr as usize % std::mem::align_of::<u64>(), 0);
+        // Release the sub-allocation ref
+        unsafe { TlabBlock::release(block) };
     }
 
     #[test]
@@ -192,12 +227,12 @@ mod tests {
         let mut tlab = Tlab::new().expect("failed to create TLAB");
         let layout = Layout::new::<u64>();
         let mut ptrs = Vec::new();
-        // Allocate many objects
+        let mut blocks = Vec::new();
         for _ in 0..100 {
-            let (ptr, _block) = tlab.alloc(layout).expect("alloc failed");
+            let (ptr, block) = tlab.alloc(layout).expect("alloc failed");
             ptrs.push(ptr);
+            blocks.push(block);
         }
-        // All pointers should be unique and aligned
         for (i, &p) in ptrs.iter().enumerate() {
             assert_eq!(p as usize % std::mem::align_of::<u64>(), 0);
             for (j, &q) in ptrs.iter().enumerate() {
@@ -206,14 +241,16 @@ mod tests {
                 }
             }
         }
+        // Release all refs
+        for block in blocks {
+            unsafe { TlabBlock::release(block) };
+        }
     }
 
     #[test]
     fn tlab_exhaustion_returns_none() {
-        // Create a tiny TLAB
         let mut tlab = Tlab::with_capacity(32).expect("failed to create TLAB");
         let layout = Layout::from_size_align(64, 8).unwrap();
-        // Should fail — 64 bytes doesn't fit in 32 byte block
         let result = tlab.alloc(layout);
         assert!(result.is_none());
     }
@@ -222,56 +259,64 @@ mod tests {
     fn tlab_alloc_slow_grows() {
         let mut tlab = Tlab::with_capacity(32).expect("failed to create TLAB");
         let layout = Layout::from_size_align(64, 8).unwrap();
-        // Fast path fails
         assert!(tlab.alloc(layout).is_none());
-        // Slow path allocates a new block
         let result = tlab.alloc_slow(layout);
         assert!(result.is_some());
+        let (_, block) = result.unwrap();
+        unsafe { TlabBlock::release(block) };
     }
 
     #[test]
     fn tlab_alloc_or_grow() {
         let mut tlab = Tlab::with_capacity(32).expect("failed to create TLAB");
         let layout = Layout::from_size_align(64, 8).unwrap();
-        // alloc_or_grow should succeed even though fast path fails
         let result = tlab.alloc_or_grow(layout);
         assert!(result.is_some());
+        let (_, block) = result.unwrap();
+        unsafe { TlabBlock::release(block) };
     }
 
     #[test]
-    fn tlab_block_freed_when_all_arcs_dropped() {
+    fn tlab_block_freed_when_all_refs_dropped() {
         let mut tlab = Tlab::with_capacity(256).expect("failed to create TLAB");
         let layout = Layout::new::<u64>();
 
         let (_ptr1, block1) = tlab.alloc(layout).unwrap();
         let (_ptr2, block2) = tlab.alloc(layout).unwrap();
 
-        // Both Arcs point to the same block
-        assert!(Arc::ptr_eq(&block1, &block2));
-        // 1 (tlab.current_block) + 2 (block1, block2) = 3
-        assert_eq!(Arc::strong_count(&block1), 3);
+        // Both point to the same block
+        assert_eq!(block1, block2);
+        // ref_count: 1 (tlab) + 2 (allocs) = 3
+        assert_eq!(unsafe { (*block1).ref_count }, 3);
 
-        // Force a new block by exhausting or replacing
+        // Force a new block
         tlab.alloc_slow(layout).unwrap();
-        // Now tlab.current_block is a different block, so block1/block2 refcount = 2
-        assert_eq!(Arc::strong_count(&block1), 2);
+        // Old block's tlab ref was released: ref_count = 2
+        assert_eq!(unsafe { (*block1).ref_count }, 2);
 
-        drop(block1);
-        assert_eq!(Arc::strong_count(&block2), 1);
-        // When block2 is dropped, the TlabBlock memory is freed
-        // (no crash = success)
-        drop(block2);
+        // Release the slow-alloc ref
+        let (_, new_block) = tlab.alloc(Layout::new::<u8>()).unwrap();
+        unsafe { TlabBlock::release(new_block) };
+
+        unsafe { TlabBlock::release(block1) };
+        assert_eq!(unsafe { (*block2).ref_count }, 1);
+        // When block2 ref is released, the TlabBlock memory is freed
+        unsafe { TlabBlock::release(block2) };
     }
 
     #[test]
     fn tlab_alignment_varied() {
         let mut tlab = Tlab::new().expect("failed to create TLAB");
+        let mut blocks = Vec::new();
 
-        // Allocate with different alignments
         for &align in &[1, 2, 4, 8, 16] {
             let layout = Layout::from_size_align(align, align).unwrap();
-            let (ptr, _block) = tlab.alloc(layout).expect("alloc failed");
+            let (ptr, block) = tlab.alloc(layout).expect("alloc failed");
             assert_eq!(ptr as usize % align, 0, "ptr not aligned to {}", align);
+            blocks.push(block);
+        }
+        for block in blocks {
+            unsafe { TlabBlock::release(block) };
         }
     }
 
