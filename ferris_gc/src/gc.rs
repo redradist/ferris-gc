@@ -119,6 +119,7 @@ struct GcInfo {
 }
 
 impl GcInfo {
+    #[inline]
     fn new() -> GcInfo {
         GcInfo {
             root_ref_count: AtomicUsize::new(0),
@@ -142,6 +143,7 @@ impl<T> GcPtr<T>
 where
     T: 'static + Sized + Trace,
 {
+    #[inline]
     fn new(t: T) -> GcPtr<T> {
         GcPtr {
             info: GcInfo::new(),
@@ -289,6 +291,7 @@ impl<T> GcInternal<T>
 where
     T: 'static + Sized + Trace,
 {
+    #[inline]
     fn new(ptr: *const GcPtr<T>, object_id: ObjectId) -> GcInternal<T> {
         GcInternal {
             is_root: AtomicBool::new(true),
@@ -302,13 +305,15 @@ impl<T> Trace for GcInternal<T>
 where
     T: Sized + Trace,
 {
+    #[inline]
     fn is_root(&self) -> bool {
-        self.is_root.load(Ordering::Acquire)
+        self.is_root.load(Ordering::Relaxed)
     }
 
+    #[inline]
     fn reset_root(&self) {
-        if self.is_root.load(Ordering::Acquire) {
-            self.is_root.store(false, Ordering::Release);
+        if self.is_root.load(Ordering::Relaxed) {
+            self.is_root.store(false, Ordering::Relaxed);
             unsafe {
                 // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
                 (*self.ptr.get()).reset_root();
@@ -1340,6 +1345,7 @@ impl GarbageCollector {
     /// # Safety
     /// Caller must guarantee no concurrent access (e.g., from a thread_local!
     /// context with no background collection thread accessing gc_maps).
+    #[inline]
     pub(crate) unsafe fn gc_maps_unsync(&self) -> &mut GcMaps {
         unsafe { &mut *self.gc_maps.get() }
     }
@@ -3359,6 +3365,7 @@ impl LocalGarbageCollector {
     ///
     /// # Safety
     /// The returned pointer must be initialized before use.
+    #[inline]
     unsafe fn alloc_mem_tlab<T: Sized>(&mut self) -> (*mut T, (GcObjMem, Layout)) {
         let layout = Layout::new::<T>();
 
@@ -3422,6 +3429,7 @@ impl LocalGarbageCollector {
     /// little garbage, the threshold doubles (up to 100K) to avoid wasteful scans
     /// of a mostly-live heap. If a collection frees a lot, the threshold shrinks
     /// (down to 1K) to reclaim memory promptly.
+    #[inline]
     unsafe fn maybe_collect(&self) {
         let count = self.core.allocation_count.get();
         let threshold = self.core.alloc_threshold.get();
@@ -3444,6 +3452,7 @@ impl LocalGarbageCollector {
         }
     }
 
+    #[inline]
     unsafe fn create_gc<T>(&mut self, t: T, region: RegionId) -> Gc<T>
     where
         T: Sized + Trace,
@@ -3499,8 +3508,9 @@ impl LocalGarbageCollector {
                 ptr: gc_ptr,
                 object_id: obj_id,
             };
-            // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
-            (*(*gc.internal_ptr).ptr.get()).reset_root();
+            // SAFETY: gc_ptr was just initialized above; call reset_root directly
+            // instead of going through gc.internal_ptr→ptr.get() (avoids triple dereference).
+            (*gc_ptr).reset_root();
             self.core.allocation_count.set(self.core.allocation_count.get() + 1);
             self.maybe_collect();
             gc
@@ -3534,7 +3544,7 @@ impl LocalGarbageCollector {
                 object_id,
             };
             // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source Gc.
-            (*(*gc.internal_ptr).ptr.get()).reset_root();
+            (*gc.ptr).reset_root();
             gc
         }
     }
@@ -3601,8 +3611,8 @@ impl LocalGarbageCollector {
                 ptr: gc_ptr,
                 object_id: obj_id,
             };
-            // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
-            (*(*gc.internal_ptr).ptr.get()).reset_root();
+            // SAFETY: gc_ptr/gc.ptr was initialized above; call reset_root directly.
+            (*gc.ptr).reset_root();
             self.core.allocation_count.set(self.core.allocation_count.get() + 1);
             self.maybe_collect();
             gc
@@ -3639,7 +3649,7 @@ impl LocalGarbageCollector {
                 object_id,
             };
             // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source GcCell.
-            (*(*gc.internal_ptr).ptr.get()).reset_root();
+            (*gc.ptr).reset_root();
             gc
         }
     }
@@ -3708,8 +3718,8 @@ impl LocalGarbageCollector {
                 ptr: gc_ptr,
                 object_id: obj_id,
             };
-            // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
-            (*(*gc.internal_ptr).ptr.get()).reset_root();
+            // SAFETY: gc_ptr/gc.ptr was initialized above; call reset_root directly.
+            (*gc.ptr).reset_root();
             self.core.allocation_count.set(self.core.allocation_count.get() + 1);
             self.maybe_collect();
             Ok(gc)
@@ -3790,8 +3800,8 @@ impl LocalGarbageCollector {
                 ptr: gc_ptr,
                 object_id: obj_id,
             };
-            // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
-            (*(*gc.internal_ptr).ptr.get()).reset_root();
+            // SAFETY: gc_ptr/gc.ptr was initialized above; call reset_root directly.
+            (*gc.ptr).reset_root();
             self.core.allocation_count.set(self.core.allocation_count.get() + 1);
             self.maybe_collect();
             Ok(gc)
@@ -3828,7 +3838,7 @@ impl LocalGarbageCollector {
                 object_id,
             };
             // SAFETY: Both internal_ptr (just initialized) and ptr (verified alive via STW lock) are valid.
-            (*(*gc.internal_ptr).ptr.get()).reset_root();
+            (*gc.ptr).reset_root();
             gc
         }
     }

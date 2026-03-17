@@ -138,6 +138,7 @@ impl Tlab {
     /// object is collected).
     ///
     /// Returns `None` if the current block doesn't have enough space.
+    #[inline]
     pub(crate) fn alloc(&mut self, layout: Layout) -> Option<(*mut u8, *mut TlabBlock)> {
         let align = layout.align();
         let size = layout.size();
@@ -179,6 +180,7 @@ impl Tlab {
     }
 
     /// Convenience: try the fast path, then the slow path.
+    #[inline]
     pub(crate) fn alloc_or_grow(&mut self, layout: Layout) -> Option<(*mut u8, *mut TlabBlock)> {
         self.alloc(layout).or_else(|| self.alloc_slow(layout))
     }
