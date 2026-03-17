@@ -73,17 +73,19 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Insert a value and return its key.
+    #[inline]
     pub fn insert(&mut self, value: V) -> K {
         self.len += 1;
         if self.free_head != SENTINEL {
             let idx = self.free_head;
-            let slot = &mut self.slots[idx as usize];
-            match slot.value {
-                SlotValue::Vacant { next_free } => {
-                    self.free_head = next_free;
-                }
-                SlotValue::Occupied(_) => unreachable!("free slot is occupied"),
-            }
+            // SAFETY: free_head always points to a valid Vacant slot.
+            let slot = unsafe { self.slots.get_unchecked_mut(idx as usize) };
+            // SAFETY: Slots on the freelist are always Vacant.
+            self.free_head = match slot.value {
+                SlotValue::Vacant { next_free } => next_free,
+                // SAFETY: free_head invariant guarantees this is Vacant.
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            };
             let key = K::from_raw(idx, slot.ver);
             slot.value = SlotValue::Occupied(value);
             key
@@ -128,6 +130,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Remove the value at `key`. Returns `None` if the key is stale or invalid.
+    #[inline]
     pub fn remove(&mut self, key: K) -> Option<V> {
         let idx = key.index() as usize;
         if idx >= self.slots.len() {
@@ -159,6 +162,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Look up a value by key. Returns `None` if the key is stale or invalid.
+    #[inline]
     pub fn get(&self, key: K) -> Option<&V> {
         let idx = key.index() as usize;
         if idx >= self.slots.len() {
@@ -175,6 +179,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Mutable look up by key. Returns `None` if the key is stale or invalid.
+    #[inline]
     pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
         let idx = key.index() as usize;
         if idx >= self.slots.len() {
