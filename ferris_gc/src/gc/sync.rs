@@ -6,9 +6,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::basic_gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
-use crate::gc::{Finalize, GarbageCollector, ObjectEntry, Trace, TracerEntry};
+use crate::gc::{Finalize, GarbageCollector, ObjectEntry, Trace, TracerInfo, TracerList};
 use crate::generation::Generation;
-use crate::slot_map::{ObjectId, TracerId};
+use crate::slot_map::ObjectId;
 
 /// Convenience alias for an optional thread-safe GC pointer.
 pub type OptGc<T> = Option<Gc<T>>;
@@ -196,7 +196,6 @@ where
 {
     is_root: AtomicBool,
     ptr: *const GcPtr<T>,
-    pub(crate) tracer_id: TracerId,
     pub(crate) object_id: ObjectId,
 }
 
@@ -204,11 +203,10 @@ impl<T> GcInternal<T>
 where
     T: 'static + Sized + Trace,
 {
-    fn new(ptr: *const GcPtr<T>, tracer_id: TracerId, object_id: ObjectId) -> GcInternal<T> {
+    fn new(ptr: *const GcPtr<T>, object_id: ObjectId) -> GcInternal<T> {
         GcInternal {
             is_root: AtomicBool::new(true),
             ptr,
-            tracer_id,
             object_id,
         }
     }
@@ -286,7 +284,6 @@ where
 {
     internal_ptr: *mut GcInternal<T>,
     ptr: *const GcPtr<T>,
-    tracer_id: TracerId,
     object_id: ObjectId,
 }
 
@@ -378,11 +375,11 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
-        let tracer_id = self.tracer_id;
+        let tracer_ptr = self.internal_ptr as *const u8;
         let object_id = self.object_id;
         unsafe {
             // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-            (*GLOBAL_GC).remove_tracer(tracer_id, object_id);
+            (*GLOBAL_GC).remove_tracer(object_id, tracer_ptr);
         }
     }
 }
@@ -450,7 +447,6 @@ where
 {
     is_root: AtomicBool,
     ptr: *const RefCell<GcPtr<T>>,
-    pub(crate) tracer_id: TracerId,
     pub(crate) object_id: ObjectId,
 }
 
@@ -460,13 +456,11 @@ where
 {
     fn new(
         ptr: *const RefCell<GcPtr<T>>,
-        tracer_id: TracerId,
         object_id: ObjectId,
     ) -> GcCellInternal<T> {
         GcCellInternal {
             is_root: AtomicBool::new(true),
             ptr,
-            tracer_id,
             object_id,
         }
     }
@@ -531,7 +525,6 @@ where
 {
     internal_ptr: *mut GcCellInternal<T>,
     ptr: *const RefCell<GcPtr<T>>,
-    tracer_id: TracerId,
     object_id: ObjectId,
 }
 
@@ -546,11 +539,11 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
-        let tracer_id = self.tracer_id;
+        let tracer_ptr = self.internal_ptr as *const u8;
         let object_id = self.object_id;
         unsafe {
             // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-            (*GLOBAL_GC).remove_tracer(tracer_id, object_id);
+            (*GLOBAL_GC).remove_tracer(object_id, tracer_ptr);
         }
     }
 }
@@ -862,29 +855,25 @@ impl GlobalGarbageCollector {
                 finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
-                ref_count: 1,
+                tracers: TracerList::new(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                }),
                 region,
                 root_ref_count_ptr,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id: obj_id,
-            });
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
             drop(gc_maps);
 
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
-                tracer_id,
                 object_id: obj_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
@@ -905,25 +894,22 @@ impl GlobalGarbageCollector {
             let object_id = (*gc.internal_ptr).object_id;
 
             let mut gc_maps = self.core.lock_gc_maps();
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id,
-            });
-            // RC hybrid: increment ref count for the cloned object
+            // RC hybrid: push tracer for the cloned object
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.ref_count += 1;
+                entry.tracers.push(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                });
             }
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, tracer_id, object_id));
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, object_id));
             drop(gc_maps);
 
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
-                tracer_id,
                 object_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
@@ -971,32 +957,28 @@ impl GlobalGarbageCollector {
                 finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
-                ref_count: 1,
+                tracers: TracerList::new(TracerInfo {
+                    tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                }),
                 region,
                 root_ref_count_ptr,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id: obj_id,
-            });
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
-                GcCellInternal::new(gc_ptr, tracer_id, obj_id),
+                GcCellInternal::new(gc_ptr, obj_id),
             );
             drop(gc_maps);
 
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
-                tracer_id,
                 object_id: obj_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
@@ -1017,27 +999,24 @@ impl GlobalGarbageCollector {
             let object_id = (*gc.internal_ptr).object_id;
 
             let mut gc_maps = self.core.lock_gc_maps();
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info.0,
-                layout: mem_info.1,
-                object_id,
-            });
-            // RC hybrid: increment ref count for the cloned object
+            // RC hybrid: push tracer for the cloned object
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.ref_count += 1;
+                entry.tracers.push(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info.0,
+                    layout: mem_info.1,
+                });
             }
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_inter_ptr,
-                GcCellInternal::new(gc.ptr, tracer_id, object_id),
+                GcCellInternal::new(gc.ptr, object_id),
             );
             drop(gc_maps);
             let gc = GcCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
-                tracer_id,
                 object_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
@@ -1093,28 +1072,24 @@ impl GlobalGarbageCollector {
                 finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
-                ref_count: 1,
+                tracers: TracerList::new(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                }),
                 region,
                 root_ref_count_ptr,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id: obj_id,
-            });
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
             drop(gc_maps);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
-                tracer_id,
                 object_id: obj_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
@@ -1175,31 +1150,27 @@ impl GlobalGarbageCollector {
                 finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
-                ref_count: 1,
+                tracers: TracerList::new(TracerInfo {
+                    tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                }),
                 region,
                 root_ref_count_ptr,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id: obj_id,
-            });
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
-                GcCellInternal::new(gc_ptr, tracer_id, obj_id),
+                GcCellInternal::new(gc_ptr, obj_id),
             );
             drop(gc_maps);
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
-                tracer_id,
                 object_id: obj_id,
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
@@ -1226,27 +1197,24 @@ impl GlobalGarbageCollector {
                 return None;
             }
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id,
-            });
-            // RC hybrid: increment ref count for upgraded object
+            // RC hybrid: push tracer for upgraded object
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.ref_count += 1;
+                entry.tracers.push(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                });
             }
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_inter_ptr,
-                GcInternal::new(weak.ptr, tracer_id, object_id),
+                GcInternal::new(weak.ptr, object_id),
             );
             drop(gc_maps);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: weak.ptr,
-                tracer_id,
                 object_id,
             };
             // SAFETY: internal_ptr was just written above; weak.ptr is valid because
@@ -1299,10 +1267,10 @@ impl GlobalGarbageCollector {
         unsafe { self.core.collect_parallel_mark(max_gen) }
     }
 
-    pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
+    pub(crate) unsafe fn remove_tracer(&self, object_id: ObjectId, tracer_ptr: *const u8) {
         unsafe {
-            // SAFETY: Caller provides valid tracer_id and object_id from a live Gc/GcCell handle.
-            self.core.remove_tracer(tracer_id, object_id);
+            // SAFETY: Caller provides valid object_id and tracer_ptr from a live Gc/GcCell handle.
+            self.core.remove_tracer(object_id, tracer_ptr);
         }
     }
 
@@ -1693,8 +1661,10 @@ mod tests {
         let baseline = (*GLOBAL_GC)
             .core
             .lock_gc_maps()
-            .tracers
-            .len();
+            .objects
+            .values()
+            .map(|e| e.tracers.len())
+            .sum::<usize>();
         (guard, baseline)
     }
 
@@ -1708,8 +1678,10 @@ mod tests {
             (*GLOBAL_GC)
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>()
                 - baseline,
             1
         );
@@ -1727,8 +1699,10 @@ mod tests {
             (*GLOBAL_GC)
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>()
                 - baseline,
             0
         );
@@ -1747,8 +1721,10 @@ mod tests {
             (*GLOBAL_GC)
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>()
                 - baseline,
             1
         );
@@ -1768,8 +1744,10 @@ mod tests {
             (*GLOBAL_GC)
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>()
                 - baseline,
             1
         );
@@ -1791,8 +1769,10 @@ mod tests {
             (*GLOBAL_GC)
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>()
                 - baseline,
             0
         );
@@ -1891,8 +1871,10 @@ mod tests {
             (*GLOBAL_GC)
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>()
                 - baseline,
             0
         );
@@ -1917,8 +1899,10 @@ mod tests {
             (*GLOBAL_GC)
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>()
                 - baseline,
             1
         );
@@ -1964,8 +1948,10 @@ mod tests {
             (*GLOBAL_GC)
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>()
                 - baseline,
             0
         );
@@ -2030,11 +2016,13 @@ mod tests {
         let stats = (*GLOBAL_GC).stats();
         // allocation_count can be reset by background strategy calling collect(),
         // so check live_objects instead — we hold both Gc references alive.
-        let live = (*GLOBAL_GC)
+        let live: usize = (*GLOBAL_GC)
             .core
             .lock_gc_maps()
-            .tracers
-            .len();
+            .objects
+            .values()
+            .map(|e| e.tracers.len())
+            .sum();
         assert!(
             live - baseline >= 2,
             "expected at least 2 new tracers, got {}",
@@ -2161,8 +2149,10 @@ mod tests {
             (*GLOBAL_GC)
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>()
                 - baseline,
             1
         );
@@ -2236,7 +2226,7 @@ mod tests {
             .core
             .lock_gc_maps();
         assert_eq!(
-            gc_maps.tracers.len(),
+            gc_maps.objects.values().map(|e| e.tracers.len()).sum::<usize>(),
             baseline,
             "RC should free object immediately"
         );

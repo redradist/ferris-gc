@@ -29,21 +29,6 @@ impl SlotKey for ObjectId {
     }
 }
 
-/// Identifies a tracer slot in the GC's tracer arena.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct TracerId(u64);
-
-impl SlotKey for TracerId {
-    fn from_raw(index: u32, slot_gen: u32) -> Self {
-        TracerId(((slot_gen as u64) << 32) | (index as u64))
-    }
-    fn index(self) -> u32 {
-        self.0 as u32
-    }
-    fn slot_generation(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-}
 
 const SENTINEL: u32 = u32::MAX;
 
@@ -377,7 +362,7 @@ mod tests {
 
     #[test]
     fn insert_with_key_works() {
-        let mut map = SlotMap::<TracerId, String>::new();
+        let mut map = SlotMap::<ObjectId, String>::new();
         let k = map.insert_with_key(|key| format!("id={}", key.index()));
         assert_eq!(map.get(k), Some(&"id=0".to_string()));
     }

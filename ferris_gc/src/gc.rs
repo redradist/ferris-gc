@@ -2,7 +2,7 @@ use crate::card_table::CardTable;
 use crate::generation::{
     CollectionPhase, CollectionStats, GcStats, Generation, MarkColor, PromotionConfig, RegionId,
 };
-use crate::slot_map::{ObjectId, SlotMap, TracerId};
+use crate::slot_map::{ObjectId, SlotMap};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
@@ -282,7 +282,6 @@ where
 {
     is_root: AtomicBool,
     ptr: Cell<*const GcPtr<T>>,
-    pub(crate) tracer_id: TracerId,
     pub(crate) object_id: ObjectId,
 }
 
@@ -290,11 +289,10 @@ impl<T> GcInternal<T>
 where
     T: 'static + Sized + Trace,
 {
-    fn new(ptr: *const GcPtr<T>, tracer_id: TracerId, object_id: ObjectId) -> GcInternal<T> {
+    fn new(ptr: *const GcPtr<T>, object_id: ObjectId) -> GcInternal<T> {
         GcInternal {
             is_root: AtomicBool::new(true),
             ptr: Cell::new(ptr),
-            tracer_id,
             object_id,
         }
     }
@@ -381,7 +379,6 @@ where
 {
     internal_ptr: *mut GcInternal<T>,
     ptr: *const GcPtr<T>,
-    tracer_id: TracerId,
     object_id: ObjectId,
 }
 
@@ -492,14 +489,14 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
-        let tracer_id = self.tracer_id;
+        let tracer_ptr = self.internal_ptr as *const u8;
         let object_id = self.object_id;
         // SAFETY: Thread-local access ensures single-threaded borrow; try_borrow_mut avoids re-entrant panic.
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
             // Use try_borrow_mut to avoid panic from re-entrant drops:
             // RC hybrid dealloc may drop inner Gc fields whose drop also calls remove_tracer.
             if let Ok(gc) = gc.try_borrow_mut() {
-                gc.remove_tracer(tracer_id, object_id);
+                gc.remove_tracer(object_id, tracer_ptr);
             }
         });
     }
@@ -573,7 +570,6 @@ where
 {
     is_root: AtomicBool,
     ptr: Cell<*const RefCell<GcPtr<T>>>,
-    pub(crate) tracer_id: TracerId,
     pub(crate) object_id: ObjectId,
 }
 
@@ -583,13 +579,11 @@ where
 {
     fn new(
         ptr: *const RefCell<GcPtr<T>>,
-        tracer_id: TracerId,
         object_id: ObjectId,
     ) -> GcCellInternal<T> {
         GcCellInternal {
             is_root: AtomicBool::new(true),
             ptr: Cell::new(ptr),
-            tracer_id,
             object_id,
         }
     }
@@ -667,7 +661,6 @@ where
 {
     internal_ptr: *mut GcCellInternal<T>,
     ptr: *const RefCell<GcPtr<T>>,
-    tracer_id: TracerId,
     object_id: ObjectId,
 }
 
@@ -676,14 +669,14 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
-        let tracer_id = self.tracer_id;
+        let tracer_ptr = self.internal_ptr as *const u8;
         let object_id = self.object_id;
         // SAFETY: Thread-local access ensures single-threaded borrow; try_borrow_mut avoids re-entrant panic.
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
             // Use try_borrow_mut to avoid panic from re-entrant drops:
             // RC hybrid dealloc may drop inner Gc fields whose drop also calls remove_tracer.
             if let Ok(gc) = gc.try_borrow_mut() {
-                gc.remove_tracer(tracer_id, object_id);
+                gc.remove_tracer(object_id, tracer_ptr);
             }
         });
     }
@@ -1047,6 +1040,118 @@ pub(crate) type DropFn = unsafe fn(*mut u8);
 /// provenance issues from storing a pre-computed `*const dyn Finalize`.
 pub(crate) type FinalizeFn = unsafe fn(*mut u8);
 
+/// Per-tracer metadata stored inline in ObjectEntry's tracers Vec.
+pub(crate) struct TracerInfo {
+    pub(crate) tracer_ptr: *const dyn Trace,
+    pub(crate) mem: GcObjMem,
+    pub(crate) layout: Layout,
+}
+
+/// Inline-optimized tracer list: stores the first tracer inline (no heap alloc),
+/// spills to a Vec only when clones add additional tracers.
+pub(crate) enum TracerList {
+    /// Common case: exactly one tracer (no heap allocation).
+    One(TracerInfo),
+    /// Overflow: multiple tracers (e.g. after Gc::clone).
+    Many(Vec<TracerInfo>),
+    /// Sentinel for drain operations.
+    Empty,
+}
+
+impl TracerList {
+    #[inline]
+    fn new(t: TracerInfo) -> Self {
+        TracerList::One(t)
+    }
+
+    #[inline]
+    fn push(&mut self, t: TracerInfo) {
+        *self = match std::mem::replace(self, TracerList::Empty) {
+            TracerList::One(first) => TracerList::Many(vec![first, t]),
+            TracerList::Many(mut v) => { v.push(t); TracerList::Many(v) }
+            TracerList::Empty => TracerList::One(t),
+        };
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            TracerList::One(_) => 1,
+            TracerList::Many(v) => v.len(),
+            TracerList::Empty => 0,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        matches!(self, TracerList::Empty)
+    }
+
+    fn iter(&self) -> TracerListIter<'_> {
+        match self {
+            TracerList::One(t) => TracerListIter::One(std::iter::once(t)),
+            TracerList::Many(v) => TracerListIter::Many(v.iter()),
+            TracerList::Empty => TracerListIter::Many([].iter()),
+        }
+    }
+
+    /// Remove the tracer whose pointer matches `ptr` (as *const u8).
+    /// Returns the removed TracerInfo, or None if not found.
+    fn remove_by_ptr(&mut self, ptr: *const u8) -> Option<TracerInfo> {
+        match self {
+            TracerList::One(t) => {
+                if (t.tracer_ptr as *const u8) == ptr {
+                    if let TracerList::One(t) = std::mem::replace(self, TracerList::Empty) {
+                        Some(t)
+                    } else {
+                        unreachable!()
+                    }
+                } else {
+                    None
+                }
+            }
+            TracerList::Many(v) => {
+                if let Some(pos) = v.iter().position(|t| (t.tracer_ptr as *const u8) == ptr) {
+                    let removed = v.swap_remove(pos);
+                    if v.len() == 1 {
+                        if let TracerList::Many(mut v) = std::mem::replace(self, TracerList::Empty) {
+                            *self = TracerList::One(v.pop().unwrap());
+                        }
+                    }
+                    Some(removed)
+                } else {
+                    None
+                }
+            }
+            TracerList::Empty => None,
+        }
+    }
+
+    /// Drain all tracers out, leaving Empty.
+    fn drain(&mut self) -> Vec<TracerInfo> {
+        match std::mem::replace(self, TracerList::Empty) {
+            TracerList::One(t) => vec![t],
+            TracerList::Many(v) => v,
+            TracerList::Empty => Vec::new(),
+        }
+    }
+}
+
+pub(crate) enum TracerListIter<'a> {
+    One(std::iter::Once<&'a TracerInfo>),
+    Many(std::slice::Iter<'a, TracerInfo>),
+}
+
+impl<'a> Iterator for TracerListIter<'a> {
+    type Item = &'a TracerInfo;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            TracerListIter::One(it) => it.next(),
+            TracerListIter::Many(it) => it.next(),
+        }
+    }
+}
+
 /// Per-object metadata stored in a contiguous SlotMap.
 pub(crate) struct ObjectEntry {
     pub(crate) ptr: *const dyn Trace,
@@ -1057,8 +1162,9 @@ pub(crate) struct ObjectEntry {
     pub(crate) finalize_fn: FinalizeFn,
     pub(crate) drop_fn: DropFn,
     pub(crate) weak_alive: Option<Arc<AtomicBool>>,
-    /// Number of tracers pointing to this object (RC hybrid).
-    pub(crate) ref_count: usize,
+    /// All Gc<T>/GcCell<T> handles pointing to this object.
+    /// RC hybrid: when tracers is empty, the object is eagerly deallocated.
+    pub(crate) tracers: TracerList,
     /// Region assignment for region-based collection.
     pub(crate) region: RegionId,
     /// Raw pointer to the object's `root_ref_count` atomic inside GcInfo.
@@ -1067,24 +1173,20 @@ pub(crate) struct ObjectEntry {
     pub(crate) root_ref_count_ptr: *const AtomicUsize,
 }
 
-/// Per-tracer metadata stored in a contiguous SlotMap.
-pub(crate) struct TracerEntry {
-    pub(crate) tracer_ptr: *const dyn Trace,
-    pub(crate) mem: GcObjMem,
-    pub(crate) layout: Layout,
-    pub(crate) object_id: ObjectId,
-}
-
-/// Unified GC maps replacing separate TracerMaps + ObjectMaps.
-/// Single Mutex protects all state to simplify locking.
+/// Unified GC maps. Single Mutex protects all state to simplify locking.
 pub(crate) struct GcMaps {
     pub(crate) objects: SlotMap<ObjectId, ObjectEntry>,
-    pub(crate) tracers: SlotMap<TracerId, TracerEntry>,
     /// Maps thin object pointer → ObjectId for trace_children resolution.
     pub(crate) ptr_to_object: HashMap<usize, ObjectId>,
 }
 
 impl GcMaps {
+    /// Total number of tracers across all objects.
+    #[cfg(test)]
+    fn total_tracers(&self) -> usize {
+        self.objects.values().map(|e| e.tracers.len()).sum()
+    }
+
     /// Compute per-region total bytes and object counts on demand from the objects SlotMap.
     pub(crate) fn compute_region_stats(
         &self,
@@ -1198,7 +1300,6 @@ impl GarbageCollector {
         GarbageCollector {
             gc_maps: UnsafeCell::new(GcMaps {
                 objects: SlotMap::new(),
-                tracers: SlotMap::new(),
                 ptr_to_object: HashMap::new(),
             }),
             gc_maps_lock: Mutex::new(()),
@@ -1273,7 +1374,7 @@ impl GarbageCollector {
         GcStats {
             heap_size,
             live_objects: gc_maps.objects.len(),
-            live_tracers: gc_maps.tracers.len(),
+            live_tracers: gc_maps.objects.values().map(|e| e.tracers.len()).sum::<usize>(),
             gen0_objects: gen0,
             gen1_objects: gen1,
             gen2_objects: gen2,
@@ -1438,37 +1539,66 @@ impl GarbageCollector {
         }
     }
 
-    pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
+    pub(crate) unsafe fn remove_tracer(&self, object_id: ObjectId, tracer_ptr: *const u8) {
         let (tracer_dealloc, object_dealloc) = {
             let mut gc_maps = self.lock_gc_maps();
-            let mut tracer_dealloc = None;
-            let mut object_dealloc = None;
-
-            if let Some(tracer_entry) = gc_maps.tracers.remove(tracer_id) {
-                tracer_dealloc = Some((tracer_entry.mem, tracer_entry.layout));
-
-                // RC hybrid: decrement ref count and eagerly dealloc if zero
-                if let Some(obj_entry) = gc_maps.objects.get_mut(object_id) {
-                    obj_entry.ref_count -= 1;
-                    if obj_entry.ref_count == 0 {
-                        let obj_entry = gc_maps.objects.remove(object_id).expect(
-                            "remove_tracer: object entry not found after ref_count reached zero",
-                        );
-                        let thin = obj_entry.ptr.get_thin_ptr();
-                        gc_maps.ptr_to_object.remove(&thin);
-                        self.card_table.remove_object(thin, object_id);
-                        // Region stats are computed on-demand; no counters to decrement.
-                        if let Some(alive) = &obj_entry.weak_alive {
-                            alive.store(false, Ordering::Release);
-                        }
-                        object_dealloc = Some(obj_entry);
-                    }
-                }
-            }
-
-            (tracer_dealloc, object_dealloc)
+            Self::remove_tracer_inner(&mut gc_maps, &self.card_table, object_id, tracer_ptr)
         };
 
+        Self::finalize_remove_tracer(self, tracer_dealloc, object_dealloc);
+    }
+
+    /// Thread-local fast path: no mutex, uses UnsafeCell directly.
+    ///
+    /// # Safety
+    /// Must only be called from the owning thread (thread-local GC).
+    pub(crate) unsafe fn remove_tracer_unsync(&self, object_id: ObjectId, tracer_ptr: *const u8) {
+        let gc_maps = unsafe { self.gc_maps_unsync() };
+        let (tracer_dealloc, object_dealloc) =
+            Self::remove_tracer_inner(gc_maps, &self.card_table, object_id, tracer_ptr);
+
+        Self::finalize_remove_tracer(self, tracer_dealloc, object_dealloc);
+    }
+
+    fn remove_tracer_inner(
+        gc_maps: &mut GcMaps,
+        card_table: &CardTable,
+        object_id: ObjectId,
+        tracer_ptr: *const u8,
+    ) -> (Option<(GcObjMem, Layout)>, Option<ObjectEntry>) {
+        let mut tracer_dealloc = None;
+        let mut object_dealloc = None;
+
+        if let Some(obj_entry) = gc_maps.objects.get_mut(object_id) {
+            // Find and remove the tracer matching tracer_ptr
+            if let Some(removed) = obj_entry.tracers.remove_by_ptr(tracer_ptr) {
+                tracer_dealloc = Some((removed.mem, removed.layout));
+
+                // RC hybrid: eagerly dealloc object if no tracers remain
+                if obj_entry.tracers.is_empty() {
+                    let obj_gen = obj_entry.generation;
+                    let obj_entry = gc_maps.objects.remove(object_id).expect(
+                        "remove_tracer: object entry not found after tracers became empty",
+                    );
+                    let thin = obj_entry.ptr.get_thin_ptr();
+                    gc_maps.ptr_to_object.remove(&thin);
+                    // Only clean card table for promoted objects (Gen0 objects are never registered).
+                    if obj_gen != Generation::Gen0 {
+                        card_table.remove_object(thin, object_id);
+                    }
+                    // Region stats are computed on-demand; no counters to decrement.
+                    if let Some(alive) = &obj_entry.weak_alive {
+                        alive.store(false, Ordering::Release);
+                    }
+                    object_dealloc = Some(obj_entry);
+                }
+            }
+        }
+
+        (tracer_dealloc, object_dealloc)
+    }
+
+    fn finalize_remove_tracer(&self, tracer_dealloc: Option<(GcObjMem, Layout)>, object_dealloc: Option<ObjectEntry>) {
         // Dealloc tracer outside lock scope
         if let Some((mem, layout)) = tracer_dealloc {
             // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
@@ -1534,11 +1664,13 @@ impl GarbageCollector {
 
                 // Mark phase: trace from ALL roots (needed for correctness —
                 // Gen1+ roots may reference Gen0 objects through pre-promotion edges).
-                for entry in gc_maps.tracers.values() {
-                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    let tracer = &(*entry.tracer_ptr);
-                    if tracer.is_root() {
-                        tracer.trace();
+                for obj_entry in gc_maps.objects.values() {
+                    for tracer in obj_entry.tracers.iter() {
+                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
+                        let t = &(*tracer.tracer_ptr);
+                        if t.is_root() {
+                            t.trace();
+                        }
                     }
                 }
 
@@ -1553,30 +1685,9 @@ impl GarbageCollector {
                     }
                 }
 
-                // Sweep tracers: collect unreachable tracers whose object is in scope.
-                // Uses inline root_ref_count check instead of vtable dispatch.
-                let collected_tracers: Vec<TracerId> = gc_maps
-                    .tracers
-                    .iter()
-                    .filter(|(_, e)| {
-                        gc_maps
-                            .objects
-                            .get(e.object_id)
-                            .is_some_and(|obj| {
-                                obj.generation <= max_gen
-                                    && (*obj.root_ref_count_ptr).load(Ordering::Acquire) == 0
-                            })
-                    })
-                    .map(|(id, _)| id)
-                    .collect();
-
+                // No separate tracer sweep needed — dead tracers are collected
+                // with their dead objects below.
                 let mut tracer_deallocs = Vec::new();
-                for tracer_id in &collected_tracers {
-                    if let Some(entry) = gc_maps.tracers.remove(*tracer_id) {
-                        tracer_deallocs.push((entry.mem, entry.layout));
-                    }
-                }
-                stats.tracers_collected = collected_tracers.len();
 
                 // Combined pass: sweep + count + clear_trace + promotion in a single
                 // iteration over objects. Avoids 3 extra full iterations and uses
@@ -1618,10 +1729,10 @@ impl GarbageCollector {
                 }
                 stats.objects_collected = collected_objects.len();
 
-                // Remove collected objects
+                // Remove collected objects and extract tracer deallocs
                 let mut object_deallocs = Vec::new();
                 for &obj_id in &collected_objects {
-                    if let Some(entry) = gc_maps.objects.remove(obj_id) {
+                    if let Some(mut entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
@@ -1629,6 +1740,11 @@ impl GarbageCollector {
                         // Region stats are computed on-demand; no counters to decrement.
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
+                        }
+                        // Drain tracers before consuming the object entry
+                        stats.tracers_collected += entry.tracers.len();
+                        for tracer in entry.tracers.drain() {
+                            tracer_deallocs.push((tracer.mem, tracer.layout));
                         }
                         object_deallocs.push(entry);
                     }
@@ -1647,10 +1763,11 @@ impl GarbageCollector {
                 self.allocation_count.store(0, Ordering::Relaxed);
             }
 
-            // Dealloc phase: all locks released
-            // IMPORTANT: Object drops must happen BEFORE tracer deallocs, because
-            // dropping an object may drop inner Gc<T> handles whose Drop impl
-            // dereferences tracer memory to read tracer_id/object_id.
+            // Dealloc phase: all locks released.
+            // Object drops must happen BEFORE tracer deallocs, because dropping
+            // an object may drop inner Gc<T> handles whose Drop impl calls
+            // remove_tracer (which looks up object_id in gc_maps — the object
+            // has been removed so the lookup is a no-op, which is correct).
             for entry in object_deallocs {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
@@ -1685,19 +1802,17 @@ impl GarbageCollector {
                 let mut gc_maps = self.lock_gc_maps();
                 self.card_table.clear_all();
 
-                let tracer_entries = gc_maps.tracers.drain();
-                let tracer_deallocs: Vec<_> = tracer_entries
-                    .into_iter()
-                    .map(|(_, e)| (e.mem, e.layout))
-                    .collect();
-
+                let mut tracer_deallocs = Vec::new();
                 let obj_entries = gc_maps.objects.drain();
                 gc_maps.ptr_to_object.clear();
                 let object_deallocs: Vec<_> = obj_entries
                     .into_iter()
-                    .map(|(_, entry)| {
+                    .map(|(_, mut entry)| {
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
+                        }
+                        for tracer in entry.tracers.drain() {
+                            tracer_deallocs.push((tracer.mem, tracer.layout));
                         }
                         entry
                     })
@@ -1705,9 +1820,10 @@ impl GarbageCollector {
                 (tracer_deallocs, object_deallocs)
             };
             self.allocation_count.store(0, Ordering::Relaxed);
-            // IMPORTANT: Object drops must happen BEFORE tracer deallocs, because
-            // dropping an object may drop inner Gc<T> handles whose Drop impl
-            // dereferences tracer memory to read tracer_id/object_id.
+            // Object drops must happen BEFORE tracer deallocs, because dropping
+            // an object may drop inner Gc<T> handles whose Drop impl calls
+            // remove_tracer (which looks up object_id in gc_maps — the object
+            // has been removed so the lookup is a no-op, which is correct).
             for entry in object_deallocs {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
@@ -1761,11 +1877,13 @@ impl GarbageCollector {
                 }
 
                 // Mark phase: trace from ALL roots.
-                for entry in gc_maps.tracers.values() {
-                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    let tracer = &(*entry.tracer_ptr);
-                    if tracer.is_root() {
-                        tracer.trace();
+                for obj_entry in gc_maps.objects.values() {
+                    for tracer in obj_entry.tracers.iter() {
+                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
+                        let t = &(*tracer.tracer_ptr);
+                        if t.is_root() {
+                            t.trace();
+                        }
                     }
                 }
 
@@ -1787,28 +1905,9 @@ impl GarbageCollector {
                     .filter(|(_, e)| e.generation <= max_gen)
                     .count();
 
-                // Sweep tracers: collect unreachable tracers whose object is in scope
-                let collected_tracers: Vec<TracerId> = gc_maps
-                    .tracers
-                    .iter()
-                    .filter(|(_, e)| {
-                        let in_scope = gc_maps
-                            .objects
-                            .get(e.object_id)
-                            .is_some_and(|obj| obj.generation <= max_gen);
-                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        in_scope && !(&*e.tracer_ptr).is_traceable()
-                    })
-                    .map(|(id, _)| id)
-                    .collect();
-
+                // No separate tracer sweep needed — dead tracers are collected
+                // with their dead objects below.
                 let mut tracer_deallocs = Vec::new();
-                for tracer_id in &collected_tracers {
-                    if let Some(entry) = gc_maps.tracers.remove(*tracer_id) {
-                        tracer_deallocs.push((entry.mem, entry.layout));
-                    }
-                }
-                stats.tracers_collected = collected_tracers.len();
 
                 // Sweep objects: collect unreachable in-scope objects (direct generation check)
                 let collected_objects: Vec<ObjectId> = gc_maps
@@ -1826,10 +1925,10 @@ impl GarbageCollector {
                     (&*entry.ptr).clear_trace();
                 }
 
-                // Remove collected objects, collect entries for deferred dealloc
+                // Remove collected objects and extract tracer deallocs
                 let mut object_deallocs = Vec::new();
                 for &obj_id in &collected_objects {
-                    if let Some(entry) = gc_maps.objects.remove(obj_id) {
+                    if let Some(mut entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
@@ -1837,6 +1936,10 @@ impl GarbageCollector {
                         // Region stats are computed on-demand; no counters to decrement.
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
+                        }
+                        stats.tracers_collected += entry.tracers.len();
+                        for tracer in entry.tracers.drain() {
+                            tracer_deallocs.push((tracer.mem, tracer.layout));
                         }
                         object_deallocs.push(entry);
                     }
@@ -1876,10 +1979,11 @@ impl GarbageCollector {
                 self.allocation_count.store(0, Ordering::Relaxed);
             }
 
-            // Parallel dealloc phase: all locks released
-            // IMPORTANT: Object drops must happen BEFORE tracer deallocs, because
-            // dropping an object may drop inner Gc<T> handles whose Drop impl
-            // dereferences tracer memory to read tracer_id/object_id.
+            // Parallel dealloc phase: all locks released.
+            // Object drops must happen BEFORE tracer deallocs, because dropping
+            // an object may drop inner Gc<T> handles whose Drop impl calls
+            // remove_tracer (which looks up object_id in gc_maps — the object
+            // has been removed so the lookup is a no-op, which is correct).
 
             // Wrap dealloc info in Send-safe wrappers.
             // SAFETY: The raw pointers within are only used for deallocation
@@ -2004,10 +2108,11 @@ impl GarbageCollector {
 
                 // SAFETY: Tracer pointers are valid while gc_maps lock is held.
                 let root_tracers: Vec<SendTracePtr> = gc_maps
-                    .tracers
+                    .objects
                     .values()
-                    .filter(|e| (&*e.tracer_ptr).is_root())
-                    .map(|e| SendTracePtr(e.tracer_ptr))
+                    .flat_map(|obj| obj.tracers.iter())
+                    .filter(|t| (&*t.tracer_ptr).is_root())
+                    .map(|t| SendTracePtr(t.tracer_ptr))
                     .collect();
 
                 // SAFETY: Tracer pointers are valid; STW lock prevents concurrent mutation.
@@ -2033,28 +2138,9 @@ impl GarbageCollector {
                     .filter(|(_, e)| e.generation <= max_gen)
                     .count();
 
-                // Sweep tracers: collect unreachable tracers whose object is in scope
-                // SAFETY: Tracer pointers are valid while gc_maps lock is held.
-                let collected_tracers: Vec<TracerId> = gc_maps
-                    .tracers
-                    .iter()
-                    .filter(|(_, e)| {
-                        let in_scope = gc_maps
-                            .objects
-                            .get(e.object_id)
-                            .is_some_and(|obj| obj.generation <= max_gen);
-                        in_scope && !(&*e.tracer_ptr).is_traceable()
-                    })
-                    .map(|(id, _)| id)
-                    .collect();
-
+                // No separate tracer sweep needed — dead tracers are collected
+                // with their dead objects below.
                 let mut tracer_deallocs = Vec::new();
-                for tracer_id in &collected_tracers {
-                    if let Some(entry) = gc_maps.tracers.remove(*tracer_id) {
-                        tracer_deallocs.push((entry.mem, entry.layout));
-                    }
-                }
-                stats.tracers_collected = collected_tracers.len();
 
                 // Sweep objects: collect unreachable in-scope objects (direct generation check)
                 // SAFETY: Object pointers are valid while gc_maps lock is held.
@@ -2072,16 +2158,20 @@ impl GarbageCollector {
                     (&*entry.ptr).clear_trace();
                 }
 
-                // Remove collected objects
+                // Remove collected objects and extract tracer deallocs
                 let mut object_deallocs = Vec::new();
                 for &obj_id in &collected_objects {
-                    if let Some(entry) = gc_maps.objects.remove(obj_id) {
+                    if let Some(mut entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
+                        }
+                        stats.tracers_collected += entry.tracers.len();
+                        for tracer in entry.tracers.drain() {
+                            tracer_deallocs.push((tracer.mem, tracer.layout));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2213,15 +2303,17 @@ impl GarbageCollector {
         }
 
         // Gray objects reachable from root tracers
-        for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
-            unsafe {
-                // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                let tracer = &(*tracer_entry.tracer_ptr);
-                if tracer.is_root() {
-                    if let Some(color) = incr.colors.get_mut(&tracer_entry.object_id) {
-                        if *color == MarkColor::White {
-                            *color = MarkColor::Gray;
-                            incr.gray_stack.push(tracer_entry.object_id);
+        for (obj_id, obj_entry) in gc_maps.objects.iter() {
+            for tracer in obj_entry.tracers.iter() {
+                unsafe {
+                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
+                    let t = &(*tracer.tracer_ptr);
+                    if t.is_root() {
+                        if let Some(color) = incr.colors.get_mut(&obj_id) {
+                            if *color == MarkColor::White {
+                                *color = MarkColor::Gray;
+                                incr.gray_stack.push(obj_id);
+                            }
                         }
                     }
                 }
@@ -2307,11 +2399,13 @@ impl GarbageCollector {
                 }
 
                 // Mark from all root tracers using trace() (same as collect_generation).
-                for entry in gc_maps.tracers.values() {
-                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    let tracer = &(*entry.tracer_ptr);
-                    if tracer.is_root() {
-                        tracer.trace();
+                for obj_entry in gc_maps.objects.values() {
+                    for tracer in obj_entry.tracers.iter() {
+                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
+                        let t = &(*tracer.tracer_ptr);
+                        if t.is_root() {
+                            t.trace();
+                        }
                     }
                 }
 
@@ -2336,30 +2430,9 @@ impl GarbageCollector {
                     duration: std::time::Duration::ZERO,
                 };
 
-                // Sweep tracers: collect unreachable tracers whose object is in scope.
-                // Uses inline root_ref_count check instead of vtable dispatch.
-                let collected_tracers: Vec<TracerId> = gc_maps
-                    .tracers
-                    .iter()
-                    .filter(|(_, e)| {
-                        gc_maps
-                            .objects
-                            .get(e.object_id)
-                            .is_some_and(|obj| {
-                                obj.generation <= max_gen
-                                    && (*obj.root_ref_count_ptr).load(Ordering::Acquire) == 0
-                            })
-                    })
-                    .map(|(id, _)| id)
-                    .collect();
-
+                // No separate tracer sweep needed — dead tracers are collected
+                // with their dead objects below.
                 let mut tracer_deallocs = Vec::new();
-                for tracer_id in &collected_tracers {
-                    if let Some(entry) = gc_maps.tracers.remove(*tracer_id) {
-                        tracer_deallocs.push((entry.mem, entry.layout));
-                    }
-                }
-                stats.tracers_collected = collected_tracers.len();
 
                 // Combined pass: sweep + count + clear_trace + promotion.
                 let promo_cfg = self.promotion_config();
@@ -2392,10 +2465,10 @@ impl GarbageCollector {
                 }
                 stats.objects_collected = collected_objects.len();
 
-                // Remove collected objects
+                // Remove collected objects and extract tracer deallocs
                 let mut object_deallocs = Vec::new();
                 for &obj_id in &collected_objects {
-                    if let Some(entry) = gc_maps.objects.remove(obj_id) {
+                    if let Some(mut entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
@@ -2403,6 +2476,10 @@ impl GarbageCollector {
                         // Region stats are computed on-demand; no counters to decrement.
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
+                        }
+                        stats.tracers_collected += entry.tracers.len();
+                        for tracer in entry.tracers.drain() {
+                            tracer_deallocs.push((tracer.mem, tracer.layout));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2426,10 +2503,11 @@ impl GarbageCollector {
                 self.allocation_count.store(0, Ordering::Relaxed);
             }
 
-            // Dealloc phase: all locks released
-            // IMPORTANT: Object drops must happen BEFORE tracer deallocs, because
-            // dropping an object may drop inner Gc<T> handles whose Drop impl
-            // dereferences tracer memory to read tracer_id/object_id.
+            // Dealloc phase: all locks released.
+            // Object drops must happen BEFORE tracer deallocs, because dropping
+            // an object may drop inner Gc<T> handles whose Drop impl calls
+            // remove_tracer (which looks up object_id in gc_maps — the object
+            // has been removed so the lookup is a no-op, which is correct).
             for entry in object_deallocs {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
@@ -2594,15 +2672,17 @@ impl GarbageCollector {
         }
 
         // Gray objects reachable from root tracers
-        for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
-            unsafe {
-                // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                let tracer = &(*tracer_entry.tracer_ptr);
-                if tracer.is_root() {
-                    if let Some(color) = incr.colors.get_mut(&tracer_entry.object_id) {
-                        if *color == MarkColor::White {
-                            *color = MarkColor::Gray;
-                            incr.gray_stack.push(tracer_entry.object_id);
+        for (obj_id, obj_entry) in gc_maps.objects.iter() {
+            for tracer in obj_entry.tracers.iter() {
+                unsafe {
+                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
+                    let t = &(*tracer.tracer_ptr);
+                    if t.is_root() {
+                        if let Some(color) = incr.colors.get_mut(&obj_id) {
+                            if *color == MarkColor::White {
+                                *color = MarkColor::Gray;
+                                incr.gray_stack.push(obj_id);
+                            }
                         }
                     }
                 }
@@ -2757,11 +2837,13 @@ impl GarbageCollector {
                 }
 
                 // Mark phase: trace from ALL roots
-                for entry in gc_maps.tracers.values() {
-                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    let tracer = &(*entry.tracer_ptr);
-                    if tracer.is_root() {
-                        tracer.trace();
+                for obj_entry in gc_maps.objects.values() {
+                    for tracer in obj_entry.tracers.iter() {
+                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
+                        let t = &(*tracer.tracer_ptr);
+                        if t.is_root() {
+                            t.trace();
+                        }
                     }
                 }
 
@@ -2774,28 +2856,9 @@ impl GarbageCollector {
                     }
                 }
 
-                // Sweep unreachable tracers whose object is in this region.
-                let collected_tracers: Vec<TracerId> = gc_maps
-                    .tracers
-                    .iter()
-                    .filter(|(_, e)| {
-                        gc_maps
-                            .objects
-                            .get(e.object_id)
-                            .is_some_and(|obj| {
-                                obj.region == region
-                                    && (*obj.root_ref_count_ptr).load(Ordering::Acquire) == 0
-                            })
-                    })
-                    .map(|(id, _)| id)
-                    .collect();
+                // No separate tracer sweep needed — dead tracers are collected
+                // with their dead objects below.
                 let mut tracer_deallocs = Vec::new();
-                for tracer_id in &collected_tracers {
-                    if let Some(entry) = gc_maps.tracers.remove(*tracer_id) {
-                        tracer_deallocs.push((entry.mem, entry.layout));
-                    }
-                }
-                stats.tracers_collected = collected_tracers.len();
 
                 // Combined pass: sweep + count + clear_trace in a single iteration.
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
@@ -2814,10 +2877,10 @@ impl GarbageCollector {
                 }
                 stats.objects_collected = collected_objects.len();
 
-                // Remove collected objects
+                // Remove collected objects and extract tracer deallocs
                 let mut object_deallocs = Vec::new();
                 for &obj_id in &collected_objects {
-                    if let Some(entry) = gc_maps.objects.remove(obj_id) {
+                    if let Some(mut entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
@@ -2826,6 +2889,10 @@ impl GarbageCollector {
                         if let Some(alive) = &entry.weak_alive {
                             alive.store(false, Ordering::Release);
                         }
+                        stats.tracers_collected += entry.tracers.len();
+                        for tracer in entry.tracers.drain() {
+                            tracer_deallocs.push((tracer.mem, tracer.layout));
+                        }
                         object_deallocs.push(entry);
                     }
                 }
@@ -2833,10 +2900,11 @@ impl GarbageCollector {
                 (tracer_deallocs, object_deallocs)
             };
 
-            // Dealloc phase: all locks released
-            // IMPORTANT: Object drops must happen BEFORE tracer deallocs, because
-            // dropping an object may drop inner Gc<T> handles whose Drop impl
-            // dereferences tracer memory to read tracer_id/object_id.
+            // Dealloc phase: all locks released.
+            // Object drops must happen BEFORE tracer deallocs, because dropping
+            // an object may drop inner Gc<T> handles whose Drop impl calls
+            // remove_tracer (which looks up object_id in gc_maps — the object
+            // has been removed so the lookup is a no-op, which is correct).
             for entry in object_deallocs {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
@@ -2915,11 +2983,13 @@ impl GarbageCollector {
                 }
 
                 // Mark from all roots
-                for entry in gc_maps.tracers.values() {
-                    // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    let tracer = &(*entry.tracer_ptr);
-                    if tracer.is_root() {
-                        tracer.trace();
+                for obj_entry in gc_maps.objects.values() {
+                    for tracer in obj_entry.tracers.iter() {
+                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
+                        let t = &(*tracer.tracer_ptr);
+                        if t.is_root() {
+                            t.trace();
+                        }
                     }
                 }
 
@@ -2977,29 +3047,19 @@ impl GarbageCollector {
                         continue;
                     }
 
-                    // Sweep tracers pointing to dead objects in this region
-                    let dead_tracers: Vec<TracerId> = gc_maps
-                        .tracers
-                        .iter()
-                        .filter(|(_id, e)| dead_in_region.contains(&e.object_id))
-                        .map(|(id, _)| id)
-                        .collect();
-                    for tracer_id in &dead_tracers {
-                        if let Some(entry) = gc_maps.tracers.remove(*tracer_id) {
-                            tracer_deallocs.push((entry.mem, entry.layout));
-                        }
-                    }
-                    stats.tracers_collected += dead_tracers.len();
-
-                    // Remove dead objects
+                    // Remove dead objects and extract tracer deallocs
                     for obj_id in &dead_in_region {
-                        if let Some(entry) = gc_maps.objects.remove(*obj_id) {
+                        if let Some(mut entry) = gc_maps.objects.remove(*obj_id) {
                             let thin = entry.ptr.get_thin_ptr();
                             gc_maps.ptr_to_object.remove(&thin);
                             self.card_table.remove_object(thin, *obj_id);
                             stats.bytes_freed += entry.layout.size();
                             if let Some(alive) = &entry.weak_alive {
                                 alive.store(false, Ordering::Release);
+                            }
+                            stats.tracers_collected += entry.tracers.len();
+                            for tracer in entry.tracers.drain() {
+                                tracer_deallocs.push((tracer.mem, tracer.layout));
                             }
                             object_deallocs.push(entry);
                         }
@@ -3015,8 +3075,8 @@ impl GarbageCollector {
                 (tracer_deallocs, object_deallocs)
             };
 
-            // Dealloc phase: all locks released
-            // IMPORTANT: Object drops must happen BEFORE tracer deallocs.
+            // Dealloc phase: all locks released.
+            // Object drops must happen BEFORE tracer deallocs.
             for entry in object_deallocs {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
@@ -3203,10 +3263,12 @@ impl GarbageCollector {
             }
 
             // Relocate tracer pointers: tell each GcInternal to update its gc_ptr field
-            for (_tracer_id, tracer_entry) in gc_maps.tracers.iter() {
-                for (_, old_raw, new_raw, _) in &relocations {
-                    // SAFETY: tracer_ptr is valid while gc_maps lock is held; relocate is called during STW with exclusive access.
-                    (&*tracer_entry.tracer_ptr).relocate(*old_raw, *new_raw);
+            for (_obj_id, obj_entry) in gc_maps.objects.iter() {
+                for tracer in obj_entry.tracers.iter() {
+                    for (_, old_raw, new_raw, _) in &relocations {
+                        // SAFETY: tracer_ptr is valid while gc_maps lock is held; relocate is called during STW with exclusive access.
+                        (&*tracer.tracer_ptr).relocate(*old_raw, *new_raw);
+                    }
                 }
             }
 
@@ -3408,28 +3470,24 @@ impl LocalGarbageCollector {
                 finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
-                ref_count: 1,
+                tracers: TracerList::new(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                }),
                 region,
                 root_ref_count_ptr,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id: obj_id,
-            });
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
 
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
-                tracer_id,
                 object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
@@ -3450,23 +3508,20 @@ impl LocalGarbageCollector {
             let object_id = (*gc.internal_ptr).object_id;
 
             let gc_maps = self.core.gc_maps_unsync();
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id,
-            });
-            // RC hybrid: increment ref count for the cloned object
+            // RC hybrid: push tracer to the object's tracers Vec
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.ref_count += 1;
+                entry.tracers.push(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                });
             }
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, tracer_id, object_id));
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, object_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
-                tracer_id,
                 object_id,
             };
             // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source Gc.
@@ -3514,31 +3569,27 @@ impl LocalGarbageCollector {
                 finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
-                ref_count: 1,
+                tracers: TracerList::new(TracerInfo {
+                    tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                }),
                 region,
                 root_ref_count_ptr,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id: obj_id,
-            });
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
-                GcCellInternal::new(gc_ptr, tracer_id, obj_id),
+                GcCellInternal::new(gc_ptr, obj_id),
             );
 
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
-                tracer_id,
                 object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
@@ -3559,26 +3610,23 @@ impl LocalGarbageCollector {
             let object_id = (*gc.internal_ptr).object_id;
 
             let gc_maps = self.core.gc_maps_unsync();
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info.0,
-                layout: mem_info.1,
-                object_id,
-            });
-            // RC hybrid: increment ref count for the cloned object
+            // RC hybrid: push tracer to the object's tracers Vec
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.ref_count += 1;
+                entry.tracers.push(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info.0,
+                    layout: mem_info.1,
+                });
             }
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_inter_ptr,
-                GcCellInternal::new(gc.ptr, tracer_id, object_id),
+                GcCellInternal::new(gc.ptr, object_id),
             );
             let gc = GcCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
-                tracer_id,
                 object_id,
             };
             // SAFETY: Both internal_ptr and ptr are valid; internal_ptr was just initialized, ptr comes from the source GcCell.
@@ -3631,28 +3679,24 @@ impl LocalGarbageCollector {
                 finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
-                ref_count: 1,
+                tracers: TracerList::new(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                }),
                 region,
                 root_ref_count_ptr,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id: obj_id,
-            });
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
+            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
 
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
-                tracer_id,
                 object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
@@ -3714,31 +3758,27 @@ impl LocalGarbageCollector {
                 finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
-                ref_count: 1,
+                tracers: TracerList::new(TracerInfo {
+                    tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                }),
                 region,
                 root_ref_count_ptr,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id: obj_id,
-            });
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
                 gc_cell_inter_ptr,
-                GcCellInternal::new(gc_ptr, tracer_id, obj_id),
+                GcCellInternal::new(gc_ptr, obj_id),
             );
 
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
-                tracer_id,
                 object_id: obj_id,
             };
             // SAFETY: Both internal_ptr and ptr were just initialized above; derefs are valid.
@@ -3759,26 +3799,23 @@ impl LocalGarbageCollector {
 
             let gc_maps = self.core.gc_maps_unsync();
             let object_id = weak.object_id;
-            let tracer_id = gc_maps.tracers.insert(TracerEntry {
-                tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                mem: mem_info_internal_ptr.0,
-                layout: mem_info_internal_ptr.1,
-                object_id,
-            });
-            // RC hybrid: increment ref count for upgraded object
+            // RC hybrid: push tracer to the object's tracers Vec
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.ref_count += 1;
+                entry.tracers.push(TracerInfo {
+                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                    mem: mem_info_internal_ptr.0,
+                    layout: mem_info_internal_ptr.1,
+                });
             }
 
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
             std::ptr::write(
                 gc_inter_ptr,
-                GcInternal::new(weak.ptr, tracer_id, object_id),
+                GcInternal::new(weak.ptr, object_id),
             );
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: weak.ptr,
-                tracer_id,
                 object_id,
             };
             // SAFETY: Both internal_ptr (just initialized) and ptr (verified alive via STW lock) are valid.
@@ -3835,10 +3872,10 @@ impl LocalGarbageCollector {
         unsafe { self.core.collect_parallel_mark(max_gen) }
     }
 
-    pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
-        // SAFETY: Caller provides valid tracer_id and object_id obtained from a live Gc handle.
+    pub(crate) unsafe fn remove_tracer(&self, object_id: ObjectId, tracer_ptr: *const u8) {
+        // SAFETY: Thread-local GC, no concurrent access; caller provides valid object_id and tracer_ptr.
         unsafe {
-            self.core.remove_tracer(tracer_id, object_id);
+            self.core.remove_tracer_unsync(object_id, tracer_ptr);
         }
     }
 
@@ -4238,8 +4275,7 @@ mod tests {
             gc.borrow()
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .total_tracers()
         });
         let _one = Gc::new(1);
         LOCAL_GC.with(move |gc| unsafe {
@@ -4248,8 +4284,7 @@ mod tests {
                 gc.borrow()
                     .core
                     .lock_gc_maps()
-                    .tracers
-                    .len()
+                    .total_tracers()
                     - baseline,
                 1
             );
@@ -4263,8 +4298,7 @@ mod tests {
             gc.borrow()
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .total_tracers()
         });
         {
             let _one = Gc::new(1);
@@ -4275,8 +4309,7 @@ mod tests {
                 gc.borrow()
                     .core
                     .lock_gc_maps()
-                    .tracers
-                    .len()
+                    .total_tracers()
                     - baseline,
                 0
             );
@@ -4293,8 +4326,7 @@ mod tests {
             gc.borrow()
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .total_tracers()
         });
         let mut one = Gc::new(1);
         one = Gc::new(2);
@@ -4303,8 +4335,7 @@ mod tests {
                 gc.borrow()
                     .core
                     .lock_gc_maps()
-                    .tracers
-                    .len()
+                    .total_tracers()
                     - baseline,
                 1
             );
@@ -4321,8 +4352,7 @@ mod tests {
             gc.borrow()
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .total_tracers()
         });
         let mut one = Gc::new(1);
         one = Gc::new(2);
@@ -4332,8 +4362,7 @@ mod tests {
                 gc.borrow()
                     .core
                     .lock_gc_maps()
-                    .tracers
-                    .len()
+                    .total_tracers()
                     - baseline,
                 1
             );
@@ -4349,8 +4378,7 @@ mod tests {
             gc.borrow()
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .total_tracers()
         });
         {
             let mut one = Gc::new(1);
@@ -4363,8 +4391,7 @@ mod tests {
                 gc.borrow()
                     .core
                     .lock_gc_maps()
-                    .tracers
-                    .len()
+                    .total_tracers()
                     - baseline,
                 0
             );
@@ -4378,8 +4405,7 @@ mod tests {
             gc.borrow()
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .total_tracers()
         });
         let baseline_p2o = LOCAL_GC.with(|gc| {
             gc.borrow()
@@ -4397,8 +4423,7 @@ mod tests {
                 gc.borrow()
                     .core
                     .lock_gc_maps()
-                    .tracers
-                    .len()
+                    .total_tracers()
                     - baseline_trs,
                 0
             );
@@ -4421,8 +4446,7 @@ mod tests {
             gc.borrow()
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .total_tracers()
         });
         let _one = Gc::new(42);
         LOCAL_GC.with(|gc| {
@@ -4437,8 +4461,7 @@ mod tests {
                 gc.borrow()
                     .core
                     .lock_gc_maps()
-                    .tracers
-                    .len()
+                    .total_tracers()
                     - baseline,
                 1
             );
@@ -4499,8 +4522,7 @@ mod tests {
             gc.borrow()
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .total_tracers()
         });
         let source = Gc::new(42);
         let mut target = Gc::new(99);
@@ -4510,8 +4532,7 @@ mod tests {
                 .borrow()
                 .core
                 .lock_gc_maps()
-                .tracers
-                .len()
+                .total_tracers()
                 - baseline;
             // source + target + the new clone's tracer = at least 2 alive
             assert!(
