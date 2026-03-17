@@ -73,8 +73,8 @@ pub fn background_local_strategy(
                 thread::sleep(config_bg.poll_interval);
 
                 // Check heap occupancy to decide whether to trigger Gen2
-                let current = gc.core.current_heap_size.load(Ordering::Relaxed);
-                let peak = gc.core.peak_heap_size.load(Ordering::Relaxed);
+                let current = gc.core.current_heap_size.get();
+                let peak = gc.core.peak_heap_size.get();
 
                 if peak > 0 && current as f64 > peak as f64 * config_bg.gen2_occupancy_trigger {
                     // Begin concurrent Gen2 collection (brief STW for snapshot)
@@ -129,7 +129,7 @@ pub fn background_local_strategy(
             let mut gen1_count: u32 = 0;
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config_fg.poll_interval);
-                let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
+                let allocs = gc.core.allocation_count.get();
                 if allocs >= config_fg.gen0_threshold {
                     unsafe {
                         gc.core.collect_generation(Generation::Gen0);
@@ -188,8 +188,8 @@ pub fn background_global_strategy(
                 thread::sleep(config_bg.poll_interval);
 
                 // Check heap occupancy to decide whether to trigger Gen2
-                let current = gc.core.current_heap_size.load(Ordering::Relaxed);
-                let peak = gc.core.peak_heap_size.load(Ordering::Relaxed);
+                let current = gc.core.current_heap_size.get();
+                let peak = gc.core.peak_heap_size.get();
 
                 if peak > 0 && current as f64 > peak as f64 * config_bg.gen2_occupancy_trigger {
                     unsafe {
@@ -240,7 +240,7 @@ pub fn background_global_strategy(
             let mut gen1_count: u32 = 0;
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config_fg2.poll_interval);
-                let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
+                let allocs = gc.core.allocation_count.get();
                 if allocs >= config_fg2.gen0_threshold {
                     unsafe {
                         gc.core.collect_generation(Generation::Gen0);

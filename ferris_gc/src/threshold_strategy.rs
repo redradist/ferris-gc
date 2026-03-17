@@ -48,7 +48,7 @@ pub fn threshold_local_strategy(
             let mut gen1_count: u32 = 0;
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config.poll_interval);
-                let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
+                let allocs = gc.core.allocation_count.get();
                 if allocs >= config.gen0_threshold {
                     unsafe {
                         gc.core.collect_generation(Generation::Gen0);
@@ -96,7 +96,7 @@ pub fn threshold_global_strategy(
             let mut gen1_count: u32 = 0;
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config.poll_interval);
-                let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
+                let allocs = gc.core.allocation_count.get();
                 if allocs >= config.gen0_threshold {
                     unsafe {
                         gc.core.collect_generation(Generation::Gen0);
