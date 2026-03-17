@@ -838,7 +838,7 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.core.lock_gc_maps();
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     // SAFETY: ptr was originally allocated as a GcPtr<T> and has not been dropped yet.
@@ -904,7 +904,7 @@ impl GlobalGarbageCollector {
             // SAFETY: internal_ptr is valid; the source Gc handle is alive during clone.
             let object_id = (*gc.internal_ptr).object_id;
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.core.lock_gc_maps();
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
                 mem: mem_info_internal_ptr.0,
@@ -944,7 +944,7 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.core.lock_gc_maps();
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     // SAFETY: ptr was originally allocated as a RefCell<GcPtr<T>> and has not been dropped yet.
@@ -1016,7 +1016,7 @@ impl GlobalGarbageCollector {
             // SAFETY: internal_ptr is valid; the source GcCell handle is alive during clone.
             let object_id = (*gc.internal_ptr).object_id;
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.core.lock_gc_maps();
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
                 mem: mem_info.0,
@@ -1069,7 +1069,7 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.core.lock_gc_maps();
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     // SAFETY: ptr was originally allocated as a GcPtr<T> and has not been dropped yet.
@@ -1148,7 +1148,7 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.core.lock_gc_maps();
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     // SAFETY: ptr was originally allocated as a RefCell<GcPtr<T>> and has not been dropped yet.
@@ -1218,7 +1218,7 @@ impl GlobalGarbageCollector {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.core.lock_gc_maps();
             // Re-check under gc_maps lock: the object may have been freed by a
             // concurrent drop (RC hybrid) between the alive check and this point.
             let object_id = weak.object_id;
@@ -1692,9 +1692,7 @@ mod tests {
         unsafe { (*GLOBAL_GC).collect() };
         let baseline = (*GLOBAL_GC)
             .core
-            .gc_maps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_gc_maps()
             .tracers
             .len();
         (guard, baseline)
@@ -1709,9 +1707,7 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline,
@@ -1730,9 +1726,7 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline,
@@ -1752,9 +1746,7 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline,
@@ -1775,9 +1767,7 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline,
@@ -1800,9 +1790,7 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline,
@@ -1902,9 +1890,7 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline,
@@ -1930,9 +1916,7 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline,
@@ -1979,9 +1963,7 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline,
@@ -2050,9 +2032,7 @@ mod tests {
         // so check live_objects instead — we hold both Gc references alive.
         let live = (*GLOBAL_GC)
             .core
-            .gc_maps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_gc_maps()
             .tracers
             .len();
         assert!(
@@ -2180,9 +2160,7 @@ mod tests {
         assert_eq!(
             (*GLOBAL_GC)
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline,
@@ -2212,9 +2190,7 @@ mod tests {
         let region = (*GLOBAL_GC).core.current_region();
         let gc_maps = (*GLOBAL_GC)
             .core
-            .gc_maps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock_gc_maps();
         assert!(
             gc_maps.objects.values().any(|e| e.region == region),
             "object should be assigned to current region"
@@ -2258,9 +2234,7 @@ mod tests {
         // RC should have freed it — check tracers are back to baseline
         let gc_maps = (*GLOBAL_GC)
             .core
-            .gc_maps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock_gc_maps();
         assert_eq!(
             gc_maps.tracers.len(),
             baseline,
@@ -2275,17 +2249,13 @@ mod tests {
         let b = a.clone();
         let baseline = (*GLOBAL_GC)
             .core
-            .gc_maps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_gc_maps()
             .objects
             .len();
         drop(a);
         let after = (*GLOBAL_GC)
             .core
-            .gc_maps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_gc_maps()
             .objects
             .len();
         assert_eq!(after, baseline, "object should survive when clone exists");

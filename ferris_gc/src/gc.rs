@@ -4,7 +4,7 @@ use crate::generation::{
 };
 use crate::slot_map::{ObjectId, SlotMap, TracerId};
 use std::alloc::{Layout, alloc, dealloc};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -1134,11 +1134,34 @@ impl IncrementalState {
     }
 }
 
+/// RAII guard for accessing GcMaps. Optionally holds a MutexGuard when
+/// thread-safe access is needed (GlobalGarbageCollector, background strategies).
+/// For thread-local access, the lock field is None and access is zero-cost.
+pub(crate) struct GcMapsGuard<'a> {
+    maps: &'a mut GcMaps,
+    _lock: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl<'a> Deref for GcMapsGuard<'a> {
+    type Target = GcMaps;
+    fn deref(&self) -> &GcMaps {
+        self.maps
+    }
+}
+
+impl<'a> DerefMut for GcMapsGuard<'a> {
+    fn deref_mut(&mut self) -> &mut GcMaps {
+        self.maps
+    }
+}
+
 /// Shared GC bookkeeping used by both LocalGarbageCollector and GlobalGarbageCollector.
-/// All object/tracer state is consolidated under a single Mutex<GcMaps> for
-/// simpler locking and slot-map-based O(1) operations.
+/// gc_maps is behind UnsafeCell for zero-cost thread-local access; gc_maps_lock
+/// provides Mutex protection when cross-thread access is needed.
 pub(crate) struct GarbageCollector {
-    pub(crate) gc_maps: Mutex<GcMaps>,
+    pub(crate) gc_maps: UnsafeCell<GcMaps>,
+    /// Mutex for thread-safe gc_maps access (used by GlobalGC and background strategies).
+    pub(crate) gc_maps_lock: Mutex<()>,
     pub(crate) allocation_count: AtomicUsize,
     pub(crate) card_table: CardTable,
     pub(crate) stw_lock: RwLock<()>,
@@ -1163,9 +1186,9 @@ pub(crate) struct GarbageCollector {
     pub(crate) alloc_threshold: AtomicUsize,
 }
 
-// SAFETY: All mutable state in GarbageCollector is behind Mutex or atomic types,
-// ensuring exclusive access across threads. Raw pointers stored in ObjectEntry/TracerEntry
-// are only dereferenced while holding the gc_maps Mutex lock.
+// SAFETY: GcMaps is behind UnsafeCell but protected by gc_maps_lock (Mutex<()>)
+// for cross-thread access. Thread-local access bypasses the lock (single-threaded
+// guarantee from thread_local!). All other mutable state is behind Mutex or atomics.
 unsafe impl Sync for GarbageCollector {}
 unsafe impl Send for GarbageCollector {}
 
@@ -1173,11 +1196,12 @@ unsafe impl Send for GarbageCollector {}
 impl GarbageCollector {
     pub(crate) fn new() -> GarbageCollector {
         GarbageCollector {
-            gc_maps: Mutex::new(GcMaps {
+            gc_maps: UnsafeCell::new(GcMaps {
                 objects: SlotMap::new(),
                 tracers: SlotMap::new(),
                 ptr_to_object: HashMap::new(),
             }),
+            gc_maps_lock: Mutex::new(()),
             allocation_count: AtomicUsize::new(0),
             card_table: CardTable::new(),
             stw_lock: RwLock::new(()),
@@ -1192,6 +1216,27 @@ impl GarbageCollector {
             alloc_threshold: AtomicUsize::new(LOCAL_GC_ALLOC_THRESHOLD),
             on_collection: Mutex::new(None),
         }
+    }
+
+    /// Thread-safe locked access to gc_maps. Used by collection methods
+    /// and GlobalGarbageCollector. Acquires gc_maps_lock Mutex.
+    pub(crate) fn lock_gc_maps(&self) -> GcMapsGuard<'_> {
+        let lock = self.gc_maps_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: MutexGuard ensures exclusive access across threads.
+        let maps = unsafe { &mut *self.gc_maps.get() };
+        GcMapsGuard {
+            maps,
+            _lock: Some(lock),
+        }
+    }
+
+    /// Unsynchronized zero-cost access to gc_maps for single-threaded use.
+    ///
+    /// # Safety
+    /// Caller must guarantee no concurrent access (e.g., from a thread_local!
+    /// context with no background collection thread accessing gc_maps).
+    pub(crate) unsafe fn gc_maps_unsync(&self) -> &mut GcMaps {
+        unsafe { &mut *self.gc_maps.get() }
     }
 
     /// Set custom promotion thresholds.
@@ -1212,7 +1257,7 @@ impl GarbageCollector {
 
     /// Return a snapshot of current GC diagnostics.
     pub fn stats(&self) -> GcStats {
-        let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let gc_maps = self.lock_gc_maps();
         let mut gen0 = 0usize;
         let mut gen1 = 0usize;
         let mut gen2 = 0usize;
@@ -1356,7 +1401,7 @@ impl GarbageCollector {
 
     /// Get or create the alive flag for an object (used by weak references).
     pub(crate) fn get_or_create_weak_alive(&self, obj_id: ObjectId) -> Arc<AtomicBool> {
-        let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gc_maps = self.lock_gc_maps();
         if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
             return entry
                 .weak_alive
@@ -1372,7 +1417,7 @@ impl GarbageCollector {
     /// the tri-color invariant (no Black->White edges).
     pub(crate) fn write_barrier(&self, obj_id: ObjectId, obj_ptr: *const dyn Trace) {
         let thin = obj_ptr.get_thin_ptr();
-        let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let gc_maps = self.lock_gc_maps();
         if let Some(entry) = gc_maps.objects.get(obj_id) {
             if entry.generation > Generation::Gen0 {
                 self.card_table.mark_dirty(thin);
@@ -1395,7 +1440,7 @@ impl GarbageCollector {
 
     pub(crate) unsafe fn remove_tracer(&self, tracer_id: TracerId, object_id: ObjectId) {
         let (tracer_dealloc, object_dealloc) = {
-            let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.lock_gc_maps();
             let mut tracer_dealloc = None;
             let mut object_dealloc = None;
 
@@ -1467,7 +1512,7 @@ impl GarbageCollector {
             let (tracer_deallocs, object_deallocs) = {
                 // STW: block all mutator operations during mark+sweep
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-                let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+                let mut gc_maps = self.lock_gc_maps();
 
                 // Root discovery: cascade reset_root() into object fields.
                 // For partial collections (max_gen < Gen2), only walk in-scope objects.
@@ -1637,7 +1682,7 @@ impl GarbageCollector {
             let (tracer_deallocs, object_deallocs) = {
                 // STW: block all mutator operations during cleanup
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-                let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+                let mut gc_maps = self.lock_gc_maps();
                 self.card_table.clear_all();
 
                 let tracer_entries = gc_maps.tracers.drain();
@@ -1698,7 +1743,7 @@ impl GarbageCollector {
             let (tracer_deallocs, object_deallocs) = {
                 // STW: block all mutator operations during mark+sweep
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-                let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+                let mut gc_maps = self.lock_gc_maps();
 
                 // Root discovery: for partial collections, only walk in-scope objects.
                 if max_gen >= Generation::Gen2 {
@@ -1941,7 +1986,7 @@ impl GarbageCollector {
 
             let (tracer_deallocs, object_deallocs) = {
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-                let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+                let mut gc_maps = self.lock_gc_maps();
 
                 // Root discovery (serial — must complete before marking)
                 for entry in gc_maps.objects.values() {
@@ -2142,7 +2187,7 @@ impl GarbageCollector {
     pub unsafe fn begin_collection(&self, max_gen: Generation) {
         let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gc_maps = self.lock_gc_maps();
 
         // Lazily rebuild ptr_to_object for mark_step's trace_children resolution.
         gc_maps.rebuild_ptr_to_object();
@@ -2190,7 +2235,7 @@ impl GarbageCollector {
     pub unsafe fn mark_step(&self, budget: usize) -> bool {
         let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let gc_maps = self.lock_gc_maps();
 
         let mut processed = 0;
         let mut children_buf = Vec::new();
@@ -2241,7 +2286,7 @@ impl GarbageCollector {
             let (tracer_deallocs, object_deallocs, mut stats) = {
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
                 let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-                let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+                let mut gc_maps = self.lock_gc_maps();
 
                 max_gen = incr.max_gen;
                 incr.phase = CollectionPhase::Sweeping;
@@ -2440,7 +2485,7 @@ impl GarbageCollector {
     pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
         let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let gc_maps = self.lock_gc_maps();
 
         let deadline = Instant::now() + max_duration;
         let mut children_buf = Vec::new();
@@ -2510,7 +2555,7 @@ impl GarbageCollector {
     pub unsafe fn begin_concurrent_collection(&self, max_gen: Generation) {
         let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gc_maps = self.lock_gc_maps();
 
         // Lazily rebuild ptr_to_object for edge snapshot resolution.
         gc_maps.rebuild_ptr_to_object();
@@ -2703,7 +2748,7 @@ impl GarbageCollector {
 
             let (tracer_deallocs, object_deallocs) = {
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-                let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+                let mut gc_maps = self.lock_gc_maps();
 
                 // Root discovery
                 for entry in gc_maps.objects.values() {
@@ -2817,7 +2862,7 @@ impl GarbageCollector {
 
     /// Return per-region liveness statistics without running a collection.
     pub fn region_stats(&self) -> Vec<crate::generation::RegionStats> {
-        let gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+        let gc_maps = self.lock_gc_maps();
         let (total_bytes, object_count) = gc_maps.compute_region_stats();
         let mut region_ids: Vec<RegionId> = total_bytes.keys().copied().collect();
         for key in object_count.keys() {
@@ -2859,7 +2904,7 @@ impl GarbageCollector {
             let (tracer_deallocs, object_deallocs) = {
                 // STW: block all mutator operations during mark+sweep
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-                let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+                let mut gc_maps = self.lock_gc_maps();
 
                 // ---- Mark phase (same as collect_generation Gen2) ----
 
@@ -3016,7 +3061,7 @@ impl GarbageCollector {
             self.collect();
 
             let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-            let mut gc_maps = self.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gc_maps = self.lock_gc_maps();
 
             let num_objects = gc_maps.objects.len();
             if num_objects == 0 {
@@ -3338,7 +3383,7 @@ impl LocalGarbageCollector {
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let gc_maps = self.core.gc_maps_unsync();
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     // SAFETY: Pointer points to a valid, initialized GcPtr<T> that is being deallocated.
@@ -3380,7 +3425,6 @@ impl LocalGarbageCollector {
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
-            drop(gc_maps);
 
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
@@ -3405,7 +3449,7 @@ impl LocalGarbageCollector {
             // SAFETY: internal_ptr is valid for the lifetime of the source Gc handle.
             let object_id = (*gc.internal_ptr).object_id;
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let gc_maps = self.core.gc_maps_unsync();
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
                 mem: mem_info_internal_ptr.0,
@@ -3419,7 +3463,6 @@ impl LocalGarbageCollector {
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, tracer_id, object_id));
-            drop(gc_maps);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
@@ -3443,7 +3486,7 @@ impl LocalGarbageCollector {
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let gc_maps = self.core.gc_maps_unsync();
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     // SAFETY: Pointer points to a valid, initialized RefCell<GcPtr<T>> that is being deallocated.
@@ -3491,7 +3534,6 @@ impl LocalGarbageCollector {
                 gc_cell_inter_ptr,
                 GcCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
-            drop(gc_maps);
 
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
@@ -3516,7 +3558,7 @@ impl LocalGarbageCollector {
             // SAFETY: internal_ptr is valid for the lifetime of the source GcCell handle.
             let object_id = (*gc.internal_ptr).object_id;
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let gc_maps = self.core.gc_maps_unsync();
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
                 mem: mem_info.0,
@@ -3533,7 +3575,6 @@ impl LocalGarbageCollector {
                 gc_inter_ptr,
                 GcCellInternal::new(gc.ptr, tracer_id, object_id),
             );
-            drop(gc_maps);
             let gc = GcCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
@@ -3565,7 +3606,7 @@ impl LocalGarbageCollector {
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let gc_maps = self.core.gc_maps_unsync();
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     // SAFETY: Pointer points to a valid, initialized GcPtr<T> that is being deallocated.
@@ -3607,7 +3648,6 @@ impl LocalGarbageCollector {
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, tracer_id, obj_id));
-            drop(gc_maps);
 
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
@@ -3646,7 +3686,7 @@ impl LocalGarbageCollector {
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let gc_maps = self.core.gc_maps_unsync();
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
                     // SAFETY: Pointer points to a valid, initialized RefCell<GcPtr<T>> that is being deallocated.
@@ -3694,7 +3734,6 @@ impl LocalGarbageCollector {
                 gc_cell_inter_ptr,
                 GcCellInternal::new(gc_ptr, tracer_id, obj_id),
             );
-            drop(gc_maps);
 
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
@@ -3718,7 +3757,7 @@ impl LocalGarbageCollector {
         unsafe {
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
 
-            let mut gc_maps = self.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let gc_maps = self.core.gc_maps_unsync();
             let object_id = weak.object_id;
             let tracer_id = gc_maps.tracers.insert(TracerEntry {
                 tracer_ptr: gc_inter_ptr as *const dyn Trace,
@@ -3730,7 +3769,6 @@ impl LocalGarbageCollector {
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
                 entry.ref_count += 1;
             }
-            drop(gc_maps);
 
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
             std::ptr::write(
@@ -4199,9 +4237,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
         });
@@ -4211,9 +4247,7 @@ mod tests {
             assert_eq!(
                 gc.borrow()
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .tracers
                     .len()
                     - baseline,
@@ -4228,9 +4262,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
         });
@@ -4242,9 +4274,7 @@ mod tests {
             assert_eq!(
                 gc.borrow()
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .tracers
                     .len()
                     - baseline,
@@ -4262,9 +4292,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
         });
@@ -4274,9 +4302,7 @@ mod tests {
             assert_eq!(
                 gc.borrow()
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .tracers
                     .len()
                     - baseline,
@@ -4294,9 +4320,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
         });
@@ -4307,9 +4331,7 @@ mod tests {
             assert_eq!(
                 gc.borrow()
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .tracers
                     .len()
                     - baseline,
@@ -4326,9 +4348,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
         });
@@ -4342,9 +4362,7 @@ mod tests {
             assert_eq!(
                 gc.borrow()
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .tracers
                     .len()
                     - baseline,
@@ -4359,18 +4377,14 @@ mod tests {
         let baseline_trs = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
         });
         let baseline_p2o = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .ptr_to_object
                 .len()
         });
@@ -4382,9 +4396,7 @@ mod tests {
             assert_eq!(
                 gc.borrow()
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .tracers
                     .len()
                     - baseline_trs,
@@ -4393,9 +4405,7 @@ mod tests {
             assert_eq!(
                 gc.borrow()
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .ptr_to_object
                     .len()
                     - baseline_p2o,
@@ -4410,9 +4420,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
         });
@@ -4428,9 +4436,7 @@ mod tests {
             assert_eq!(
                 gc.borrow()
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .tracers
                     .len()
                     - baseline,
@@ -4492,9 +4498,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
         });
@@ -4505,9 +4509,7 @@ mod tests {
             let delta = gc
                 .borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .tracers
                 .len()
                 - baseline;
@@ -4559,9 +4561,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let gc_maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -4590,9 +4590,7 @@ mod tests {
             {
                 let gc_maps = gc_ref
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .lock_gc_maps();
                 assert!(
                     gc_maps
                         .objects
@@ -4604,9 +4602,7 @@ mod tests {
 
             let baseline_objs = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             // Gen0-only collection should not touch Gen1 objects
@@ -4617,9 +4613,7 @@ mod tests {
             }
             let after_objs = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             assert_eq!(
@@ -4647,9 +4641,7 @@ mod tests {
             {
                 let gc_maps = gc_ref
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .lock_gc_maps();
                 assert!(
                     gc_maps
                         .objects
@@ -4667,9 +4659,7 @@ mod tests {
             }
             let gc_maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -4704,9 +4694,7 @@ mod tests {
             }
             let gc_maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -4725,9 +4713,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -4737,9 +4723,7 @@ mod tests {
         let after = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -4782,9 +4766,7 @@ mod tests {
             // Verify it's in Gen1 (check by value to avoid fat pointer comparison issues)
             let gc_maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -4891,9 +4873,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let objs_before = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             unsafe {
@@ -4903,9 +4883,7 @@ mod tests {
             }
             let objs_after = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             assert_eq!(
@@ -5051,9 +5029,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5065,9 +5041,7 @@ mod tests {
         let after = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5090,9 +5064,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5103,9 +5075,7 @@ mod tests {
         let after = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5132,9 +5102,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let objs_before = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             let stats = unsafe {
@@ -5149,9 +5117,7 @@ mod tests {
             assert_eq!(
                 gc_ref
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .objects
                     .len(),
                 objs_before
@@ -5169,9 +5135,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let objs_before = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             unsafe {
@@ -5187,9 +5151,7 @@ mod tests {
             }
             let objs_after = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             assert_eq!(objs_before, objs_after, "live object count must not change");
@@ -5210,9 +5172,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let objs_before = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             unsafe {
@@ -5222,9 +5182,7 @@ mod tests {
             }
             let objs_after = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             assert_eq!(
@@ -5250,9 +5208,7 @@ mod tests {
             }
             let gc_maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -5351,9 +5307,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5366,9 +5320,7 @@ mod tests {
         let after = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5669,9 +5621,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let objs_before = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             let _stats = unsafe {
@@ -5681,9 +5631,7 @@ mod tests {
             };
             let objs_after = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             assert!(
@@ -5701,9 +5649,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let objs_before = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             let stats = unsafe {
@@ -5717,9 +5663,7 @@ mod tests {
             );
             let objs_after = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             assert_eq!(objs_before, objs_after);
@@ -5757,9 +5701,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let gc_maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert!(
                 gc_maps.objects.values().any(|e| e.region.0 == 0),
                 "new objects should be in region 0 (default)"
@@ -5782,9 +5724,7 @@ mod tests {
             let region_id = gc_ref.core.current_region();
             let gc_maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert!(
                 gc_maps.objects.values().any(|e| e.region == region_id),
                 "object should be in the new region"
@@ -5838,9 +5778,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5849,9 +5787,7 @@ mod tests {
             let during = LOCAL_GC.with(|gc| {
                 gc.borrow()
                     .core
-                    .gc_maps
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_gc_maps()
                     .objects
                     .len()
             });
@@ -5860,9 +5796,7 @@ mod tests {
         let after = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5878,9 +5812,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5891,9 +5823,7 @@ mod tests {
         let after_drop_a = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5908,9 +5838,7 @@ mod tests {
         let after_drop_b = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5928,9 +5856,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5950,9 +5876,7 @@ mod tests {
         let after = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5965,9 +5889,7 @@ mod tests {
         let final_count = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5985,9 +5907,7 @@ mod tests {
         let baseline = LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()
         });
@@ -5996,9 +5916,7 @@ mod tests {
             LOCAL_GC.with(|gc| gc
                 .borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()),
             baseline + 1,
@@ -6011,9 +5929,7 @@ mod tests {
             LOCAL_GC.with(|gc| gc
                 .borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()),
             baseline + 1,
@@ -6026,9 +5942,7 @@ mod tests {
             LOCAL_GC.with(|gc| gc
                 .borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()),
             baseline + 1,
@@ -6042,9 +5956,7 @@ mod tests {
             LOCAL_GC.with(|gc| gc
                 .borrow()
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len()),
             baseline,
@@ -6063,9 +5975,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let objs_before = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             unsafe {
@@ -6079,9 +5989,7 @@ mod tests {
             }
             let objs_after = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             assert_eq!(objs_before, objs_after, "no objects should be collected");
@@ -6099,9 +6007,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let objs_before = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             unsafe {
@@ -6114,9 +6020,7 @@ mod tests {
             }
             let objs_after = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_gc_maps()
                 .objects
                 .len();
             assert_eq!(objs_before, objs_after, "no objects should be collected");
@@ -6397,9 +6301,7 @@ mod tests {
             // No objects should remain from this batch
             let maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert_eq!(
                 maps.objects.len(),
                 0,
@@ -6443,9 +6345,7 @@ mod tests {
             // There should be exactly 1 object remaining (the live one)
             let maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert_eq!(
                 maps.objects.len(),
                 1,
@@ -6486,9 +6386,7 @@ mod tests {
             );
             let maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert_eq!(
                 maps.objects.len(),
                 0,
@@ -6510,7 +6408,7 @@ mod tests {
         // Verify the objects are tracked by the GC
         LOCAL_GC.with(|gc| {
             let gc = gc.borrow();
-            let maps = gc.core.gc_maps.lock().unwrap_or_else(|e| e.into_inner());
+            let maps = gc.core.lock_gc_maps();
             assert!(maps.objects.len() >= 2);
         });
         drop(a);
@@ -6586,9 +6484,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert_eq!(
                 maps.objects.len(),
                 0,
@@ -6636,9 +6532,7 @@ mod tests {
             let gc_ref = gc.borrow();
             let maps = gc_ref
                 .core
-                .gc_maps
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock_gc_maps();
             assert_eq!(maps.objects.len(), 0, "all objects should be collected");
         });
     }
