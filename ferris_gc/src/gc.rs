@@ -115,14 +115,14 @@ pub type OptGc<T> = Option<Gc<T>>;
 pub type OptGcCell<T> = Option<GcCell<T>>;
 
 struct GcInfo {
-    root_ref_count: AtomicUsize,
+    root_ref_count: Cell<usize>,
 }
 
 impl GcInfo {
     #[inline]
     fn new() -> GcInfo {
         GcInfo {
-            root_ref_count: AtomicUsize::new(0),
+            root_ref_count: Cell::new(0),
         }
     }
 }
@@ -186,7 +186,8 @@ where
 
     fn trace(&self) {
         // Guard: only recurse into children on first trace (breaks cycles)
-        let prev = self.info.root_ref_count.fetch_add(1, Ordering::AcqRel);
+        let prev = self.info.root_ref_count.get();
+        self.info.root_ref_count.set(prev + 1);
         if prev == 0 {
             self.t.trace();
         }
@@ -194,14 +195,15 @@ where
 
     fn reset(&self) {
         // Guard: only recurse into children on last reset (breaks cycles)
-        let prev = self.info.root_ref_count.fetch_sub(1, Ordering::AcqRel);
+        let prev = self.info.root_ref_count.get();
+        self.info.root_ref_count.set(prev - 1);
         if prev == 1 {
             self.t.reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        self.info.root_ref_count.load(Ordering::Acquire) > 0
+        self.info.root_ref_count.get() > 0
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -209,7 +211,7 @@ where
     }
 
     fn clear_trace(&self) {
-        self.info.root_ref_count.store(0, Ordering::Release);
+        self.info.root_ref_count.set(0);
     }
 }
 
@@ -226,29 +228,23 @@ where
     }
 
     fn trace(&self) {
-        let prev = self
-            .borrow()
-            .info
-            .root_ref_count
-            .fetch_add(1, Ordering::AcqRel);
+        let prev = self.borrow().info.root_ref_count.get();
+        self.borrow().info.root_ref_count.set(prev + 1);
         if prev == 0 {
             self.borrow().t.trace();
         }
     }
 
     fn reset(&self) {
-        let prev = self
-            .borrow()
-            .info
-            .root_ref_count
-            .fetch_sub(1, Ordering::AcqRel);
+        let prev = self.borrow().info.root_ref_count.get();
+        self.borrow().info.root_ref_count.set(prev - 1);
         if prev == 1 {
             self.borrow().t.reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        self.borrow().info.root_ref_count.load(Ordering::Acquire) > 0
+        self.borrow().info.root_ref_count.get() > 0
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -256,10 +252,7 @@ where
     }
 
     fn clear_trace(&self) {
-        self.borrow()
-            .info
-            .root_ref_count
-            .store(0, Ordering::Release);
+        self.borrow().info.root_ref_count.set(0);
     }
 }
 
@@ -282,7 +275,7 @@ pub(crate) struct GcInternal<T>
 where
     T: 'static + Sized + Trace,
 {
-    is_root: AtomicBool,
+    is_root: Cell<bool>,
     ptr: Cell<*const GcPtr<T>>,
     pub(crate) object_id: ObjectId,
 }
@@ -294,7 +287,7 @@ where
     #[inline]
     fn new(ptr: *const GcPtr<T>, object_id: ObjectId) -> GcInternal<T> {
         GcInternal {
-            is_root: AtomicBool::new(true),
+            is_root: Cell::new(true),
             ptr: Cell::new(ptr),
             object_id,
         }
@@ -307,13 +300,13 @@ where
 {
     #[inline]
     fn is_root(&self) -> bool {
-        self.is_root.load(Ordering::Relaxed)
+        self.is_root.get()
     }
 
     #[inline]
     fn reset_root(&self) {
-        if self.is_root.load(Ordering::Relaxed) {
-            self.is_root.store(false, Ordering::Relaxed);
+        if self.is_root.get() {
+            self.is_root.set(false);
             unsafe {
                 // SAFETY: Pointer is valid for the lifetime of this Gc handle; the GC guarantees the allocation is not freed while any handle exists.
                 (*self.ptr.get()).reset_root();
@@ -573,7 +566,7 @@ pub(crate) struct GcCellInternal<T>
 where
     T: 'static + Sized + Trace,
 {
-    is_root: AtomicBool,
+    is_root: Cell<bool>,
     ptr: Cell<*const RefCell<GcPtr<T>>>,
     pub(crate) object_id: ObjectId,
 }
@@ -587,7 +580,7 @@ where
         object_id: ObjectId,
     ) -> GcCellInternal<T> {
         GcCellInternal {
-            is_root: AtomicBool::new(true),
+            is_root: Cell::new(true),
             ptr: Cell::new(ptr),
             object_id,
         }
@@ -599,12 +592,12 @@ where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
-        self.is_root.load(Ordering::Acquire)
+        self.is_root.get()
     }
 
     fn reset_root(&self) {
-        if self.is_root.load(Ordering::Acquire) {
-            self.is_root.store(false, Ordering::Release);
+        if self.is_root.get() {
+            self.is_root.set(false);
             unsafe {
                 // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
                 (*self.ptr.get()).borrow().reset_root();
@@ -1172,10 +1165,10 @@ pub(crate) struct ObjectEntry {
     pub(crate) tracers: TracerList,
     /// Region assignment for region-based collection.
     pub(crate) region: RegionId,
-    /// Raw pointer to the object's `root_ref_count` atomic inside GcInfo.
+    /// Raw pointer to the object's `root_ref_count` Cell inside GcInfo.
     /// Allows inline mark-bit checks (is_traceable / clear_trace) without
     /// virtual dispatch through `*const dyn Trace`.
-    pub(crate) root_ref_count_ptr: *const AtomicUsize,
+    pub(crate) root_ref_count_ptr: *const Cell<usize>,
 }
 
 /// Unified GC maps. Single Mutex protects all state to simplify locking.
@@ -1712,7 +1705,7 @@ impl GarbageCollector {
                 for (id, entry) in gc_maps.objects.iter_mut() {
                     let in_scope = entry.generation <= max_gen;
                     // SAFETY: root_ref_count_ptr points into a valid GcInfo allocation.
-                    let marked = (*entry.root_ref_count_ptr).load(Ordering::Acquire) > 0;
+                    let marked = (*entry.root_ref_count_ptr).get() > 0;
 
                     if in_scope {
                         stats.objects_scanned += 1;
@@ -1740,7 +1733,7 @@ impl GarbageCollector {
                     }
                     // Clear mark state for all surviving objects (in-scope survivors
                     // + out-of-scope objects that may have been marked transitively).
-                    (*entry.root_ref_count_ptr).store(0, Ordering::Release);
+                    (*entry.root_ref_count_ptr).set(0);
                 }
                 stats.objects_collected = collected_objects.len();
 
@@ -2078,8 +2071,8 @@ impl GarbageCollector {
     /// Uses rayon to parallelize the mark phase (root tracing) and the sweep phase
     /// (deallocation). The mark phase partitions root tracers across worker threads;
     /// each worker traces its assigned roots independently. This works because
-    /// `GcInfo::root_ref_count` uses `AtomicUsize` — concurrent mark is safe when
-    /// multiple threads call `trace()` on overlapping subgraphs.
+    /// `GcInfo::root_ref_count` uses `Cell<usize>` for the thread-local GC.
+    /// Parallel mark requires reverting to AtomicUsize or using UnsafeCell.
     ///
     /// Best for large heaps with many root objects. For small heaps, the serial
     /// `collect_generation()` is faster due to lower overhead.
@@ -2114,9 +2107,8 @@ impl GarbageCollector {
                 }
 
                 // Parallel mark phase: collect root tracers, then trace in parallel.
-                // SAFETY: GcInfo uses AtomicUsize for root_ref_count, so concurrent
-                // trace() calls on overlapping subgraphs are safe. During STW no
-                // mutator threads are running.
+                // NOTE: root_ref_count is Cell<usize> — parallel mark would need
+                // AtomicUsize or UnsafeCell. This feature is currently disabled.
                 struct SendTracePtr(*const dyn Trace);
                 unsafe impl Send for SendTracePtr {}
                 unsafe impl Sync for SendTracePtr {}
@@ -2454,7 +2446,7 @@ impl GarbageCollector {
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
                 for (id, entry) in gc_maps.objects.iter_mut() {
                     let in_scope = entry.generation <= max_gen;
-                    let marked = (*entry.root_ref_count_ptr).load(Ordering::Acquire) > 0;
+                    let marked = (*entry.root_ref_count_ptr).get() > 0;
 
                     if in_scope {
                         stats.objects_scanned += 1;
@@ -2476,7 +2468,7 @@ impl GarbageCollector {
                             }
                         }
                     }
-                    (*entry.root_ref_count_ptr).store(0, Ordering::Release);
+                    (*entry.root_ref_count_ptr).set(0);
                 }
                 stats.objects_collected = collected_objects.len();
 
@@ -2879,7 +2871,7 @@ impl GarbageCollector {
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
                 for (id, entry) in gc_maps.objects.iter_mut() {
                     let in_region = entry.region == region;
-                    let marked = (*entry.root_ref_count_ptr).load(Ordering::Acquire) > 0;
+                    let marked = (*entry.root_ref_count_ptr).get() > 0;
 
                     if in_region {
                         stats.objects_scanned += 1;
@@ -2888,7 +2880,7 @@ impl GarbageCollector {
                             continue;
                         }
                     }
-                    (*entry.root_ref_count_ptr).store(0, Ordering::Release);
+                    (*entry.root_ref_count_ptr).set(0);
                 }
                 stats.objects_collected = collected_objects.len();
 
@@ -3016,7 +3008,7 @@ impl GarbageCollector {
 
                 for (_id, entry) in gc_maps.objects.iter() {
                     *region_total.entry(entry.region).or_insert(0) += 1;
-                    if (*entry.root_ref_count_ptr).load(Ordering::Acquire) > 0 {
+                    if (*entry.root_ref_count_ptr).get() > 0 {
                         *region_marked.entry(entry.region).or_insert(0) += 1;
                     }
                 }
@@ -3053,7 +3045,7 @@ impl GarbageCollector {
                         .iter()
                         .filter(|(_id, e)| {
                             e.region == *region
-                                && (*e.root_ref_count_ptr).load(Ordering::Acquire) == 0
+                                && (*e.root_ref_count_ptr).get() == 0
                         })
                         .map(|(id, _)| id)
                         .collect();
@@ -3084,7 +3076,7 @@ impl GarbageCollector {
 
                 // Clear mark state for ALL surviving objects using inline access.
                 for entry in gc_maps.objects.values() {
-                    (*entry.root_ref_count_ptr).store(0, Ordering::Release);
+                    (*entry.root_ref_count_ptr).set(0);
                 }
 
                 (tracer_deallocs, object_deallocs)
@@ -3253,7 +3245,7 @@ impl GarbageCollector {
 
                     // Update root_ref_count_ptr: same offset, new base address.
                     let rrc_offset = entry.root_ref_count_ptr as usize - old_thin;
-                    entry.root_ref_count_ptr = (new_thin + rrc_offset) as *const AtomicUsize;
+                    entry.root_ref_count_ptr = (new_thin + rrc_offset) as *const Cell<usize>;
 
                     // Replace memory tracking with compact block reference.
                     // Use std::mem::replace to properly move the old GcObjMem out,
@@ -3478,7 +3470,7 @@ impl LocalGarbageCollector {
                 }
             }
             // SAFETY: gc_ptr was just initialized; root_ref_count lives at a fixed offset in GcInfo.
-            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize;
+            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -3578,7 +3570,7 @@ impl LocalGarbageCollector {
             }
             // SAFETY: gc_ptr was just initialized; as_ptr() gives stable pointer to inner GcPtr<T>.
             let root_ref_count_ptr =
-                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize;
+                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -3688,7 +3680,7 @@ impl LocalGarbageCollector {
                 }
             }
             // SAFETY: gc_ptr was just initialized; root_ref_count lives at a fixed offset in GcInfo.
-            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize;
+            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -3767,7 +3759,7 @@ impl LocalGarbageCollector {
             }
             // SAFETY: gc_ptr was just initialized; as_ptr() gives stable pointer to inner GcPtr<T>.
             let root_ref_count_ptr =
-                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize;
+                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,

@@ -845,7 +845,7 @@ impl GlobalGarbageCollector {
                     (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
-            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize;
+            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -947,7 +947,7 @@ impl GlobalGarbageCollector {
                 }
             }
             let root_ref_count_ptr =
-                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize;
+                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -1062,7 +1062,7 @@ impl GlobalGarbageCollector {
                     (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
-            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize;
+            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -1140,7 +1140,7 @@ impl GlobalGarbageCollector {
                 }
             }
             let root_ref_count_ptr =
-                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize;
+                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
