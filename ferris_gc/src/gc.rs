@@ -994,16 +994,21 @@ pub(crate) enum GcObjMem {
     /// Compacted memory sub-allocation. The `Arc<CompactBlock>` keeps the
     /// contiguous buffer alive until all compacted objects are collected.
     Compact(*mut u8, Arc<CompactBlock>),
+    /// Part of a combined allocation (e.g. initial tracer co-allocated with
+    /// the object). No separate deallocation needed — freed with the object.
+    Inline,
 }
 
 impl GcObjMem {
     /// Return the raw pointer to the allocated memory, regardless of source.
+    /// Panics for `Inline` variant (no owned pointer).
     #[inline]
     pub(crate) fn ptr(&self) -> *mut u8 {
         match self {
             GcObjMem::Mem(p) => *p,
             GcObjMem::Tlab(p, _) => *p,
             GcObjMem::Compact(p, _) => *p,
+            GcObjMem::Inline => panic!("Inline GcObjMem has no owned pointer"),
         }
     }
 
@@ -1027,6 +1032,9 @@ impl GcObjMem {
             GcObjMem::Compact(_ptr, _block) => {
                 // Dropping the Arc<CompactBlock>. When all Arcs for this block
                 // are dropped, the CompactBlock::drop frees the entire buffer.
+            }
+            GcObjMem::Inline => {
+                // No-op: inline allocations are freed with their parent object.
             }
         }
     }
@@ -3350,6 +3358,36 @@ impl LocalGarbageCollector {
         }
     }
 
+    /// Try to allocate A and B in a single TLAB bump (combined allocation).
+    /// Returns `Some((ptr_a, ptr_b, combined_mem, combined_layout))` on success,
+    /// or `None` if the TLAB cannot satisfy the combined layout.
+    ///
+    /// # Safety
+    /// Both returned pointers must be initialized before use.
+    #[inline]
+    unsafe fn try_alloc_combined_tlab<A: Sized, B: Sized>(
+        &mut self,
+    ) -> Option<(*mut A, *mut B, GcObjMem, Layout)> {
+        let layout_a = Layout::new::<A>();
+        let layout_b = Layout::new::<B>();
+        let (combined, offset_b) = layout_a.extend(layout_b).ok()?;
+        let combined = combined.pad_to_align();
+
+        let tlab_result = if let Some(ref mut tlab) = self.tlab {
+            tlab.alloc_or_grow(combined)
+        } else {
+            let mut tlab = crate::tlab::Tlab::new()?;
+            let r = tlab.alloc(combined);
+            self.tlab = Some(tlab);
+            r
+        };
+        let (ptr, block) = tlab_result?;
+        let ptr_a = ptr as *mut A;
+        // SAFETY: offset_b is within the combined allocation.
+        let ptr_b = unsafe { ptr.add(offset_b) } as *mut B;
+        Some((ptr_a, ptr_b, GcObjMem::Tlab(ptr, block), combined))
+    }
+
     /// Try to allocate memory from the TLAB. Falls back to system allocator if
     /// the TLAB is exhausted or cannot be created.
     ///
@@ -3450,49 +3488,62 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem_tlab::<GcPtr<T>>();
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.alloc_mem_tlab::<GcInternal<T>>();
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
+            // Try combined allocation: [GcPtr<T> | GcInternal<T>] in one TLAB bump.
+            let (gc_ptr, gc_inter_ptr, obj_mem, obj_layout, tracer_info);
+            if let Some((a, b, mem, layout)) =
+                self.try_alloc_combined_tlab::<GcPtr<T>, GcInternal<T>>()
+            {
+                gc_ptr = a;
+                gc_inter_ptr = b;
+                obj_mem = mem;
+                obj_layout = layout;
+                tracer_info = TracerInfo {
+                    tracer_ptr: b as *const dyn Trace,
+                    mem: GcObjMem::Inline,
+                    layout: Layout::new::<GcInternal<T>>(),
+                };
+            } else {
+                // Fallback: separate allocations
+                let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<GcPtr<T>>();
+                let (b, (mem_b, layout_b)) = self.alloc_mem_tlab::<GcInternal<T>>();
+                gc_ptr = a;
+                gc_inter_ptr = b;
+                obj_mem = mem_a;
+                obj_layout = layout_a;
+                tracer_info = TracerInfo {
+                    tracer_ptr: b as *const dyn Trace,
+                    mem: mem_b,
+                    layout: layout_b,
+                };
+            }
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let gc_maps = self.core.gc_maps_unsync();
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: Pointer points to a valid, initialized GcPtr<T> that is being deallocated.
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
             unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: Pointer points to a valid GcPtr<T>; derives reference at call
-                    // time to avoid Stacked Borrows provenance issues.
                     (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
-            // SAFETY: gc_ptr was just initialized; root_ref_count lives at a fixed offset in GcInfo.
             let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
-                mem: mem_info_gc_ptr.0,
-                layout: mem_info_gc_ptr.1,
+                mem: obj_mem,
+                layout: obj_layout,
                 generation: Generation::Gen0,
                 survive_count: 0,
                 finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
-                tracers: TracerList::new(TracerInfo {
-                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                }),
+                tracers: TracerList::new(tracer_info),
                 region,
                 root_ref_count_ptr,
             });
-            // ptr_to_object, region stats, and card table are populated lazily
-            // (during marking/promotion), not on the allocation hot path.
-            self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
+            self.core.track_alloc(obj_layout.size());
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
 
             let gc = Gc {
@@ -3546,51 +3597,63 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.alloc_mem_tlab::<RefCell<GcPtr<T>>>();
-            let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                self.alloc_mem_tlab::<GcCellInternal<T>>();
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
+            let (gc_ptr, gc_cell_inter_ptr, obj_mem, obj_layout, tracer_info);
+            if let Some((a, b, mem, layout)) =
+                self.try_alloc_combined_tlab::<RefCell<GcPtr<T>>, GcCellInternal<T>>()
+            {
+                gc_ptr = a;
+                gc_cell_inter_ptr = b;
+                obj_mem = mem;
+                obj_layout = layout;
+                tracer_info = TracerInfo {
+                    tracer_ptr: b as *const dyn Trace,
+                    mem: GcObjMem::Inline,
+                    layout: Layout::new::<GcCellInternal<T>>(),
+                };
+            } else {
+                let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<RefCell<GcPtr<T>>>();
+                let (b, (mem_b, layout_b)) = self.alloc_mem_tlab::<GcCellInternal<T>>();
+                gc_ptr = a;
+                gc_cell_inter_ptr = b;
+                obj_mem = mem_a;
+                obj_layout = layout_a;
+                tracer_info = TracerInfo {
+                    tracer_ptr: b as *const dyn Trace,
+                    mem: mem_b,
+                    layout: layout_b,
+                };
+            }
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let gc_maps = self.core.gc_maps_unsync();
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: Pointer points to a valid, initialized RefCell<GcPtr<T>> that is being deallocated.
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
             unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: Pointer points to a valid RefCell<GcPtr<T>>; derives reference
-                    // at call time to avoid Stacked Borrows provenance issues.
                     (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
                         .t
                         .finalize();
                 }
             }
-            // SAFETY: gc_ptr was just initialized; as_ptr() gives stable pointer to inner GcPtr<T>.
             let root_ref_count_ptr =
                 &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
-                mem: mem_info_gc_ptr.0,
-                layout: mem_info_gc_ptr.1,
+                mem: obj_mem,
+                layout: obj_layout,
                 generation: Generation::Gen0,
                 survive_count: 0,
                 finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
-                tracers: TracerList::new(TracerInfo {
-                    tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                }),
+                tracers: TracerList::new(tracer_info),
                 region,
                 root_ref_count_ptr,
             });
-            // ptr_to_object, region stats, and card table are populated lazily
-            // (during marking/promotion), not on the allocation hot path.
-            self.core.track_alloc(mem_info_gc_ptr.1.size());
+            self.core.track_alloc(obj_layout.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
@@ -3652,57 +3715,67 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.try_alloc_mem_tlab::<GcPtr<T>>()?;
-            let (gc_inter_ptr, mem_info_internal_ptr) =
-                match self.try_alloc_mem_tlab::<GcInternal<T>>() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        mem_info_gc_ptr.0.dealloc_mem(mem_info_gc_ptr.1);
-                        return Err(e);
-                    }
+            let (gc_ptr, gc_inter_ptr, obj_mem, obj_layout, tracer_info);
+            if let Some((a, b, mem, layout)) =
+                self.try_alloc_combined_tlab::<GcPtr<T>, GcInternal<T>>()
+            {
+                gc_ptr = a;
+                gc_inter_ptr = b;
+                obj_mem = mem;
+                obj_layout = layout;
+                tracer_info = TracerInfo {
+                    tracer_ptr: b as *const dyn Trace,
+                    mem: GcObjMem::Inline,
+                    layout: Layout::new::<GcInternal<T>>(),
                 };
-            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
+            } else {
+                let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<GcPtr<T>>()?;
+                let (b, (mem_b, layout_b)) =
+                    match self.try_alloc_mem_tlab::<GcInternal<T>>() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            mem_a.dealloc_mem(layout_a);
+                            return Err(e);
+                        }
+                    };
+                gc_ptr = a;
+                gc_inter_ptr = b;
+                obj_mem = mem_a;
+                obj_layout = layout_a;
+                tracer_info = TracerInfo {
+                    tracer_ptr: b as *const dyn Trace,
+                    mem: mem_b,
+                    layout: layout_b,
+                };
+            }
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let gc_maps = self.core.gc_maps_unsync();
             unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: Pointer points to a valid, initialized GcPtr<T> that is being deallocated.
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
             unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: Pointer points to a valid GcPtr<T>; derives reference at call
-                    // time to avoid Stacked Borrows provenance issues.
                     (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
-            // SAFETY: gc_ptr was just initialized; root_ref_count lives at a fixed offset in GcInfo.
             let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
-                mem: mem_info_gc_ptr.0,
-                layout: mem_info_gc_ptr.1,
+                mem: obj_mem,
+                layout: obj_layout,
                 generation: Generation::Gen0,
                 survive_count: 0,
                 finalize_fn: finalize_gc_ptr::<T>,
                 drop_fn: drop_gc_ptr::<T>,
                 weak_alive: None,
-                tracers: TracerList::new(TracerInfo {
-                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                }),
+                tracers: TracerList::new(tracer_info),
                 region,
                 root_ref_count_ptr,
             });
-            // ptr_to_object, region stats, and card table are populated lazily
-            // (during marking/promotion), not on the allocation hot path.
-            self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
+            self.core.track_alloc(obj_layout.size());
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
 
             let gc = Gc {
@@ -3728,58 +3801,70 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, mem_info_gc_ptr) = self.try_alloc_mem_tlab::<RefCell<GcPtr<T>>>()?;
-            let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                match self.try_alloc_mem_tlab::<GcCellInternal<T>>() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        mem_info_gc_ptr.0.dealloc_mem(mem_info_gc_ptr.1);
-                        return Err(e);
-                    }
+            let (gc_ptr, gc_cell_inter_ptr, obj_mem, obj_layout, tracer_info);
+            if let Some((a, b, mem, layout)) =
+                self.try_alloc_combined_tlab::<RefCell<GcPtr<T>>, GcCellInternal<T>>()
+            {
+                gc_ptr = a;
+                gc_cell_inter_ptr = b;
+                obj_mem = mem;
+                obj_layout = layout;
+                tracer_info = TracerInfo {
+                    tracer_ptr: b as *const dyn Trace,
+                    mem: GcObjMem::Inline,
+                    layout: Layout::new::<GcCellInternal<T>>(),
                 };
-            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
+            } else {
+                let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<RefCell<GcPtr<T>>>()?;
+                let (b, (mem_b, layout_b)) =
+                    match self.try_alloc_mem_tlab::<GcCellInternal<T>>() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            mem_a.dealloc_mem(layout_a);
+                            return Err(e);
+                        }
+                    };
+                gc_ptr = a;
+                gc_cell_inter_ptr = b;
+                obj_mem = mem_a;
+                obj_layout = layout_a;
+                tracer_info = TracerInfo {
+                    tracer_ptr: b as *const dyn Trace,
+                    mem: mem_b,
+                    layout: layout_b,
+                };
+            }
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let gc_maps = self.core.gc_maps_unsync();
             unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: Pointer points to a valid, initialized RefCell<GcPtr<T>> that is being deallocated.
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
             unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: Pointer points to a valid RefCell<GcPtr<T>>; derives reference
-                    // at call time to avoid Stacked Borrows provenance issues.
                     (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
                         .t
                         .finalize();
                 }
             }
-            // SAFETY: gc_ptr was just initialized; as_ptr() gives stable pointer to inner GcPtr<T>.
             let root_ref_count_ptr =
                 &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize>;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
-                mem: mem_info_gc_ptr.0,
-                layout: mem_info_gc_ptr.1,
+                mem: obj_mem,
+                layout: obj_layout,
                 generation: Generation::Gen0,
                 survive_count: 0,
                 finalize_fn: finalize_gc_cell_ptr::<T>,
                 drop_fn: drop_gc_cell_ptr::<T>,
                 weak_alive: None,
-                tracers: TracerList::new(TracerInfo {
-                    tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                }),
+                tracers: TracerList::new(tracer_info),
                 region,
                 root_ref_count_ptr,
             });
-            // ptr_to_object, region stats, and card table are populated lazily
-            // (during marking/promotion), not on the allocation hot path.
-            self.core.track_alloc(mem_info_gc_ptr.1.size());
+            self.core.track_alloc(obj_layout.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(
