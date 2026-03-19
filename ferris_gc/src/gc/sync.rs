@@ -848,7 +848,7 @@ impl GlobalGarbageCollector {
                 generation: Generation::Gen0,
                 survive_count: 0,
                 dealloc_fn: dealloc_gc_ptr::<T>,
-                weak_alive: None,
+
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_inter_ptr as *const dyn Trace,
                     mem: mem_info_internal_ptr.0,
@@ -944,7 +944,7 @@ impl GlobalGarbageCollector {
                 generation: Generation::Gen0,
                 survive_count: 0,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
-                weak_alive: None,
+
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
                     mem: mem_info_internal_ptr.0,
@@ -1029,7 +1029,7 @@ impl GlobalGarbageCollector {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        mem_info_gc_ptr.0.dealloc_mem(mem_info_gc_ptr.1);
+                        mem_info_gc_ptr.0.dealloc_mem(gc_ptr as *mut u8, mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
@@ -1053,7 +1053,7 @@ impl GlobalGarbageCollector {
                 generation: Generation::Gen0,
                 survive_count: 0,
                 dealloc_fn: dealloc_gc_ptr::<T>,
-                weak_alive: None,
+
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_inter_ptr as *const dyn Trace,
                     mem: mem_info_internal_ptr.0,
@@ -1098,7 +1098,7 @@ impl GlobalGarbageCollector {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        mem_info_gc_ptr.0.dealloc_mem(mem_info_gc_ptr.1);
+                        mem_info_gc_ptr.0.dealloc_mem(gc_ptr as *mut u8, mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
@@ -1125,7 +1125,7 @@ impl GlobalGarbageCollector {
                 generation: Generation::Gen0,
                 survive_count: 0,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
-                weak_alive: None,
+
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
                     mem: mem_info_internal_ptr.0,

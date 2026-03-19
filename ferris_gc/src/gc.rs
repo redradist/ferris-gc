@@ -986,50 +986,39 @@ impl std::error::Error for GcAllocError {}
 /// - `Tlab` — sub-allocated from a TLAB block; freed by releasing the block's
 ///   non-atomic ref_count, which frees the entire block once all refs are gone.
 pub(crate) enum GcObjMem {
-    /// System-allocated memory.
-    Mem(*mut u8),
+    /// System-allocated memory. The raw pointer is derived from the owning
+    /// ObjectEntry/TracerInfo's fat `*const dyn Trace` thin pointer.
+    Mem,
     /// TLAB sub-allocation. The `*mut TlabBlock` holds a ref_count reference
     /// to the backing block. Call `TlabBlock::release` to decrement.
-    Tlab(*mut u8, *mut crate::tlab::TlabBlock),
+    Tlab(*mut crate::tlab::TlabBlock),
     /// Compacted memory sub-allocation. The `Arc<CompactBlock>` keeps the
     /// contiguous buffer alive until all compacted objects are collected.
-    Compact(*mut u8, Arc<CompactBlock>),
+    Compact(Arc<CompactBlock>),
     /// Part of a combined allocation (e.g. initial tracer co-allocated with
     /// the object). No separate deallocation needed — freed with the object.
     Inline,
 }
 
 impl GcObjMem {
-    /// Return the raw pointer to the allocated memory, regardless of source.
-    /// Panics for `Inline` variant (no owned pointer).
-    #[inline]
-    pub(crate) fn ptr(&self) -> *mut u8 {
-        match self {
-            GcObjMem::Mem(p) => *p,
-            GcObjMem::Tlab(p, _) => *p,
-            GcObjMem::Compact(p, _) => *p,
-            GcObjMem::Inline => panic!("Inline GcObjMem has no owned pointer"),
-        }
-    }
-
     /// Deallocate this memory. For `Mem`, calls `std::alloc::dealloc`.
     /// For `Tlab`, releases the block's ref_count (block freed when count hits 0).
     ///
     /// # Safety
-    /// For `Mem` variant, the pointer must have been allocated with the given layout.
+    /// For `Mem` variant, `ptr` must have been allocated with the given layout.
     /// The memory must not have been previously deallocated.
-    pub(crate) unsafe fn dealloc_mem(self, layout: Layout) {
+    pub(crate) unsafe fn dealloc_mem(self, ptr: *mut u8, layout: Layout) {
         match self {
-            GcObjMem::Mem(ptr) => {
+            GcObjMem::Mem => {
                 // SAFETY: Caller guarantees ptr was allocated with this layout.
                 unsafe { dealloc(ptr, layout) };
             }
-            GcObjMem::Tlab(_ptr, block) => {
+            GcObjMem::Tlab(block) => {
                 // SAFETY: block pointer is valid; decrement ref_count.
                 // When ref_count reaches 0, the block buffer is freed.
                 unsafe { crate::tlab::TlabBlock::release(block) };
             }
-            GcObjMem::Compact(_ptr, _block) => {
+            GcObjMem::Compact(_block) => {
                 // Dropping the Arc<CompactBlock>. When all Arcs for this block
                 // are dropped, the CompactBlock::drop frees the entire buffer.
             }
@@ -1207,7 +1196,6 @@ pub(crate) struct ObjectEntry {
     pub(crate) generation: Generation,
     pub(crate) survive_count: u32,
     pub(crate) dealloc_fn: DeallocFn,
-    pub(crate) weak_alive: Option<Arc<AtomicBool>>,
     /// All Gc<T>/GcCell<T> handles pointing to this object.
     /// RC hybrid: when tracers is empty, the object is eagerly deallocated.
     pub(crate) tracers: TracerList,
@@ -1224,6 +1212,10 @@ pub(crate) struct GcMaps {
     pub(crate) objects: SlotMap<ObjectId, ObjectEntry>,
     /// Maps thin object pointer → ObjectId for trace_children resolution.
     pub(crate) ptr_to_object: HashMap<usize, ObjectId>,
+    /// Weak-reference alive flags. Only populated for objects that have
+    /// weak references — most objects never need this, so keeping it
+    /// out of ObjectEntry saves 8B per object on the hot path.
+    pub(crate) weak_alive_map: HashMap<ObjectId, Arc<AtomicBool>>,
 }
 
 impl GcMaps {
@@ -1351,6 +1343,7 @@ impl GarbageCollector {
             gc_maps: UnsafeCell::new(GcMaps {
                 objects: SlotMap::new(),
                 ptr_to_object: HashMap::new(),
+                weak_alive_map: HashMap::new(),
             }),
             gc_maps_lock: Mutex::new(()),
             allocation_count: Cell::new(0),
@@ -1480,14 +1473,14 @@ impl GarbageCollector {
     /// The `ObjectEntry` must refer to a valid, initialized object that has been
     /// removed from the GC maps and is no longer reachable.
     unsafe fn dealloc_object_entry(entry: ObjectEntry) {
-        let mem_ptr = entry.mem.ptr();
+        let mem_ptr = entry.ptr.get_thin_ptr() as *mut u8;
         let dealloc_fn = entry.dealloc_fn;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: dealloc_fn finalizes then drops; wrapped in catch_unwind for panic safety.
             unsafe { (dealloc_fn)(mem_ptr) };
         }));
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
-        unsafe { entry.mem.dealloc_mem(entry.layout) };
+        unsafe { entry.mem.dealloc_mem(mem_ptr, entry.layout) };
     }
 
     /// Deallocate a tracer entry's memory.
@@ -1495,9 +1488,9 @@ impl GarbageCollector {
     /// # Safety
     /// The `GcObjMem` and `Layout` must refer to a valid allocation that has been
     /// removed from the GC maps.
-    unsafe fn dealloc_tracer_mem(mem: GcObjMem, layout: Layout) {
+    unsafe fn dealloc_tracer_mem(ptr: *mut u8, mem: GcObjMem, layout: Layout) {
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
-        unsafe { mem.dealloc_mem(layout) };
+        unsafe { mem.dealloc_mem(ptr, layout) };
     }
 
     pub(crate) unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout))
@@ -1511,7 +1504,7 @@ impl GarbageCollector {
             std::alloc::handle_alloc_error(layout);
         }
         let type_ptr: *mut T = mem as *mut _;
-        (type_ptr, (GcObjMem::Mem(mem), layout))
+        (type_ptr, (GcObjMem::Mem, layout))
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` instead of aborting on OOM.
@@ -1528,7 +1521,7 @@ impl GarbageCollector {
             return Err(GcAllocError);
         }
         let type_ptr: *mut T = mem as *mut _;
-        Ok((type_ptr, (GcObjMem::Mem(mem), layout)))
+        Ok((type_ptr, (GcObjMem::Mem, layout)))
     }
 
     /// Fallible allocation with emergency GC collection on first failure.
@@ -1554,10 +1547,11 @@ impl GarbageCollector {
     /// Get or create the alive flag for an object (used by weak references).
     pub(crate) fn get_or_create_weak_alive(&self, obj_id: ObjectId) -> Arc<AtomicBool> {
         let mut gc_maps = self.lock_gc_maps();
-        if let Some(entry) = gc_maps.objects.get_mut(obj_id) {
-            return entry
-                .weak_alive
-                .get_or_insert_with(|| Arc::new(AtomicBool::new(true)))
+        if gc_maps.objects.get(obj_id).is_some() {
+            return gc_maps
+                .weak_alive_map
+                .entry(obj_id)
+                .or_insert_with(|| Arc::new(AtomicBool::new(true)))
                 .clone();
         }
         Arc::new(AtomicBool::new(false))
@@ -1616,14 +1610,14 @@ impl GarbageCollector {
         card_table: &CardTable,
         object_id: ObjectId,
         tracer_ptr: *const u8,
-    ) -> (Option<(GcObjMem, Layout)>, Option<ObjectEntry>) {
+    ) -> (Option<(*mut u8, GcObjMem, Layout)>, Option<ObjectEntry>) {
         let mut tracer_dealloc = None;
         let mut object_dealloc = None;
 
         if let Some(obj_entry) = gc_maps.objects.get_mut(object_id) {
             // Find and remove the tracer matching tracer_ptr
             if let Some(removed) = obj_entry.tracers.remove_by_ptr(tracer_ptr) {
-                tracer_dealloc = Some((removed.mem, removed.layout));
+                tracer_dealloc = Some((removed.tracer_ptr.get_thin_ptr() as *mut u8, removed.mem, removed.layout));
 
                 // RC hybrid: eagerly dealloc object if no tracers remain
                 if obj_entry.tracers.is_empty() {
@@ -1639,7 +1633,7 @@ impl GarbageCollector {
                         card_table.remove_object(thin, object_id);
                     }
                     // Region stats are computed on-demand; no counters to decrement.
-                    if let Some(alive) = &obj_entry.weak_alive {
+                    if let Some(alive) = gc_maps.weak_alive_map.remove(&object_id) {
                         alive.store(false, Ordering::Release);
                     }
                     object_dealloc = Some(obj_entry);
@@ -1650,11 +1644,11 @@ impl GarbageCollector {
         (tracer_dealloc, object_dealloc)
     }
 
-    fn finalize_remove_tracer(&self, tracer_dealloc: Option<(GcObjMem, Layout)>, object_dealloc: Option<ObjectEntry>) {
+    fn finalize_remove_tracer(&self, tracer_dealloc: Option<(*mut u8, GcObjMem, Layout)>, object_dealloc: Option<ObjectEntry>) {
         // Dealloc tracer outside lock scope
-        if let Some((mem, layout)) = tracer_dealloc {
+        if let Some((ptr, mem, layout)) = tracer_dealloc {
             // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
-            unsafe { Self::dealloc_tracer_mem(mem, layout) };
+            unsafe { Self::dealloc_tracer_mem(ptr, mem, layout) };
         }
 
         // RC hybrid: dealloc object outside lock scope (prevents re-entrant deadlock)
@@ -1789,14 +1783,13 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        // Region stats are computed on-demand; no counters to decrement.
-                        if let Some(alive) = &entry.weak_alive {
+                        if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
                         // Drain tracers before consuming the object entry
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.mem, tracer.layout));
+                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
                         }
                         object_deallocs.push(entry);
                     }
@@ -1824,9 +1817,9 @@ impl GarbageCollector {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
             }
-            for (mem, layout) in tracer_deallocs {
+            for (ptr, mem, layout) in tracer_deallocs {
                 // SAFETY: Tracer has been removed from gc_maps and is unreachable.
-                Self::dealloc_tracer_mem(mem, layout);
+                Self::dealloc_tracer_mem(ptr, mem, layout);
             }
 
             // Track heap shrinkage
@@ -1857,14 +1850,15 @@ impl GarbageCollector {
                 let mut tracer_deallocs = Vec::new();
                 let obj_entries = gc_maps.objects.drain();
                 gc_maps.ptr_to_object.clear();
+                // Signal all weak refs as dead
+                for (_, alive) in gc_maps.weak_alive_map.drain() {
+                    alive.store(false, Ordering::Release);
+                }
                 let object_deallocs: Vec<_> = obj_entries
                     .into_iter()
                     .map(|(_, mut entry)| {
-                        if let Some(alive) = &entry.weak_alive {
-                            alive.store(false, Ordering::Release);
-                        }
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.mem, tracer.layout));
+                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
                         }
                         entry
                     })
@@ -1880,9 +1874,9 @@ impl GarbageCollector {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
             }
-            for (mem, layout) in tracer_deallocs {
+            for (ptr, mem, layout) in tracer_deallocs {
                 // SAFETY: Tracer has been removed from gc_maps and is unreachable.
-                Self::dealloc_tracer_mem(mem, layout);
+                Self::dealloc_tracer_mem(ptr, mem, layout);
             }
         }
     }
@@ -1986,12 +1980,12 @@ impl GarbageCollector {
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
                         // Region stats are computed on-demand; no counters to decrement.
-                        if let Some(alive) = &entry.weak_alive {
+                        if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.mem, tracer.layout));
+                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2042,6 +2036,7 @@ impl GarbageCollector {
             // (finalize, drop, dealloc) and each entry is disjoint — no two
             // entries alias the same memory.
             struct SendObjectDealloc {
+                ptr: *mut u8,
                 mem: GcObjMem,
                 layout: Layout,
                 dealloc_fn: DeallocFn,
@@ -2052,6 +2047,7 @@ impl GarbageCollector {
             unsafe impl Sync for SendObjectDealloc {}
 
             struct SendTracerDealloc {
+                ptr: *mut u8,
                 mem: GcObjMem,
                 layout: Layout,
             }
@@ -2061,30 +2057,34 @@ impl GarbageCollector {
 
             let obj_dealloc_items: Vec<SendObjectDealloc> = object_deallocs
                 .into_iter()
-                .map(|entry| SendObjectDealloc {
-                    mem: entry.mem,
-                    layout: entry.layout,
-                    dealloc_fn: entry.dealloc_fn,
+                .map(|entry| {
+                    let ptr = entry.ptr.get_thin_ptr() as *mut u8;
+                    SendObjectDealloc {
+                        ptr,
+                        mem: entry.mem,
+                        layout: entry.layout,
+                        dealloc_fn: entry.dealloc_fn,
+                    }
                 })
                 .collect();
 
             let tracer_dealloc_items: Vec<SendTracerDealloc> = tracer_deallocs
                 .into_iter()
-                .map(|(mem, layout)| SendTracerDealloc { mem, layout })
+                .map(|(ptr, mem, layout)| SendTracerDealloc { ptr, mem, layout })
                 .collect();
 
             obj_dealloc_items.into_par_iter().for_each(|item| {
-                let mem_ptr = item.mem.ptr();
+                let mem_ptr = item.ptr;
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // SAFETY: dealloc_fn finalizes+drops; wrapped in catch_unwind for panic safety.
                     (item.dealloc_fn)(mem_ptr);
                 }));
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
-                unsafe { item.mem.dealloc_mem(item.layout) };
+                unsafe { item.mem.dealloc_mem(item.ptr, item.layout) };
             });
             tracer_dealloc_items.into_par_iter().for_each(|item| {
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
-                unsafe { item.mem.dealloc_mem(item.layout) };
+                unsafe { item.mem.dealloc_mem(item.ptr, item.layout) };
             });
 
             // Track heap shrinkage
@@ -2211,12 +2211,12 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        if let Some(alive) = &entry.weak_alive {
+                        if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.mem, tracer.layout));
+                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2256,6 +2256,7 @@ impl GarbageCollector {
 
             // Parallel dealloc (same as collect_parallel)
             struct SendObjectDealloc {
+                ptr: *mut u8,
                 mem: GcObjMem,
                 layout: Layout,
                 dealloc_fn: DeallocFn,
@@ -2264,6 +2265,7 @@ impl GarbageCollector {
             unsafe impl Sync for SendObjectDealloc {}
 
             struct SendTracerDealloc {
+                ptr: *mut u8,
                 mem: GcObjMem,
                 layout: Layout,
             }
@@ -2272,30 +2274,34 @@ impl GarbageCollector {
 
             let obj_dealloc_items: Vec<SendObjectDealloc> = object_deallocs
                 .into_iter()
-                .map(|entry| SendObjectDealloc {
-                    mem: entry.mem,
-                    layout: entry.layout,
-                    dealloc_fn: entry.dealloc_fn,
+                .map(|entry| {
+                    let ptr = entry.ptr.get_thin_ptr() as *mut u8;
+                    SendObjectDealloc {
+                        ptr,
+                        mem: entry.mem,
+                        layout: entry.layout,
+                        dealloc_fn: entry.dealloc_fn,
+                    }
                 })
                 .collect();
 
             let tracer_dealloc_items: Vec<SendTracerDealloc> = tracer_deallocs
                 .into_iter()
-                .map(|(mem, layout)| SendTracerDealloc { mem, layout })
+                .map(|(ptr, mem, layout)| SendTracerDealloc { ptr, mem, layout })
                 .collect();
 
             obj_dealloc_items.into_par_iter().for_each(|item| {
-                let mem_ptr = item.mem.ptr();
+                let mem_ptr = item.ptr;
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // SAFETY: dealloc_fn finalizes+drops; wrapped in catch_unwind for panic safety.
                     (item.dealloc_fn)(mem_ptr);
                 }));
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
-                unsafe { item.mem.dealloc_mem(item.layout) };
+                unsafe { item.mem.dealloc_mem(item.ptr, item.layout) };
             });
             tracer_dealloc_items.into_par_iter().for_each(|item| {
                 // SAFETY: Tracer memory was allocated with the same layout via alloc/alloc_mem.
-                unsafe { item.mem.dealloc_mem(item.layout) };
+                unsafe { item.mem.dealloc_mem(item.ptr, item.layout) };
             });
 
             self.track_dealloc(stats.bytes_freed);
@@ -2514,12 +2520,12 @@ impl GarbageCollector {
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
                         // Region stats are computed on-demand; no counters to decrement.
-                        if let Some(alive) = &entry.weak_alive {
+                        if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.mem, tracer.layout));
+                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2552,9 +2558,9 @@ impl GarbageCollector {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
             }
-            for (mem, layout) in tracer_deallocs {
+            for (ptr, mem, layout) in tracer_deallocs {
                 // SAFETY: Tracer has been removed from gc_maps and is unreachable.
-                Self::dealloc_tracer_mem(mem, layout);
+                Self::dealloc_tracer_mem(ptr, mem, layout);
             }
 
             // Track heap shrinkage
@@ -2926,12 +2932,12 @@ impl GarbageCollector {
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
                         // Region stats are computed on-demand; no counters to decrement.
-                        if let Some(alive) = &entry.weak_alive {
+                        if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.mem, tracer.layout));
+                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2949,9 +2955,9 @@ impl GarbageCollector {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
             }
-            for (mem, layout) in tracer_deallocs {
+            for (ptr, mem, layout) in tracer_deallocs {
                 // SAFETY: Tracer has been removed from gc_maps and is unreachable.
-                Self::dealloc_tracer_mem(mem, layout);
+                Self::dealloc_tracer_mem(ptr, mem, layout);
             }
 
             // Track heap shrinkage
@@ -3094,12 +3100,12 @@ impl GarbageCollector {
                             gc_maps.ptr_to_object.remove(&thin);
                             self.card_table.remove_object(thin, *obj_id);
                             stats.bytes_freed += entry.layout.size();
-                            if let Some(alive) = &entry.weak_alive {
+                            if let Some(alive) = gc_maps.weak_alive_map.remove(obj_id) {
                                 alive.store(false, Ordering::Release);
                             }
                             stats.tracers_collected += entry.tracers.len();
                             for tracer in entry.tracers.drain() {
-                                tracer_deallocs.push((tracer.mem, tracer.layout));
+                                tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
                             }
                             object_deallocs.push(entry);
                         }
@@ -3121,9 +3127,9 @@ impl GarbageCollector {
                 // SAFETY: Object has been removed from gc_maps and is unreachable.
                 Self::dealloc_object_entry(entry);
             }
-            for (mem, layout) in tracer_deallocs {
+            for (ptr, mem, layout) in tracer_deallocs {
                 // SAFETY: Tracer has been removed from gc_maps and is unreachable.
-                Self::dealloc_tracer_mem(mem, layout);
+                Self::dealloc_tracer_mem(ptr, mem, layout);
             }
 
             // Track heap shrinkage
@@ -3218,7 +3224,7 @@ impl GarbageCollector {
                     .objects
                     .get(*id)
                     .expect("compact: object entry not found for id in obj_layouts");
-                let old_ptr = entry.mem.ptr();
+                let old_ptr = entry.ptr.get_thin_ptr() as *mut u8;
                 // SAFETY: offset is within compact_buf bounds (calculated from accumulated layout sizes).
                 let new_ptr = compact_buf.add(offset);
 
@@ -3241,7 +3247,7 @@ impl GarbageCollector {
                 layout: compact_layout,
             });
 
-            let mut old_mems: Vec<(GcObjMem, Layout)> = Vec::with_capacity(num_objects);
+            let mut old_mems: Vec<(*mut u8, GcObjMem, Layout)> = Vec::with_capacity(num_objects);
 
             for (id, _old_raw, new_raw, layout) in &relocations {
                 // Two-phase update: first update ObjectEntry (needs &mut objects),
@@ -3285,9 +3291,9 @@ impl GarbageCollector {
                     // avoiding double-drop of Arc refs in Compact/Tlab variants.
                     let old_mem = std::mem::replace(
                         &mut entry.mem,
-                        GcObjMem::Compact(*new_raw, compact_block.clone()),
+                        GcObjMem::Compact(compact_block.clone()),
                     );
-                    old_mems.push((old_mem, *layout));
+                    old_mems.push((old_thin as *mut u8, old_mem, *layout));
                     entry.layout = *layout;
 
                     (old_thin, new_thin)
@@ -3314,9 +3320,9 @@ impl GarbageCollector {
 
             drop(gc_maps);
 
-            for (mem, layout) in old_mems {
+            for (ptr, mem, layout) in old_mems {
                 // SAFETY: Old allocation is no longer in use; objects have been relocated to the compact buffer.
-                mem.dealloc_mem(layout);
+                mem.dealloc_mem(ptr, layout);
             }
 
             num_objects
@@ -3410,7 +3416,7 @@ impl LocalGarbageCollector {
         let ptr_a = ptr as *mut A;
         // SAFETY: offset_b is within the combined allocation.
         let ptr_b = unsafe { ptr.add(offset_b) } as *mut B;
-        Some((ptr_a, ptr_b, GcObjMem::Tlab(ptr, block), combined))
+        Some((ptr_a, ptr_b, GcObjMem::Tlab(block), combined))
     }
 
     /// Try to allocate memory from the TLAB. Falls back to system allocator if
@@ -3428,7 +3434,7 @@ impl LocalGarbageCollector {
         if let Some(ref mut tlab) = self.tlab {
             if let Some((ptr, block)) = tlab.alloc_or_grow(layout) {
                 let type_ptr: *mut T = ptr as *mut T;
-                return (type_ptr, (GcObjMem::Tlab(ptr, block), layout));
+                return (type_ptr, (GcObjMem::Tlab(block), layout));
             }
         } else {
             // Lazily initialize TLAB
@@ -3436,7 +3442,7 @@ impl LocalGarbageCollector {
                 if let Some((ptr, block)) = tlab.alloc(layout) {
                     let type_ptr: *mut T = ptr as *mut T;
                     self.tlab = Some(tlab);
-                    return (type_ptr, (GcObjMem::Tlab(ptr, block), layout));
+                    return (type_ptr, (GcObjMem::Tlab(block), layout));
                 }
                 self.tlab = Some(tlab);
             }
@@ -3460,7 +3466,7 @@ impl LocalGarbageCollector {
         if let Some(ref mut tlab) = self.tlab {
             if let Some((ptr, block)) = tlab.alloc_or_grow(layout) {
                 let type_ptr: *mut T = ptr as *mut T;
-                return Ok((type_ptr, (GcObjMem::Tlab(ptr, block), layout)));
+                return Ok((type_ptr, (GcObjMem::Tlab(block), layout)));
             }
         } else {
             // Lazily initialize TLAB
@@ -3468,7 +3474,7 @@ impl LocalGarbageCollector {
                 if let Some((ptr, block)) = tlab.alloc(layout) {
                     let type_ptr: *mut T = ptr as *mut T;
                     self.tlab = Some(tlab);
-                    return Ok((type_ptr, (GcObjMem::Tlab(ptr, block), layout)));
+                    return Ok((type_ptr, (GcObjMem::Tlab(block), layout)));
                 }
                 self.tlab = Some(tlab);
             }
@@ -3556,7 +3562,7 @@ impl LocalGarbageCollector {
                 generation: Generation::Gen0,
                 survive_count: 0,
                 dealloc_fn: dealloc_gc_ptr::<T>,
-                weak_alive: None,
+
                 tracers: tracer_list,
                 region,
                 root_ref_count_ptr,
@@ -3659,7 +3665,7 @@ impl LocalGarbageCollector {
                 generation: Generation::Gen0,
                 survive_count: 0,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
-                weak_alive: None,
+
                 tracers: tracer_list,
                 region,
                 root_ref_count_ptr,
@@ -3741,7 +3747,7 @@ impl LocalGarbageCollector {
                     match self.try_alloc_mem_tlab::<GcInternal<T>>() {
                         Ok(v) => v,
                         Err(e) => {
-                            mem_a.dealloc_mem(layout_a);
+                            mem_a.dealloc_mem(a as *mut u8, layout_a);
                             return Err(e);
                         }
                     };
@@ -3774,7 +3780,7 @@ impl LocalGarbageCollector {
                 generation: Generation::Gen0,
                 survive_count: 0,
                 dealloc_fn: dealloc_gc_ptr::<T>,
-                weak_alive: None,
+
                 tracers: tracer_list,
                 region,
                 root_ref_count_ptr,
@@ -3820,7 +3826,7 @@ impl LocalGarbageCollector {
                     match self.try_alloc_mem_tlab::<GcCellInternal<T>>() {
                         Ok(v) => v,
                         Err(e) => {
-                            mem_a.dealloc_mem(layout_a);
+                            mem_a.dealloc_mem(a as *mut u8, layout_a);
                             return Err(e);
                         }
                     };
@@ -3856,7 +3862,7 @@ impl LocalGarbageCollector {
                 generation: Generation::Gen0,
                 survive_count: 0,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
-                weak_alive: None,
+
                 tracers: tracer_list,
                 region,
                 root_ref_count_ptr,
@@ -4359,6 +4365,17 @@ mod tests {
         LOCAL_GC.with(|gc| unsafe {
             gc.borrow_mut().collect();
         });
+    }
+
+    #[test]
+    fn object_entry_size() {
+        // Track ObjectEntry size to catch regressions.
+        // After weak_alive move + GcObjMem ptr removal: should be ~96B.
+        let size = std::mem::size_of::<super::ObjectEntry>();
+        eprintln!("ObjectEntry size: {}B", size);
+        eprintln!("GcObjMem size: {}B", std::mem::size_of::<super::GcObjMem>());
+        eprintln!("TracerList size: {}B", std::mem::size_of::<super::TracerList>());
+        assert!(size <= 104, "ObjectEntry grew unexpectedly to {size}B");
     }
 
     #[test]
