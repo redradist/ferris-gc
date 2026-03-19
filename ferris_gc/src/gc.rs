@@ -1188,13 +1188,41 @@ impl Iterator for TracerDrain {
     }
 }
 
+/// Compact layout: size as u32, alignment as log2.
+/// Saves 8B vs std::alloc::Layout (8B vs 16B).
+#[derive(Clone, Copy)]
+pub(crate) struct CompactLayout {
+    size: u32,
+    align_shift: u8,
+}
+
+impl CompactLayout {
+    #[inline]
+    pub(crate) fn from_layout(layout: Layout) -> Self {
+        CompactLayout {
+            size: layout.size() as u32,
+            align_shift: layout.align().trailing_zeros() as u8,
+        }
+    }
+    #[inline]
+    pub(crate) fn size(self) -> usize {
+        self.size as usize
+    }
+    #[inline]
+    pub(crate) fn to_layout(self) -> Layout {
+        // SAFETY: Original Layout was valid; size fits in u32 (< 4GB),
+        // alignment is a power of two reconstructed from trailing_zeros.
+        unsafe { Layout::from_size_align_unchecked(self.size as usize, 1usize << self.align_shift) }
+    }
+}
+
 /// Per-object metadata stored in a contiguous SlotMap.
 pub(crate) struct ObjectEntry {
     pub(crate) ptr: *const dyn Trace,
     pub(crate) mem: GcObjMem,
-    pub(crate) layout: Layout,
-    pub(crate) generation: Generation,
-    pub(crate) survive_count: u32,
+    pub(crate) layout: CompactLayout,
+    /// Packed generation (bits 31:30) + survive_count (bits 29:0).
+    pub(crate) gen_survive: u32,
     pub(crate) dealloc_fn: DeallocFn,
     /// All Gc<T>/GcCell<T> handles pointing to this object.
     /// RC hybrid: when tracers is empty, the object is eagerly deallocated.
@@ -1205,6 +1233,38 @@ pub(crate) struct ObjectEntry {
     /// Allows inline mark-bit checks (is_traceable / clear_trace) without
     /// virtual dispatch through `*const dyn Trace`.
     pub(crate) root_ref_count_ptr: *const Cell<usize>,
+}
+
+impl ObjectEntry {
+    #[inline]
+    pub(crate) fn generation(&self) -> Generation {
+        match self.gen_survive >> 30 {
+            0 => Generation::Gen0,
+            1 => Generation::Gen1,
+            _ => Generation::Gen2,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_generation(&mut self, generation: Generation) {
+        self.gen_survive = (self.gen_survive & 0x3FFF_FFFF) | ((generation as u32) << 30);
+    }
+
+    #[inline]
+    pub(crate) fn survive_count(&self) -> u32 {
+        self.gen_survive & 0x3FFF_FFFF
+    }
+
+    #[inline]
+    pub(crate) fn set_survive_count(&mut self, count: u32) {
+        self.gen_survive = (self.gen_survive & 0xC000_0000) | (count & 0x3FFF_FFFF);
+    }
+
+    #[inline]
+    pub(crate) fn increment_survive_count(&mut self) {
+        let count = self.survive_count();
+        self.set_survive_count(count + 1);
+    }
 }
 
 /// Unified GC maps. Single Mutex protects all state to simplify locking.
@@ -1408,7 +1468,7 @@ impl GarbageCollector {
         let mut gen2 = 0usize;
         let mut heap_size = 0usize;
         for entry in gc_maps.objects.values() {
-            match entry.generation {
+            match entry.generation() {
                 Generation::Gen0 => gen0 += 1,
                 Generation::Gen1 => gen1 += 1,
                 Generation::Gen2 => gen2 += 1,
@@ -1480,7 +1540,7 @@ impl GarbageCollector {
             unsafe { (dealloc_fn)(mem_ptr) };
         }));
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
-        unsafe { entry.mem.dealloc_mem(mem_ptr, entry.layout) };
+        unsafe { entry.mem.dealloc_mem(mem_ptr, entry.layout.to_layout()) };
     }
 
     /// Deallocate a tracer entry's memory.
@@ -1565,7 +1625,7 @@ impl GarbageCollector {
         let thin = obj_ptr.get_thin_ptr();
         let gc_maps = self.lock_gc_maps();
         if let Some(entry) = gc_maps.objects.get(obj_id) {
-            if entry.generation > Generation::Gen0 {
+            if entry.generation() > Generation::Gen0 {
                 self.card_table.mark_dirty(thin);
             }
         }
@@ -1621,7 +1681,7 @@ impl GarbageCollector {
 
                 // RC hybrid: eagerly dealloc object if no tracers remain
                 if obj_entry.tracers.is_empty() {
-                    let obj_gen = obj_entry.generation;
+                    let obj_gen = obj_entry.generation();
                     let obj_entry = gc_maps.objects.remove(object_id).expect(
                         "remove_tracer: object entry not found after tracers became empty",
                     );
@@ -1701,7 +1761,7 @@ impl GarbageCollector {
                     }
                 } else {
                     for (_id, entry) in gc_maps.objects.iter() {
-                        if entry.generation <= max_gen {
+                        if entry.generation() <= max_gen {
                             // SAFETY: Object pointer is valid while gc_maps lock is held.
                             (&*entry.ptr).reset_root();
                         }
@@ -1741,7 +1801,7 @@ impl GarbageCollector {
                 let promo_cfg = self.promotion_config();
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
                 for (id, entry) in gc_maps.objects.iter_mut() {
-                    let in_scope = entry.generation <= max_gen;
+                    let in_scope = entry.generation() <= max_gen;
                     // SAFETY: root_ref_count_ptr points into a valid GcInfo allocation.
                     let marked = (*entry.root_ref_count_ptr).get() > 0;
 
@@ -1753,10 +1813,10 @@ impl GarbageCollector {
                             continue;
                         }
                         // Surviving in-scope object: promote.
-                        let cur_gen = entry.generation;
-                        entry.survive_count += 1;
-                        if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
-                            entry.survive_count = 0;
+                        let cur_gen = entry.generation();
+                        entry.increment_survive_count();
+                        if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
+                            entry.set_survive_count(0);
                             if let Some(next_gen) = cur_gen.next() {
                                 if cur_gen == Generation::Gen0 {
                                     // Register with card table on first promotion
@@ -1764,7 +1824,7 @@ impl GarbageCollector {
                                     let thin = entry.ptr.get_thin_ptr();
                                     self.card_table.register_object(thin, id);
                                 }
-                                entry.generation = next_gen;
+                                entry.set_generation(next_gen);
                                 stats.objects_promoted += 1;
                             }
                         }
@@ -1915,7 +1975,7 @@ impl GarbageCollector {
                     }
                 } else {
                     for (_id, entry) in gc_maps.objects.iter() {
-                        if entry.generation <= max_gen {
+                        if entry.generation() <= max_gen {
                             // SAFETY: Object pointer is valid while gc_maps lock is held.
                             (&*entry.ptr).reset_root();
                         }
@@ -1948,7 +2008,7 @@ impl GarbageCollector {
                 stats.objects_scanned = gc_maps
                     .objects
                     .iter()
-                    .filter(|(_, e)| e.generation <= max_gen)
+                    .filter(|(_, e)| e.generation() <= max_gen)
                     .count();
 
                 // No separate tracer sweep needed — dead tracers are collected
@@ -1960,7 +2020,7 @@ impl GarbageCollector {
                     .objects
                     .iter()
                     // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    .filter(|(_, e)| e.generation <= max_gen && !(&*e.ptr).is_traceable())
+                    .filter(|(_, e)| e.generation() <= max_gen && !(&*e.ptr).is_traceable())
                     .map(|(id, _)| id)
                     .collect();
                 stats.objects_collected = collected_objects.len();
@@ -1999,19 +2059,19 @@ impl GarbageCollector {
                 // Promotion: surviving in-scope objects (already filtered by removal above)
                 let promo_cfg = self.promotion_config();
                 for (obj_id, entry) in gc_maps.objects.iter_mut() {
-                    if entry.generation > max_gen {
+                    if entry.generation() > max_gen {
                         continue;
                     }
-                    let cur_gen = entry.generation;
-                    entry.survive_count += 1;
-                    if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
-                        entry.survive_count = 0;
+                    let cur_gen = entry.generation();
+                    entry.increment_survive_count();
+                    if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
+                        entry.set_survive_count(0);
                         if let Some(next_gen) = cur_gen.next() {
                             if cur_gen == Generation::Gen0 {
                                 let thin = entry.ptr.get_thin_ptr();
                                 self.card_table.register_object(thin, obj_id);
                             }
-                            entry.generation = next_gen;
+                            entry.set_generation(next_gen);
                             stats.objects_promoted += 1;
                         }
                     }
@@ -2062,7 +2122,7 @@ impl GarbageCollector {
                     SendObjectDealloc {
                         ptr,
                         mem: entry.mem,
-                        layout: entry.layout,
+                        layout: entry.layout.to_layout(),
                         dealloc_fn: entry.dealloc_fn,
                     }
                 })
@@ -2180,7 +2240,7 @@ impl GarbageCollector {
                 stats.objects_scanned = gc_maps
                     .objects
                     .iter()
-                    .filter(|(_, e)| e.generation <= max_gen)
+                    .filter(|(_, e)| e.generation() <= max_gen)
                     .count();
 
                 // No separate tracer sweep needed — dead tracers are collected
@@ -2192,7 +2252,7 @@ impl GarbageCollector {
                 let collected_objects: Vec<ObjectId> = gc_maps
                     .objects
                     .iter()
-                    .filter(|(_, e)| e.generation <= max_gen && !(&*e.ptr).is_traceable())
+                    .filter(|(_, e)| e.generation() <= max_gen && !(&*e.ptr).is_traceable())
                     .map(|(id, _)| id)
                     .collect();
                 stats.objects_collected = collected_objects.len();
@@ -2229,19 +2289,19 @@ impl GarbageCollector {
                 // Promotion: surviving in-scope objects (already filtered by removal above)
                 let promo_cfg = self.promotion_config();
                 for (obj_id, entry) in gc_maps.objects.iter_mut() {
-                    if entry.generation > max_gen {
+                    if entry.generation() > max_gen {
                         continue;
                     }
-                    let cur_gen = entry.generation;
-                    entry.survive_count += 1;
-                    if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
-                        entry.survive_count = 0;
+                    let cur_gen = entry.generation();
+                    entry.increment_survive_count();
+                    if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
+                        entry.set_survive_count(0);
                         if let Some(next_gen) = cur_gen.next() {
                             if cur_gen == Generation::Gen0 {
                                 let thin = entry.ptr.get_thin_ptr();
                                 self.card_table.register_object(thin, obj_id);
                             }
-                            entry.generation = next_gen;
+                            entry.set_generation(next_gen);
                             stats.objects_promoted += 1;
                         }
                     }
@@ -2279,7 +2339,7 @@ impl GarbageCollector {
                     SendObjectDealloc {
                         ptr,
                         mem: entry.mem,
-                        layout: entry.layout,
+                        layout: entry.layout.to_layout(),
                         dealloc_fn: entry.dealloc_fn,
                     }
                 })
@@ -2343,7 +2403,7 @@ impl GarbageCollector {
 
         // Initialize all in-scope objects as White
         for (obj_id, entry) in gc_maps.objects.iter() {
-            if entry.generation <= max_gen {
+            if entry.generation() <= max_gen {
                 incr.colors.insert(obj_id, MarkColor::White);
             }
         }
@@ -2484,7 +2544,7 @@ impl GarbageCollector {
                 let promo_cfg = self.promotion_config();
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
                 for (id, entry) in gc_maps.objects.iter_mut() {
-                    let in_scope = entry.generation <= max_gen;
+                    let in_scope = entry.generation() <= max_gen;
                     let marked = (*entry.root_ref_count_ptr).get() > 0;
 
                     if in_scope {
@@ -2493,16 +2553,16 @@ impl GarbageCollector {
                             collected_objects.push(id);
                             continue;
                         }
-                        let cur_gen = entry.generation;
-                        entry.survive_count += 1;
-                        if entry.survive_count >= promo_cfg.threshold_for(cur_gen) {
-                            entry.survive_count = 0;
+                        let cur_gen = entry.generation();
+                        entry.increment_survive_count();
+                        if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
+                            entry.set_survive_count(0);
                             if let Some(next_gen) = cur_gen.next() {
                                 if cur_gen == Generation::Gen0 {
                                     let thin = entry.ptr.get_thin_ptr();
                                     self.card_table.register_object(thin, id);
                                 }
-                                entry.generation = next_gen;
+                                entry.set_generation(next_gen);
                                 stats.objects_promoted += 1;
                             }
                         }
@@ -2702,7 +2762,7 @@ impl GarbageCollector {
         // Initialize all in-scope objects as White and snapshot their edges
         let mut children_buf = Vec::new();
         for (obj_id, entry) in gc_maps.objects.iter() {
-            if entry.generation <= max_gen {
+            if entry.generation() <= max_gen {
                 incr.colors.insert(obj_id, MarkColor::White);
                 children_buf.clear();
                 unsafe {
@@ -3178,7 +3238,7 @@ impl GarbageCollector {
             let mut total_size: usize = 0;
             let mut obj_layouts: Vec<(ObjectId, Layout)> = Vec::with_capacity(num_objects);
             for (id, entry) in gc_maps.objects.iter() {
-                let layout = entry.layout;
+                let layout = entry.layout.to_layout();
                 // Align up
                 let align_offset = total_size % layout.align();
                 if align_offset != 0 {
@@ -3294,7 +3354,7 @@ impl GarbageCollector {
                         GcObjMem::Compact(compact_block.clone()),
                     );
                     old_mems.push((old_thin as *mut u8, old_mem, *layout));
-                    entry.layout = *layout;
+                    entry.layout = CompactLayout::from_layout(*layout);
 
                     (old_thin, new_thin)
                 };
@@ -3558,9 +3618,8 @@ impl LocalGarbageCollector {
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
-                layout: obj_layout,
-                generation: Generation::Gen0,
-                survive_count: 0,
+                layout: CompactLayout::from_layout(obj_layout),
+                gen_survive: 0,
                 dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: tracer_list,
@@ -3661,9 +3720,8 @@ impl LocalGarbageCollector {
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
-                layout: obj_layout,
-                generation: Generation::Gen0,
-                survive_count: 0,
+                layout: CompactLayout::from_layout(obj_layout),
+                gen_survive: 0,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: tracer_list,
@@ -3776,9 +3834,8 @@ impl LocalGarbageCollector {
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
-                layout: obj_layout,
-                generation: Generation::Gen0,
-                survive_count: 0,
+                layout: CompactLayout::from_layout(obj_layout),
+                gen_survive: 0,
                 dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: tracer_list,
@@ -3858,9 +3915,8 @@ impl LocalGarbageCollector {
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
-                layout: obj_layout,
-                generation: Generation::Gen0,
-                survive_count: 0,
+                layout: CompactLayout::from_layout(obj_layout),
+                gen_survive: 0,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: tracer_list,
@@ -4375,7 +4431,7 @@ mod tests {
         eprintln!("ObjectEntry size: {}B", size);
         eprintln!("GcObjMem size: {}B", std::mem::size_of::<super::GcObjMem>());
         eprintln!("TracerList size: {}B", std::mem::size_of::<super::TracerList>());
-        assert!(size <= 104, "ObjectEntry grew unexpectedly to {size}B");
+        assert!(size <= 88, "ObjectEntry grew unexpectedly to {size}B");
     }
 
     #[test]
@@ -4697,7 +4753,7 @@ mod tests {
                 gc_maps
                     .objects
                     .values()
-                    .any(|e| e.generation == crate::generation::Generation::Gen0),
+                    .any(|e| e.generation() == crate::generation::Generation::Gen0),
                 "newly allocated objects should be in Gen0"
             );
         });
@@ -4726,7 +4782,7 @@ mod tests {
                     gc_maps
                         .objects
                         .values()
-                        .any(|e| e.generation == crate::generation::Generation::Gen1),
+                        .any(|e| e.generation() == crate::generation::Generation::Gen1),
                     "object should be promoted to Gen1 after surviving 3 Gen0 collections"
                 );
             }
@@ -4777,7 +4833,7 @@ mod tests {
                     gc_maps
                         .objects
                         .values()
-                        .all(|e| e.generation == crate::generation::Generation::Gen0),
+                        .all(|e| e.generation() == crate::generation::Generation::Gen0),
                     "object should still be in Gen0 after 2 survivals"
                 );
             }
@@ -4795,7 +4851,7 @@ mod tests {
                 gc_maps
                     .objects
                     .values()
-                    .any(|e| e.generation == crate::generation::Generation::Gen1),
+                    .any(|e| e.generation() == crate::generation::Generation::Gen1),
                 "object should be promoted to Gen1 after 3 survivals"
             );
         });
@@ -4830,7 +4886,7 @@ mod tests {
                 gc_maps
                     .objects
                     .values()
-                    .any(|e| e.generation == crate::generation::Generation::Gen2),
+                    .any(|e| e.generation() == crate::generation::Generation::Gen2),
                 "object should be promoted to Gen2 after surviving Gen1 threshold"
             );
         });
@@ -4902,7 +4958,7 @@ mod tests {
                 gc_maps
                     .objects
                     .values()
-                    .any(|e| e.generation == crate::generation::Generation::Gen1),
+                    .any(|e| e.generation() == crate::generation::Generation::Gen1),
                 "cell should be promoted to Gen1 after 3 Gen0 collections"
             );
         });
@@ -5344,7 +5400,7 @@ mod tests {
                 gc_maps
                     .objects
                     .values()
-                    .any(|e| e.generation == crate::generation::Generation::Gen1),
+                    .any(|e| e.generation() == crate::generation::Generation::Gen1),
                 "incremental collection should promote survivors"
             );
         });

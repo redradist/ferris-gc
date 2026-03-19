@@ -6,8 +6,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::basic_gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
-use crate::gc::{Finalize, GarbageCollector, ObjectEntry, Trace, TracerInfo, TracerList};
-use crate::generation::Generation;
+use crate::gc::{CompactLayout, Finalize, GarbageCollector, ObjectEntry, Trace, TracerInfo, TracerList};
 use crate::slot_map::ObjectId;
 
 /// Convenience alias for an optional thread-safe GC pointer.
@@ -844,9 +843,8 @@ impl GlobalGarbageCollector {
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
-                layout: mem_info_gc_ptr.1,
-                generation: Generation::Gen0,
-                survive_count: 0,
+                layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
+                gen_survive: 0,
                 dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
@@ -940,9 +938,8 @@ impl GlobalGarbageCollector {
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
-                layout: mem_info_gc_ptr.1,
-                generation: Generation::Gen0,
-                survive_count: 0,
+                layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
+                gen_survive: 0,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
@@ -1049,9 +1046,8 @@ impl GlobalGarbageCollector {
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
-                layout: mem_info_gc_ptr.1,
-                generation: Generation::Gen0,
-                survive_count: 0,
+                layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
+                gen_survive: 0,
                 dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
@@ -1121,9 +1117,8 @@ impl GlobalGarbageCollector {
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
-                layout: mem_info_gc_ptr.1,
-                generation: Generation::Gen0,
-                survive_count: 0,
+                layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
+                gen_survive: 0,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
