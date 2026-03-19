@@ -832,17 +832,12 @@ impl GlobalGarbageCollector {
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let mut gc_maps = self.core.lock_gc_maps();
-            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
+            unsafe fn dealloc_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: ptr was originally allocated as a GcPtr<T> and has not been dropped yet.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*(ptr as *const GcPtr<T>)).t.finalize();
+                    }));
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
-                }
-            }
-            unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    // SAFETY: Pointer points to a valid GcPtr<T>; derives reference at call
-                    // time to avoid Stacked Borrows provenance issues.
-                    (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
             let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
@@ -852,8 +847,7 @@ impl GlobalGarbageCollector {
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalize_fn: finalize_gc_ptr::<T>,
-                drop_fn: drop_gc_ptr::<T>,
+                dealloc_fn: dealloc_gc_ptr::<T>,
                 weak_alive: None,
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_inter_ptr as *const dyn Trace,
@@ -931,19 +925,14 @@ impl GlobalGarbageCollector {
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let mut gc_maps = self.core.lock_gc_maps();
-            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
+            unsafe fn dealloc_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: ptr was originally allocated as a RefCell<GcPtr<T>> and has not been dropped yet.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
+                            .t
+                            .finalize();
+                    }));
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
-                }
-            }
-            unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    // SAFETY: Pointer points to a valid RefCell<GcPtr<T>>; derives reference
-                    // at call time to avoid Stacked Borrows provenance issues.
-                    (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
-                        .t
-                        .finalize();
                 }
             }
             let root_ref_count_ptr =
@@ -954,8 +943,7 @@ impl GlobalGarbageCollector {
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalize_fn: finalize_gc_cell_ptr::<T>,
-                drop_fn: drop_gc_cell_ptr::<T>,
+                dealloc_fn: dealloc_gc_cell_ptr::<T>,
                 weak_alive: None,
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
@@ -1049,17 +1037,12 @@ impl GlobalGarbageCollector {
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let mut gc_maps = self.core.lock_gc_maps();
-            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
+            unsafe fn dealloc_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: ptr was originally allocated as a GcPtr<T> and has not been dropped yet.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*(ptr as *const GcPtr<T>)).t.finalize();
+                    }));
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
-                }
-            }
-            unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    // SAFETY: Pointer points to a valid GcPtr<T>; derives reference at call
-                    // time to avoid Stacked Borrows provenance issues.
-                    (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
             let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
@@ -1069,8 +1052,7 @@ impl GlobalGarbageCollector {
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalize_fn: finalize_gc_ptr::<T>,
-                drop_fn: drop_gc_ptr::<T>,
+                dealloc_fn: dealloc_gc_ptr::<T>,
                 weak_alive: None,
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_inter_ptr as *const dyn Trace,
@@ -1124,19 +1106,14 @@ impl GlobalGarbageCollector {
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let mut gc_maps = self.core.lock_gc_maps();
-            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
+            unsafe fn dealloc_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
-                    // SAFETY: ptr was originally allocated as a RefCell<GcPtr<T>> and has not been dropped yet.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
+                            .t
+                            .finalize();
+                    }));
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
-                }
-            }
-            unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    // SAFETY: Pointer points to a valid RefCell<GcPtr<T>>; derives reference
-                    // at call time to avoid Stacked Borrows provenance issues.
-                    (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
-                        .t
-                        .finalize();
                 }
             }
             let root_ref_count_ptr =
@@ -1147,8 +1124,7 @@ impl GlobalGarbageCollector {
                 layout: mem_info_gc_ptr.1,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalize_fn: finalize_gc_cell_ptr::<T>,
-                drop_fn: drop_gc_cell_ptr::<T>,
+                dealloc_fn: dealloc_gc_cell_ptr::<T>,
                 weak_alive: None,
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,

@@ -1040,11 +1040,9 @@ impl GcObjMem {
     }
 }
 
-pub(crate) type DropFn = unsafe fn(*mut u8);
-/// Function pointer that calls `finalize()` on the object at the given memory address.
-/// Derives the `&dyn Finalize` reference at call time to avoid Stacked Borrows
-/// provenance issues from storing a pre-computed `*const dyn Finalize`.
-pub(crate) type FinalizeFn = unsafe fn(*mut u8);
+/// Combined finalize + drop function pointer. Called during deallocation.
+/// Finalizes the object first (catching panics), then drops it.
+pub(crate) type DeallocFn = unsafe fn(*mut u8);
 
 /// Per-tracer metadata stored inline in ObjectEntry's tracers Vec.
 pub(crate) struct TracerInfo {
@@ -1053,36 +1051,56 @@ pub(crate) struct TracerInfo {
     pub(crate) layout: Layout,
 }
 
-/// Inline-optimized tracer list: stores the first tracer inline (no heap alloc),
-/// spills to a Vec only when clones add additional tracers.
+/// Inline-optimized tracer list: stores the first tracer pointer inline (16B),
+/// boxing full TracerInfo only for non-inline or clone tracers.
+/// Sized to 24B instead of 56B, saving 32B per ObjectEntry.
 pub(crate) enum TracerList {
-    /// Common case: exactly one tracer (no heap allocation).
-    One(TracerInfo),
-    /// Overflow: multiple tracers (e.g. after Gc::clone).
-    Many(Vec<TracerInfo>),
+    /// Common case: single tracer with inline memory (GcObjMem::Inline).
+    /// Only the pointer is needed — no dealloc info required.
+    Inline(*const dyn Trace),
+    /// Single tracer with separate allocation (needs dealloc info).
+    One(Box<TracerInfo>),
+    /// Multiple tracers (e.g. after Gc::clone). Heap-allocated.
+    Many(Box<Vec<TracerInfo>>),
     /// Sentinel for drain operations.
     Empty,
 }
 
 impl TracerList {
+    /// Create a TracerList for a tracer with a separate allocation.
     #[inline]
     fn new(t: TracerInfo) -> Self {
-        TracerList::One(t)
+        TracerList::One(Box::new(t))
+    }
+
+    /// Create a TracerList for an inline tracer (GcObjMem::Inline).
+    #[inline]
+    fn new_inline(ptr: *const dyn Trace) -> Self {
+        TracerList::Inline(ptr)
     }
 
     #[inline]
     fn push(&mut self, t: TracerInfo) {
         *self = match std::mem::replace(self, TracerList::Empty) {
-            TracerList::One(first) => TracerList::Many(vec![first, t]),
+            TracerList::Inline(ptr) => {
+                // Synthesize TracerInfo for the inline tracer (dealloc is no-op)
+                let first = TracerInfo {
+                    tracer_ptr: ptr,
+                    mem: GcObjMem::Inline,
+                    layout: Layout::new::<()>(),
+                };
+                TracerList::Many(Box::new(vec![first, t]))
+            }
+            TracerList::One(first) => TracerList::Many(Box::new(vec![*first, t])),
             TracerList::Many(mut v) => { v.push(t); TracerList::Many(v) }
-            TracerList::Empty => TracerList::One(t),
+            TracerList::Empty => TracerList::One(Box::new(t)),
         };
     }
 
     #[inline]
     fn len(&self) -> usize {
         match self {
-            TracerList::One(_) => 1,
+            TracerList::Inline(_) | TracerList::One(_) => 1,
             TracerList::Many(v) => v.len(),
             TracerList::Empty => 0,
         }
@@ -1093,11 +1111,14 @@ impl TracerList {
         matches!(self, TracerList::Empty)
     }
 
-    fn iter(&self) -> TracerListIter<'_> {
+    /// Call a closure for each tracer pointer.
+    #[inline]
+    fn for_each_tracer<F: FnMut(*const dyn Trace)>(&self, mut f: F) {
         match self {
-            TracerList::One(t) => TracerListIter::One(std::iter::once(t)),
-            TracerList::Many(v) => TracerListIter::Many(v.iter()),
-            TracerList::Empty => TracerListIter::Many([].iter()),
+            TracerList::Inline(ptr) => f(*ptr),
+            TracerList::One(t) => f(t.tracer_ptr),
+            TracerList::Many(v) => { for t in v.iter() { f(t.tracer_ptr); } }
+            TracerList::Empty => {}
         }
     }
 
@@ -1105,10 +1126,23 @@ impl TracerList {
     /// Returns the removed TracerInfo, or None if not found.
     fn remove_by_ptr(&mut self, ptr: *const u8) -> Option<TracerInfo> {
         match self {
+            TracerList::Inline(t) => {
+                if (*t as *const u8) == ptr {
+                    let t = *t;
+                    *self = TracerList::Empty;
+                    Some(TracerInfo {
+                        tracer_ptr: t,
+                        mem: GcObjMem::Inline,
+                        layout: Layout::new::<()>(),
+                    })
+                } else {
+                    None
+                }
+            }
             TracerList::One(t) => {
                 if (t.tracer_ptr as *const u8) == ptr {
                     if let TracerList::One(t) = std::mem::replace(self, TracerList::Empty) {
-                        Some(t)
+                        Some(*t)
                     } else {
                         unreachable!()
                     }
@@ -1121,7 +1155,8 @@ impl TracerList {
                     let removed = v.swap_remove(pos);
                     if v.len() == 1 {
                         if let TracerList::Many(mut v) = std::mem::replace(self, TracerList::Empty) {
-                            *self = TracerList::One(v.pop().unwrap());
+                            let last = v.pop().unwrap();
+                            *self = TracerList::One(Box::new(last));
                         }
                     }
                     Some(removed)
@@ -1134,26 +1169,32 @@ impl TracerList {
     }
 
     /// Drain all tracers out, leaving Empty.
-    fn drain(&mut self) -> Vec<TracerInfo> {
+    fn drain(&mut self) -> TracerDrain {
         match std::mem::replace(self, TracerList::Empty) {
-            TracerList::One(t) => vec![t],
-            TracerList::Many(v) => v,
-            TracerList::Empty => Vec::new(),
+            TracerList::Inline(ptr) => TracerDrain::One(Some(TracerInfo {
+                tracer_ptr: ptr,
+                mem: GcObjMem::Inline,
+                layout: Layout::new::<()>(),
+            })),
+            TracerList::One(t) => TracerDrain::One(Some(*t)),
+            TracerList::Many(v) => TracerDrain::Many(v.into_iter()),
+            TracerList::Empty => TracerDrain::One(None),
         }
     }
 }
 
-pub(crate) enum TracerListIter<'a> {
-    One(std::iter::Once<&'a TracerInfo>),
-    Many(std::slice::Iter<'a, TracerInfo>),
+/// Iterator returned by TracerList::drain().
+pub(crate) enum TracerDrain {
+    One(Option<TracerInfo>),
+    Many(std::vec::IntoIter<TracerInfo>),
 }
 
-impl<'a> Iterator for TracerListIter<'a> {
-    type Item = &'a TracerInfo;
-    fn next(&mut self) -> Option<Self::Item> {
+impl Iterator for TracerDrain {
+    type Item = TracerInfo;
+    fn next(&mut self) -> Option<TracerInfo> {
         match self {
-            TracerListIter::One(it) => it.next(),
-            TracerListIter::Many(it) => it.next(),
+            TracerDrain::One(opt) => opt.take(),
+            TracerDrain::Many(it) => it.next(),
         }
     }
 }
@@ -1165,8 +1206,7 @@ pub(crate) struct ObjectEntry {
     pub(crate) layout: Layout,
     pub(crate) generation: Generation,
     pub(crate) survive_count: u32,
-    pub(crate) finalize_fn: FinalizeFn,
-    pub(crate) drop_fn: DropFn,
+    pub(crate) dealloc_fn: DeallocFn,
     pub(crate) weak_alive: Option<Arc<AtomicBool>>,
     /// All Gc<T>/GcCell<T> handles pointing to this object.
     /// RC hybrid: when tracers is empty, the object is eagerly deallocated.
@@ -1441,15 +1481,10 @@ impl GarbageCollector {
     /// removed from the GC maps and is no longer reachable.
     unsafe fn dealloc_object_entry(entry: ObjectEntry) {
         let mem_ptr = entry.mem.ptr();
-        let finalize_fn = entry.finalize_fn;
-        let drop_fn = entry.drop_fn;
+        let dealloc_fn = entry.dealloc_fn;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: finalize_fn and mem_ptr are valid; wrapped in catch_unwind for panic safety.
-            unsafe { (finalize_fn)(mem_ptr) };
-        }));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
-            unsafe { (drop_fn)(mem_ptr) };
+            // SAFETY: dealloc_fn finalizes then drops; wrapped in catch_unwind for panic safety.
+            unsafe { (dealloc_fn)(mem_ptr) };
         }));
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
         unsafe { entry.mem.dealloc_mem(entry.layout) };
@@ -1596,10 +1631,11 @@ impl GarbageCollector {
                     let obj_entry = gc_maps.objects.remove(object_id).expect(
                         "remove_tracer: object entry not found after tracers became empty",
                     );
-                    let thin = obj_entry.ptr.get_thin_ptr();
-                    gc_maps.ptr_to_object.remove(&thin);
+                    // Skip ptr_to_object.remove — it's rebuilt lazily before any
+                    // code that reads it (incremental/concurrent marking).
                     // Only clean card table for promoted objects (Gen0 objects are never registered).
                     if obj_gen != Generation::Gen0 {
+                        let thin = obj_entry.ptr.get_thin_ptr();
                         card_table.remove_object(thin, object_id);
                     }
                     // Region stats are computed on-demand; no counters to decrement.
@@ -1681,13 +1717,13 @@ impl GarbageCollector {
                 // Mark phase: trace from ALL roots (needed for correctness —
                 // Gen1+ roots may reference Gen0 objects through pre-promotion edges).
                 for obj_entry in gc_maps.objects.values() {
-                    for tracer in obj_entry.tracers.iter() {
+                    obj_entry.tracers.for_each_tracer(|tracer_ptr| {
                         // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        let t = &(*tracer.tracer_ptr);
+                        let t = &(*tracer_ptr);
                         if t.is_root() {
                             t.trace();
                         }
-                    }
+                    });
                 }
 
                 // For partial collections, also trace from dirty card table entries.
@@ -1894,13 +1930,13 @@ impl GarbageCollector {
 
                 // Mark phase: trace from ALL roots.
                 for obj_entry in gc_maps.objects.values() {
-                    for tracer in obj_entry.tracers.iter() {
+                    obj_entry.tracers.for_each_tracer(|tracer_ptr| {
                         // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        let t = &(*tracer.tracer_ptr);
+                        let t = &(*tracer_ptr);
                         if t.is_root() {
                             t.trace();
                         }
-                    }
+                    });
                 }
 
                 // For partial collections, also trace from dirty card table entries.
@@ -2008,12 +2044,10 @@ impl GarbageCollector {
             struct SendObjectDealloc {
                 mem: GcObjMem,
                 layout: Layout,
-                finalize_fn: FinalizeFn,
-                drop_fn: DropFn,
+                dealloc_fn: DeallocFn,
             }
             // SAFETY: Each SendObjectDealloc owns a unique allocation.
-            // The raw pointer is only used for finalize/drop/dealloc and is
-            // never shared between threads.
+            // The raw pointer is only used for dealloc and is never shared between threads.
             unsafe impl Send for SendObjectDealloc {}
             unsafe impl Sync for SendObjectDealloc {}
 
@@ -2030,8 +2064,7 @@ impl GarbageCollector {
                 .map(|entry| SendObjectDealloc {
                     mem: entry.mem,
                     layout: entry.layout,
-                    finalize_fn: entry.finalize_fn,
-                    drop_fn: entry.drop_fn,
+                    dealloc_fn: entry.dealloc_fn,
                 })
                 .collect();
 
@@ -2043,12 +2076,8 @@ impl GarbageCollector {
             obj_dealloc_items.into_par_iter().for_each(|item| {
                 let mem_ptr = item.mem.ptr();
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: finalize_fn and mem are valid; wrapped in catch_unwind for panic safety.
-                    (item.finalize_fn)(mem_ptr);
-                }));
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: Drop function and memory pointer are valid; wrapped in catch_unwind for panic safety.
-                    (item.drop_fn)(mem_ptr);
+                    // SAFETY: dealloc_fn finalizes+drops; wrapped in catch_unwind for panic safety.
+                    (item.dealloc_fn)(mem_ptr);
                 }));
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
                 unsafe { item.mem.dealloc_mem(item.layout) };
@@ -2122,13 +2151,14 @@ impl GarbageCollector {
                 unsafe impl Sync for SendTracePtr {}
 
                 // SAFETY: Tracer pointers are valid while gc_maps lock is held.
-                let root_tracers: Vec<SendTracePtr> = gc_maps
-                    .objects
-                    .values()
-                    .flat_map(|obj| obj.tracers.iter())
-                    .filter(|t| (&*t.tracer_ptr).is_root())
-                    .map(|t| SendTracePtr(t.tracer_ptr))
-                    .collect();
+                let mut root_tracers: Vec<SendTracePtr> = Vec::new();
+                for obj in gc_maps.objects.values() {
+                    obj.tracers.for_each_tracer(|tracer_ptr| {
+                        if (&*tracer_ptr).is_root() {
+                            root_tracers.push(SendTracePtr(tracer_ptr));
+                        }
+                    });
+                }
 
                 // SAFETY: Tracer pointers are valid; STW lock prevents concurrent mutation.
                 root_tracers.par_iter().for_each(|stp| {
@@ -2228,8 +2258,7 @@ impl GarbageCollector {
             struct SendObjectDealloc {
                 mem: GcObjMem,
                 layout: Layout,
-                finalize_fn: FinalizeFn,
-                drop_fn: DropFn,
+                dealloc_fn: DeallocFn,
             }
             unsafe impl Send for SendObjectDealloc {}
             unsafe impl Sync for SendObjectDealloc {}
@@ -2246,8 +2275,7 @@ impl GarbageCollector {
                 .map(|entry| SendObjectDealloc {
                     mem: entry.mem,
                     layout: entry.layout,
-                    finalize_fn: entry.finalize_fn,
-                    drop_fn: entry.drop_fn,
+                    dealloc_fn: entry.dealloc_fn,
                 })
                 .collect();
 
@@ -2258,12 +2286,9 @@ impl GarbageCollector {
 
             obj_dealloc_items.into_par_iter().for_each(|item| {
                 let mem_ptr = item.mem.ptr();
-                // SAFETY: finalize_fn/drop_fn and mem_ptr are valid; wrapped in catch_unwind for panic safety.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (item.finalize_fn)(mem_ptr);
-                }));
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (item.drop_fn)(mem_ptr);
+                    // SAFETY: dealloc_fn finalizes+drops; wrapped in catch_unwind for panic safety.
+                    (item.dealloc_fn)(mem_ptr);
                 }));
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
                 unsafe { item.mem.dealloc_mem(item.layout) };
@@ -2319,10 +2344,10 @@ impl GarbageCollector {
 
         // Gray objects reachable from root tracers
         for (obj_id, obj_entry) in gc_maps.objects.iter() {
-            for tracer in obj_entry.tracers.iter() {
+            obj_entry.tracers.for_each_tracer(|tracer_ptr| {
                 unsafe {
                     // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    let t = &(*tracer.tracer_ptr);
+                    let t = &(*tracer_ptr);
                     if t.is_root() {
                         if let Some(color) = incr.colors.get_mut(&obj_id) {
                             if *color == MarkColor::White {
@@ -2332,7 +2357,7 @@ impl GarbageCollector {
                         }
                     }
                 }
-            }
+            });
         }
     }
 
@@ -2415,13 +2440,13 @@ impl GarbageCollector {
 
                 // Mark from all root tracers using trace() (same as collect_generation).
                 for obj_entry in gc_maps.objects.values() {
-                    for tracer in obj_entry.tracers.iter() {
+                    obj_entry.tracers.for_each_tracer(|tracer_ptr| {
                         // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        let t = &(*tracer.tracer_ptr);
+                        let t = &(*tracer_ptr);
                         if t.is_root() {
                             t.trace();
                         }
-                    }
+                    });
                 }
 
                 // For partial collections, also trace from dirty card table entries.
@@ -2688,10 +2713,10 @@ impl GarbageCollector {
 
         // Gray objects reachable from root tracers
         for (obj_id, obj_entry) in gc_maps.objects.iter() {
-            for tracer in obj_entry.tracers.iter() {
+            obj_entry.tracers.for_each_tracer(|tracer_ptr| {
                 unsafe {
                     // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                    let t = &(*tracer.tracer_ptr);
+                    let t = &(*tracer_ptr);
                     if t.is_root() {
                         if let Some(color) = incr.colors.get_mut(&obj_id) {
                             if *color == MarkColor::White {
@@ -2701,7 +2726,7 @@ impl GarbageCollector {
                         }
                     }
                 }
-            }
+            });
         }
     }
 
@@ -2853,13 +2878,13 @@ impl GarbageCollector {
 
                 // Mark phase: trace from ALL roots
                 for obj_entry in gc_maps.objects.values() {
-                    for tracer in obj_entry.tracers.iter() {
+                    obj_entry.tracers.for_each_tracer(|tracer_ptr| {
                         // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        let t = &(*tracer.tracer_ptr);
+                        let t = &(*tracer_ptr);
                         if t.is_root() {
                             t.trace();
                         }
-                    }
+                    });
                 }
 
                 // Also trace from dirty card table entries
@@ -2999,13 +3024,13 @@ impl GarbageCollector {
 
                 // Mark from all roots
                 for obj_entry in gc_maps.objects.values() {
-                    for tracer in obj_entry.tracers.iter() {
+                    obj_entry.tracers.for_each_tracer(|tracer_ptr| {
                         // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        let t = &(*tracer.tracer_ptr);
+                        let t = &(*tracer_ptr);
                         if t.is_root() {
                             t.trace();
                         }
-                    }
+                    });
                 }
 
                 stats.objects_scanned = gc_maps.objects.len();
@@ -3279,12 +3304,12 @@ impl GarbageCollector {
 
             // Relocate tracer pointers: tell each GcInternal to update its gc_ptr field
             for (_obj_id, obj_entry) in gc_maps.objects.iter() {
-                for tracer in obj_entry.tracers.iter() {
+                obj_entry.tracers.for_each_tracer(|tracer_ptr| {
                     for (_, old_raw, new_raw, _) in &relocations {
                         // SAFETY: tracer_ptr is valid while gc_maps lock is held; relocate is called during STW with exclusive access.
-                        (&*tracer.tracer_ptr).relocate(*old_raw, *new_raw);
+                        (&*tracer_ptr).relocate(*old_raw, *new_raw);
                     }
-                }
+                });
             }
 
             drop(gc_maps);
@@ -3489,7 +3514,7 @@ impl LocalGarbageCollector {
     {
         unsafe {
             // Try combined allocation: [GcPtr<T> | GcInternal<T>] in one TLAB bump.
-            let (gc_ptr, gc_inter_ptr, obj_mem, obj_layout, tracer_info);
+            let (gc_ptr, gc_inter_ptr, obj_mem, obj_layout, tracer_list);
             if let Some((a, b, mem, layout)) =
                 self.try_alloc_combined_tlab::<GcPtr<T>, GcInternal<T>>()
             {
@@ -3497,11 +3522,7 @@ impl LocalGarbageCollector {
                 gc_inter_ptr = b;
                 obj_mem = mem;
                 obj_layout = layout;
-                tracer_info = TracerInfo {
-                    tracer_ptr: b as *const dyn Trace,
-                    mem: GcObjMem::Inline,
-                    layout: Layout::new::<GcInternal<T>>(),
-                };
+                tracer_list = TracerList::new_inline(b as *const dyn Trace);
             } else {
                 // Fallback: separate allocations
                 let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<GcPtr<T>>();
@@ -3510,23 +3531,21 @@ impl LocalGarbageCollector {
                 gc_inter_ptr = b;
                 obj_mem = mem_a;
                 obj_layout = layout_a;
-                tracer_info = TracerInfo {
+                tracer_list = TracerList::new(TracerInfo {
                     tracer_ptr: b as *const dyn Trace,
                     mem: mem_b,
                     layout: layout_b,
-                };
+                });
             }
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let gc_maps = self.core.gc_maps_unsync();
-            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
+            unsafe fn dealloc_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*(ptr as *const GcPtr<T>)).t.finalize();
+                    }));
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
-                }
-            }
-            unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
             let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const Cell<usize>;
@@ -3536,10 +3555,9 @@ impl LocalGarbageCollector {
                 layout: obj_layout,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalize_fn: finalize_gc_ptr::<T>,
-                drop_fn: drop_gc_ptr::<T>,
+                dealloc_fn: dealloc_gc_ptr::<T>,
                 weak_alive: None,
-                tracers: TracerList::new(tracer_info),
+                tracers: tracer_list,
                 region,
                 root_ref_count_ptr,
             });
@@ -3597,7 +3615,7 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, gc_cell_inter_ptr, obj_mem, obj_layout, tracer_info);
+            let (gc_ptr, gc_cell_inter_ptr, obj_mem, obj_layout, tracer_list);
             if let Some((a, b, mem, layout)) =
                 self.try_alloc_combined_tlab::<RefCell<GcPtr<T>>, GcCellInternal<T>>()
             {
@@ -3605,11 +3623,7 @@ impl LocalGarbageCollector {
                 gc_cell_inter_ptr = b;
                 obj_mem = mem;
                 obj_layout = layout;
-                tracer_info = TracerInfo {
-                    tracer_ptr: b as *const dyn Trace,
-                    mem: GcObjMem::Inline,
-                    layout: Layout::new::<GcCellInternal<T>>(),
-                };
+                tracer_list = TracerList::new_inline(b as *const dyn Trace);
             } else {
                 let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<RefCell<GcPtr<T>>>();
                 let (b, (mem_b, layout_b)) = self.alloc_mem_tlab::<GcCellInternal<T>>();
@@ -3617,25 +3631,23 @@ impl LocalGarbageCollector {
                 gc_cell_inter_ptr = b;
                 obj_mem = mem_a;
                 obj_layout = layout_a;
-                tracer_info = TracerInfo {
+                tracer_list = TracerList::new(TracerInfo {
                     tracer_ptr: b as *const dyn Trace,
                     mem: mem_b,
                     layout: layout_b,
-                };
+                });
             }
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let gc_maps = self.core.gc_maps_unsync();
-            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
+            unsafe fn dealloc_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
+                            .t
+                            .finalize();
+                    }));
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
-                }
-            }
-            unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
-                        .t
-                        .finalize();
                 }
             }
             let root_ref_count_ptr =
@@ -3646,10 +3658,9 @@ impl LocalGarbageCollector {
                 layout: obj_layout,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalize_fn: finalize_gc_cell_ptr::<T>,
-                drop_fn: drop_gc_cell_ptr::<T>,
+                dealloc_fn: dealloc_gc_cell_ptr::<T>,
                 weak_alive: None,
-                tracers: TracerList::new(tracer_info),
+                tracers: tracer_list,
                 region,
                 root_ref_count_ptr,
             });
@@ -3715,7 +3726,7 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, gc_inter_ptr, obj_mem, obj_layout, tracer_info);
+            let (gc_ptr, gc_inter_ptr, obj_mem, obj_layout, tracer_list);
             if let Some((a, b, mem, layout)) =
                 self.try_alloc_combined_tlab::<GcPtr<T>, GcInternal<T>>()
             {
@@ -3723,11 +3734,7 @@ impl LocalGarbageCollector {
                 gc_inter_ptr = b;
                 obj_mem = mem;
                 obj_layout = layout;
-                tracer_info = TracerInfo {
-                    tracer_ptr: b as *const dyn Trace,
-                    mem: GcObjMem::Inline,
-                    layout: Layout::new::<GcInternal<T>>(),
-                };
+                tracer_list = TracerList::new_inline(b as *const dyn Trace);
             } else {
                 let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<GcPtr<T>>()?;
                 let (b, (mem_b, layout_b)) =
@@ -3742,23 +3749,21 @@ impl LocalGarbageCollector {
                 gc_inter_ptr = b;
                 obj_mem = mem_a;
                 obj_layout = layout_a;
-                tracer_info = TracerInfo {
+                tracer_list = TracerList::new(TracerInfo {
                     tracer_ptr: b as *const dyn Trace,
                     mem: mem_b,
                     layout: layout_b,
-                };
+                });
             }
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let gc_maps = self.core.gc_maps_unsync();
-            unsafe fn drop_gc_ptr<T: 'static + Trace>(ptr: *mut u8) {
+            unsafe fn dealloc_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*(ptr as *const GcPtr<T>)).t.finalize();
+                    }));
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
-                }
-            }
-            unsafe fn finalize_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    (*(ptr as *const GcPtr<T>)).t.finalize();
                 }
             }
             let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const Cell<usize>;
@@ -3768,10 +3773,9 @@ impl LocalGarbageCollector {
                 layout: obj_layout,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalize_fn: finalize_gc_ptr::<T>,
-                drop_fn: drop_gc_ptr::<T>,
+                dealloc_fn: dealloc_gc_ptr::<T>,
                 weak_alive: None,
-                tracers: TracerList::new(tracer_info),
+                tracers: tracer_list,
                 region,
                 root_ref_count_ptr,
             });
@@ -3801,7 +3805,7 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, gc_cell_inter_ptr, obj_mem, obj_layout, tracer_info);
+            let (gc_ptr, gc_cell_inter_ptr, obj_mem, obj_layout, tracer_list);
             if let Some((a, b, mem, layout)) =
                 self.try_alloc_combined_tlab::<RefCell<GcPtr<T>>, GcCellInternal<T>>()
             {
@@ -3809,11 +3813,7 @@ impl LocalGarbageCollector {
                 gc_cell_inter_ptr = b;
                 obj_mem = mem;
                 obj_layout = layout;
-                tracer_info = TracerInfo {
-                    tracer_ptr: b as *const dyn Trace,
-                    mem: GcObjMem::Inline,
-                    layout: Layout::new::<GcCellInternal<T>>(),
-                };
+                tracer_list = TracerList::new_inline(b as *const dyn Trace);
             } else {
                 let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<RefCell<GcPtr<T>>>()?;
                 let (b, (mem_b, layout_b)) =
@@ -3828,25 +3828,23 @@ impl LocalGarbageCollector {
                 gc_cell_inter_ptr = b;
                 obj_mem = mem_a;
                 obj_layout = layout_a;
-                tracer_info = TracerInfo {
+                tracer_list = TracerList::new(TracerInfo {
                     tracer_ptr: b as *const dyn Trace,
                     mem: mem_b,
                     layout: layout_b,
-                };
+                });
             }
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let gc_maps = self.core.gc_maps_unsync();
-            unsafe fn drop_gc_cell_ptr<T: 'static + Trace>(ptr: *mut u8) {
+            unsafe fn dealloc_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
                 unsafe {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
+                            .t
+                            .finalize();
+                    }));
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
-                }
-            }
-            unsafe fn finalize_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
-                        .t
-                        .finalize();
                 }
             }
             let root_ref_count_ptr =
@@ -3857,10 +3855,9 @@ impl LocalGarbageCollector {
                 layout: obj_layout,
                 generation: Generation::Gen0,
                 survive_count: 0,
-                finalize_fn: finalize_gc_cell_ptr::<T>,
-                drop_fn: drop_gc_cell_ptr::<T>,
+                dealloc_fn: dealloc_gc_cell_ptr::<T>,
                 weak_alive: None,
-                tracers: TracerList::new(tracer_info),
+                tracers: tracer_list,
                 region,
                 root_ref_count_ptr,
             });
