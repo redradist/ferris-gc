@@ -195,6 +195,43 @@ impl<K: SlotKey, V> SlotMap<K, V> {
         }
     }
 
+    /// Mutable look up by key without bounds or generation checks.
+    ///
+    /// # Safety
+    /// The key must refer to a valid, currently occupied slot.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub unsafe fn get_unchecked_mut(&mut self, key: K) -> &mut V {
+        let slot = unsafe { self.slots.get_unchecked_mut(key.index() as usize) };
+        match &mut slot.value {
+            SlotValue::Occupied(v) => v,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+
+    /// Remove the value at `key` without bounds or generation checks.
+    ///
+    /// # Safety
+    /// The key must refer to a valid, currently occupied slot.
+    #[inline(always)]
+    pub unsafe fn remove_unchecked(&mut self, key: K) -> V {
+        let idx = key.index() as usize;
+        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
+        slot.ver = slot.ver.wrapping_add(1);
+        let old = std::mem::replace(
+            &mut slot.value,
+            SlotValue::Vacant {
+                next_free: self.free_head,
+            },
+        );
+        self.free_head = idx as u32;
+        self.len -= 1;
+        match old {
+            SlotValue::Occupied(v) => v,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+
     /// Returns `true` if the key refers to a currently occupied slot.
     #[allow(dead_code)]
     pub fn contains_key(&self, key: K) -> bool {

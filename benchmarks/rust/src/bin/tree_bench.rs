@@ -61,7 +61,11 @@ fn sum_tree(node: &Gc<TreeNode>) -> i64 {
 
 fn main() {
     let _cleanup = ferris_gc::ApplicationCleanup;
-    let depth: u32 = get_n() as u32;
+    // Default depth=20 (1M nodes), matching Go benchmark. Overridable via CLI arg.
+    let depth: u32 = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(20);
     let strategy = configure_local_strategy(&get_strategy());
     install_local_gc_monitor();
 

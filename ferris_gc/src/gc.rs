@@ -1111,6 +1111,7 @@ impl TracerList {
 
     /// Remove the tracer whose pointer matches `ptr` (as *const u8).
     /// Returns the removed TracerInfo, or None if not found.
+    #[inline]
     fn remove_by_ptr(&mut self, ptr: *const u8) -> Option<TracerInfo> {
         match self {
             TracerList::Inline(t) => {
@@ -1317,6 +1318,9 @@ pub(crate) struct GcMaps {
     /// weak references — most objects never need this, so keeping it
     /// out of ObjectEntry saves 8B per object on the hot path.
     pub(crate) weak_alive_map: HashMap<ObjectId, Arc<AtomicBool>>,
+    /// Fast Gen0 object list for O(Gen0) partial collections.
+    /// Avoids iterating all objects during Gen0 mark/sweep.
+    pub(crate) gen0_ids: Vec<ObjectId>,
 }
 
 impl GcMaps {
@@ -1445,6 +1449,7 @@ impl GarbageCollector {
                 objects: SlotMap::new(),
                 ptr_to_object: HashMap::new(),
                 weak_alive_map: HashMap::new(),
+                gen0_ids: Vec::new(),
             }),
             gc_maps_lock: Mutex::new(()),
             allocation_count: Cell::new(0),
@@ -1573,6 +1578,7 @@ impl GarbageCollector {
     /// # Safety
     /// The `ObjectEntry` must refer to a valid, initialized object that has been
     /// removed from the GC maps and is no longer reachable.
+    #[inline]
     unsafe fn dealloc_object_entry(entry_ref: ObjectEntryRef) {
         // Read all fields from the TLAB-allocated ObjectEntry before releasing memory.
         let oe_ptr = entry_ref.0;
@@ -1606,6 +1612,7 @@ impl GarbageCollector {
     /// # Safety
     /// The `GcObjMem` and `Layout` must refer to a valid allocation that has been
     /// removed from the GC maps.
+    #[inline]
     unsafe fn dealloc_tracer_mem(ptr: *mut u8, mem: GcObjMem, layout: Layout) {
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
         unsafe { mem.dealloc_mem(ptr, layout) };
@@ -1742,9 +1749,8 @@ impl GarbageCollector {
                 // RC hybrid: eagerly dealloc object if no tracers remain
                 if obj_entry.tracers.is_empty() {
                     let obj_gen = obj_entry.generation();
-                    let obj_entry = gc_maps.objects.remove(object_id).expect(
-                        "remove_tracer: object entry not found after tracers became empty",
-                    );
+                    // SAFETY: We just confirmed the slot is occupied via get_mut above.
+                    let obj_entry = unsafe { gc_maps.objects.remove_unchecked(object_id) };
                     // Skip ptr_to_object.remove — it's rebuilt lazily before any
                     // code that reads it (incremental/concurrent marking).
                     // Only clean card table for promoted objects (Gen0 objects are never registered).
@@ -1753,8 +1759,10 @@ impl GarbageCollector {
                         card_table.remove_object(thin, object_id);
                     }
                     // Region stats are computed on-demand; no counters to decrement.
-                    if let Some(alive) = gc_maps.weak_alive_map.remove(&object_id) {
-                        alive.store(false, Ordering::Release);
+                    if !gc_maps.weak_alive_map.is_empty() {
+                        if let Some(alive) = gc_maps.weak_alive_map.remove(&object_id) {
+                            alive.store(false, Ordering::Release);
+                        }
                     }
                     object_dealloc = Some(obj_entry);
                 }
@@ -1815,30 +1823,64 @@ impl GarbageCollector {
                 // For partial collections (max_gen < Gen2), only walk in-scope objects.
                 // Gen1+ objects' Gc handles already have is_root=false from previous
                 // collections or create_gc's reset_root call.
+                // Use gen0_ids only when it's smaller than total objects (avoids
+                // stale entries from RC-hybrid drops bloating iteration).
+                let use_gen0_ids = max_gen == Generation::Gen0
+                    && gc_maps.gen0_ids.len() <= gc_maps.objects.len();
+
                 if max_gen >= Generation::Gen2 {
                     for entry in gc_maps.objects.values() {
                         // SAFETY: Object pointer is valid while gc_maps lock is held.
                         (&*entry.ptr).reset_root();
                     }
+                } else if use_gen0_ids {
+                    // Gen0 collection: use gen0_ids for O(Gen0) iteration.
+                    for &obj_id in &gc_maps.gen0_ids {
+                        if let Some(entry) = gc_maps.objects.get(obj_id) {
+                            (&*entry.ptr).reset_root();
+                        }
+                    }
                 } else {
                     for (_id, entry) in gc_maps.objects.iter() {
                         if entry.generation() <= max_gen {
-                            // SAFETY: Object pointer is valid while gc_maps lock is held.
                             (&*entry.ptr).reset_root();
                         }
                     }
                 }
 
-                // Mark phase: trace from ALL roots (needed for correctness —
-                // Gen1+ roots may reference Gen0 objects through pre-promotion edges).
-                for obj_entry in gc_maps.objects.values() {
-                    obj_entry.tracers.for_each_tracer(|tracer_ptr| {
-                        // SAFETY: Tracer pointer is valid while gc_maps lock is held.
-                        let t = &(*tracer_ptr);
-                        if t.is_root() {
-                            t.trace();
+                // Mark phase: trace from root tracers.
+                if max_gen >= Generation::Gen2 {
+                    for obj_entry in gc_maps.objects.values() {
+                        obj_entry.tracers.for_each_tracer(|tracer_ptr| {
+                            let t = &(*tracer_ptr);
+                            if t.is_root() {
+                                t.trace();
+                            }
+                        });
+                    }
+                } else if use_gen0_ids {
+                    // Gen0: only scan Gen0 tracers, dirty cards handle old→young refs.
+                    for &obj_id in &gc_maps.gen0_ids {
+                        if let Some(obj_entry) = gc_maps.objects.get(obj_id) {
+                            obj_entry.tracers.for_each_tracer(|tracer_ptr| {
+                                let t = &(*tracer_ptr);
+                                if t.is_root() {
+                                    t.trace();
+                                }
+                            });
                         }
-                    });
+                    }
+                } else {
+                    for (_id, obj_entry) in gc_maps.objects.iter() {
+                        if obj_entry.generation() <= max_gen {
+                            obj_entry.tracers.for_each_tracer(|tracer_ptr| {
+                                let t = &(*tracer_ptr);
+                                if t.is_root() {
+                                    t.trace();
+                                }
+                            });
+                        }
+                    }
                 }
 
                 // For partial collections, also trace from dirty card table entries.
@@ -1861,38 +1903,109 @@ impl GarbageCollector {
                 // inline root_ref_count access instead of vtable dispatch.
                 let promo_cfg = self.promotion_config();
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
-                for (id, entry) in gc_maps.objects.iter_mut() {
-                    let in_scope = entry.generation() <= max_gen;
-                    // SAFETY: root_ref_count_offset derives from a valid GcInfo allocation.
-                    let marked = entry.root_ref_count().get() > 0;
-
-                    if in_scope {
+                if max_gen >= Generation::Gen2 {
+                    // Full collection: iterate all objects. Rebuild gen0_ids afterward.
+                    let mut new_gen0_ids = Vec::new();
+                    for (id, entry) in gc_maps.objects.iter_mut() {
+                        let marked = entry.root_ref_count().get() > 0;
                         stats.objects_scanned += 1;
                         if !marked {
                             collected_objects.push(id);
-                            // Dead object — skip clear_trace and promotion.
                             continue;
                         }
-                        // Surviving in-scope object: promote.
                         let cur_gen = entry.generation();
                         entry.increment_survive_count();
                         if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
                             entry.set_survive_count(0);
                             if let Some(next_gen) = cur_gen.next() {
                                 if cur_gen == Generation::Gen0 {
-                                    // Register with card table on first promotion
-                                    // so write barriers can track old→young references.
                                     let thin = entry.ptr.get_thin_ptr();
                                     self.card_table.register_object(thin, id);
                                 }
                                 entry.set_generation(next_gen);
                                 stats.objects_promoted += 1;
                             }
+                        } else if cur_gen == Generation::Gen0 {
+                            new_gen0_ids.push(id);
                         }
+                        entry.root_ref_count().set(0);
                     }
-                    // Clear mark state for all surviving objects (in-scope survivors
-                    // + out-of-scope objects that may have been marked transitively).
-                    entry.root_ref_count().set(0);
+                    gc_maps.gen0_ids = new_gen0_ids;
+                } else if use_gen0_ids {
+                    // Gen0 partial collection: iterate only Gen0 objects via gen0_ids.
+                    // Rebuild gen0_ids with surviving Gen0 objects (exclude dead and promoted).
+                    let old_gen0_ids = std::mem::take(&mut gc_maps.gen0_ids);
+                    for obj_id in old_gen0_ids {
+                        let entry = match gc_maps.objects.get_mut(obj_id) {
+                            Some(e) => e,
+                            None => continue, // already removed by RC-hybrid
+                        };
+                        let marked = entry.root_ref_count().get() > 0;
+                        stats.objects_scanned += 1;
+                        if !marked {
+                            collected_objects.push(obj_id);
+                            continue;
+                        }
+                        let cur_gen = entry.generation();
+                        entry.increment_survive_count();
+                        if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
+                            entry.set_survive_count(0);
+                            if let Some(next_gen) = cur_gen.next() {
+                                if cur_gen == Generation::Gen0 {
+                                    let thin = entry.ptr.get_thin_ptr();
+                                    self.card_table.register_object(thin, obj_id);
+                                }
+                                entry.set_generation(next_gen);
+                                stats.objects_promoted += 1;
+                                // Promoted out of Gen0 — don't add back to gen0_ids
+                                entry.root_ref_count().set(0);
+                                continue;
+                            }
+                        }
+                        entry.root_ref_count().set(0);
+                        // Still Gen0 — keep in gen0_ids
+                        gc_maps.gen0_ids.push(obj_id);
+                    }
+                } else {
+                    // Partial collection with full iteration (Gen1, or Gen0 with bloated gen0_ids).
+                    // Rebuild gen0_ids from live objects while sweeping.
+                    let mut new_gen0_ids = Vec::new();
+                    for (id, entry) in gc_maps.objects.iter_mut() {
+                        let cur_gen = entry.generation();
+                        if cur_gen > max_gen {
+                            // Out of scope — but track Gen0 objects for gen0_ids
+                            if cur_gen == Generation::Gen0 {
+                                new_gen0_ids.push(id);
+                            }
+                            continue;
+                        }
+                        let marked = entry.root_ref_count().get() > 0;
+                        stats.objects_scanned += 1;
+                        if !marked {
+                            collected_objects.push(id);
+                            continue;
+                        }
+                        entry.increment_survive_count();
+                        if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
+                            entry.set_survive_count(0);
+                            if let Some(next_gen) = cur_gen.next() {
+                                if cur_gen == Generation::Gen0 {
+                                    let thin = entry.ptr.get_thin_ptr();
+                                    self.card_table.register_object(thin, id);
+                                }
+                                entry.set_generation(next_gen);
+                                stats.objects_promoted += 1;
+                                entry.root_ref_count().set(0);
+                                continue;
+                            }
+                        }
+                        // Still in same generation — track Gen0 objects
+                        if cur_gen == Generation::Gen0 {
+                            new_gen0_ids.push(id);
+                        }
+                        entry.root_ref_count().set(0);
+                    }
+                    gc_maps.gen0_ids = new_gen0_ids;
                 }
                 stats.objects_collected = collected_objects.len();
 
@@ -3563,9 +3676,9 @@ impl LocalGarbageCollector {
         let ptr_a = ptr as *mut A;
         let ptr_b = unsafe { ptr.add(offset_b) } as *mut B;
         let ptr_c = unsafe { ptr.add(offset_c) } as *mut ObjectEntry;
-        // Second add_ref for the entry's separate dealloc path.
-        unsafe { crate::tlab::TlabBlock::add_ref(block) };
-        Some((ptr_a, ptr_b, ptr_c, GcObjMem::Tlab(block), abc, block))
+        // Single TLAB ref covers the entire [A|B|ObjectEntry] allocation.
+        // Object memory uses Inline (no-op dealloc), entry_block release frees the ref.
+        Some((ptr_a, ptr_b, ptr_c, GcObjMem::Inline, abc, block))
     }
 
     /// Allocate an ObjectEntry in the TLAB. Returns a raw pointer to uninitialized
@@ -3679,8 +3792,10 @@ impl LocalGarbageCollector {
                 let collected_ratio =
                     stats.objects_collected as f64 / stats.objects_scanned as f64;
                 if collected_ratio < 0.05 {
-                    // Less than 5% garbage — heap is mostly live, double threshold
-                    let new = (threshold * 2).min(100_000);
+                    // Almost no garbage — scale threshold to live set size.
+                    // Similar to Go's GOGC=100%: don't collect again until we've
+                    // allocated as many objects as are currently alive.
+                    let new = stats.objects_scanned.max(threshold * 2);
                     self.core.alloc_threshold.set(new);
                 } else if collected_ratio > 0.25 {
                     // More than 25% garbage — shrink threshold to collect sooner
@@ -3751,6 +3866,7 @@ impl LocalGarbageCollector {
             });
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
 
@@ -3857,6 +3973,7 @@ impl LocalGarbageCollector {
             });
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
@@ -3963,6 +4080,7 @@ impl LocalGarbageCollector {
             });
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
 
@@ -4033,6 +4151,7 @@ impl LocalGarbageCollector {
             });
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.

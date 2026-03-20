@@ -37,7 +37,15 @@ Both share the same API surface but differ in synchronization:
 | Ref counting | `Cell<usize>` | `AtomicUsize` |
 | Strategy | `LocalStrategy` | `GlobalStrategy` |
 
-Internal type hierarchy per GC: `Gc<T>` → `GcInternal<T>` (ref counting + root flag) → `GcPtr<T>` (data + `GcInfo` metadata). Raw allocations use `std::alloc::alloc`/`dealloc` with `Layout`.
+Internal type hierarchy per GC: `Gc<T>` → `GcInternal<T>` (ref counting + root flag) → `GcPtr<T>` (data + `GcInfo` metadata). Raw allocations use TLAB bump allocation (thread-local arena blocks) with system allocator fallback.
+
+### Memory Management
+
+- **TLAB (Thread-Local Allocation Buffer):** Bump allocator for fast allocation. `Gc::new()` allocates `[GcPtr<T> | GcInternal<T> | ObjectEntry]` in a single TLAB bump.
+- **SlotMap:** Custom generation-counted slot map (`slot_map.rs`) stores `ObjectEntryRef` pointers. O(1) insert/remove with cache-friendly iteration. Keys are `ObjectId` (u64: upper 32 = generation, lower 32 = index).
+- **RC-hybrid deallocation:** Objects freed immediately when last tracer is removed (no waiting for GC cycle). GC only handles cyclic references.
+- **Generational collection:** Gen0/Gen1/Gen2 with adaptive threshold scaling (GOGC-style: threshold proportional to live set size when <5% garbage collected).
+- **gen0_ids:** Fast Vec of Gen0 ObjectIds for O(Gen0) partial collections, with heuristic fallback to full iteration when stale entries exceed live objects.
 
 ### Procedural Macros (`ferris_gc_proc_macro`)
 
@@ -65,6 +73,20 @@ With `--no-default-features`, only core traits (`Trace`, `Finalize`) and `genera
 
 Collection methods (`collect`, `collect_generation`, `collect_incremental`, `compact`, etc.) are `pub(crate)` — only accessible to strategies internally. Users configure collection behavior through strategies, not by calling these methods directly.
 
+## Benchmarks
+
+Benchmarks live in `benchmarks/rust/` (Rust) and `benchmarks/go/` (Go baseline). Run with:
+
+```bash
+cd benchmarks/rust && cargo run --release --bin <bench_name>
+```
+
+Available: `alloc_bench`, `churn_bench`, `generational_bench`, `tree_bench`, `concurrent_bench`.
+
+Release profile uses `lto = "thin"` for cross-crate devirtualization.
+
 ## Known Issues
 
-Some sync tests are flaky due to shared global GC state (test ordering sensitive). Run individual tests with `cargo test -- <test_name>` if a sync test fails in batch.
+- Some sync tests are flaky due to shared global GC state (test ordering sensitive). Run individual tests with `cargo test -- <test_name>` if a sync test fails in batch.
+- `tree_bench` with `--strategy=adaptive` may collect live objects during build phase (node count mismatch). Use default `basic` strategy.
+- Benchmark variance is high (2-5x between runs) due to system load, cache effects, and TLAB block reuse patterns.

@@ -28,3 +28,6 @@ path = "src/bin/generational_bench.rs"
 [[bin]]
 name = "concurrent_bench"
 path = "src/bin/concurrent_bench.rs"
+
+[profile.release]
+lto = "thin"
