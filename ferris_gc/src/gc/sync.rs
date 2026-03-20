@@ -839,12 +839,12 @@ impl GlobalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
-            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
-                gen_survive: 0,
+                gen_survive_region: region.0 & 0xFFFF,
                 dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
@@ -852,8 +852,7 @@ impl GlobalGarbageCollector {
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
-                region,
-                root_ref_count_ptr,
+                root_ref_count_offset,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
@@ -933,13 +932,12 @@ impl GlobalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
-            let root_ref_count_ptr =
-                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
+            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
-                gen_survive: 0,
+                gen_survive_region: region.0 & 0xFFFF,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
@@ -947,8 +945,7 @@ impl GlobalGarbageCollector {
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
-                region,
-                root_ref_count_ptr,
+                root_ref_count_offset,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
@@ -1042,12 +1039,12 @@ impl GlobalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
-            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
-                gen_survive: 0,
+                gen_survive_region: region.0 & 0xFFFF,
                 dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
@@ -1055,8 +1052,7 @@ impl GlobalGarbageCollector {
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
-                region,
-                root_ref_count_ptr,
+                root_ref_count_offset,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
@@ -1112,13 +1108,12 @@ impl GlobalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
-            let root_ref_count_ptr =
-                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize>;
+            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
-                gen_survive: 0,
+                gen_survive_region: region.0 & 0xFFFF,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
@@ -1126,8 +1121,7 @@ impl GlobalGarbageCollector {
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
-                region,
-                root_ref_count_ptr,
+                root_ref_count_offset,
             });
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
@@ -2153,7 +2147,7 @@ mod tests {
             .core
             .lock_gc_maps();
         assert!(
-            gc_maps.objects.values().any(|e| e.region == region),
+            gc_maps.objects.values().any(|e| e.region() == region),
             "object should be assigned to current region"
         );
     }

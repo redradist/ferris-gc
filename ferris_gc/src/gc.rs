@@ -1221,24 +1221,22 @@ pub(crate) struct ObjectEntry {
     pub(crate) ptr: *const dyn Trace,
     pub(crate) mem: GcObjMem,
     pub(crate) layout: CompactLayout,
-    /// Packed generation (bits 31:30) + survive_count (bits 29:0).
-    pub(crate) gen_survive: u32,
+    /// Packed generation (bits 31:30) + survive_count (bits 29:16, 14 bits) + region (bits 15:0).
+    pub(crate) gen_survive_region: u32,
     pub(crate) dealloc_fn: DeallocFn,
     /// All Gc<T>/GcCell<T> handles pointing to this object.
     /// RC hybrid: when tracers is empty, the object is eagerly deallocated.
     pub(crate) tracers: TracerList,
-    /// Region assignment for region-based collection.
-    pub(crate) region: RegionId,
-    /// Raw pointer to the object's `root_ref_count` Cell inside GcInfo.
+    /// Offset from the thin pointer to the object's `root_ref_count` Cell inside GcInfo.
     /// Allows inline mark-bit checks (is_traceable / clear_trace) without
     /// virtual dispatch through `*const dyn Trace`.
-    pub(crate) root_ref_count_ptr: *const Cell<usize>,
+    pub(crate) root_ref_count_offset: u16,
 }
 
 impl ObjectEntry {
     #[inline]
     pub(crate) fn generation(&self) -> Generation {
-        match self.gen_survive >> 30 {
+        match self.gen_survive_region >> 30 {
             0 => Generation::Gen0,
             1 => Generation::Gen1,
             _ => Generation::Gen2,
@@ -1247,23 +1245,50 @@ impl ObjectEntry {
 
     #[inline]
     pub(crate) fn set_generation(&mut self, generation: Generation) {
-        self.gen_survive = (self.gen_survive & 0x3FFF_FFFF) | ((generation as u32) << 30);
+        let bits = match generation {
+            Generation::Gen0 => 0u32,
+            Generation::Gen1 => 1u32,
+            Generation::Gen2 => 2u32,
+        };
+        self.gen_survive_region = (bits << 30) | (self.gen_survive_region & 0x3FFF_FFFF);
     }
 
     #[inline]
     pub(crate) fn survive_count(&self) -> u32 {
-        self.gen_survive & 0x3FFF_FFFF
+        (self.gen_survive_region >> 16) & 0x3FFF
     }
 
     #[inline]
     pub(crate) fn set_survive_count(&mut self, count: u32) {
-        self.gen_survive = (self.gen_survive & 0xC000_0000) | (count & 0x3FFF_FFFF);
+        let count = count.min(0x3FFF);
+        self.gen_survive_region = (self.gen_survive_region & 0xC000_FFFF) | (count << 16);
     }
 
     #[inline]
     pub(crate) fn increment_survive_count(&mut self) {
-        let count = self.survive_count();
-        self.set_survive_count(count + 1);
+        let current = self.survive_count();
+        if current < 0x3FFF {
+            self.set_survive_count(current + 1);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn region(&self) -> RegionId {
+        RegionId((self.gen_survive_region & 0xFFFF) as u32)
+    }
+
+    #[inline]
+    pub(crate) fn set_region(&mut self, region: RegionId) {
+        self.gen_survive_region = (self.gen_survive_region & 0xFFFF_0000) | ((region.0 & 0xFFFF) as u32);
+    }
+
+    /// Get a reference to root_ref_count by deriving from the thin pointer + offset.
+    /// SAFETY: The ObjectEntry's ptr must be valid.
+    #[inline]
+    unsafe fn root_ref_count(&self) -> &Cell<usize> {
+        unsafe {
+            &*((self.ptr.get_thin_ptr() + self.root_ref_count_offset as usize) as *const Cell<usize>)
+        }
     }
 }
 
@@ -1292,8 +1317,8 @@ impl GcMaps {
         let mut total_bytes: HashMap<RegionId, usize> = HashMap::new();
         let mut object_count: HashMap<RegionId, usize> = HashMap::new();
         for (_id, entry) in self.objects.iter() {
-            *total_bytes.entry(entry.region).or_insert(0) += entry.layout.size();
-            *object_count.entry(entry.region).or_insert(0) += 1;
+            *total_bytes.entry(entry.region()).or_insert(0) += entry.layout.size();
+            *object_count.entry(entry.region()).or_insert(0) += 1;
         }
         (total_bytes, object_count)
     }
@@ -1802,8 +1827,8 @@ impl GarbageCollector {
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
                 for (id, entry) in gc_maps.objects.iter_mut() {
                     let in_scope = entry.generation() <= max_gen;
-                    // SAFETY: root_ref_count_ptr points into a valid GcInfo allocation.
-                    let marked = (*entry.root_ref_count_ptr).get() > 0;
+                    // SAFETY: root_ref_count_offset derives from a valid GcInfo allocation.
+                    let marked = entry.root_ref_count().get() > 0;
 
                     if in_scope {
                         stats.objects_scanned += 1;
@@ -1831,7 +1856,7 @@ impl GarbageCollector {
                     }
                     // Clear mark state for all surviving objects (in-scope survivors
                     // + out-of-scope objects that may have been marked transitively).
-                    (*entry.root_ref_count_ptr).set(0);
+                    entry.root_ref_count().set(0);
                 }
                 stats.objects_collected = collected_objects.len();
 
@@ -2545,7 +2570,7 @@ impl GarbageCollector {
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
                 for (id, entry) in gc_maps.objects.iter_mut() {
                     let in_scope = entry.generation() <= max_gen;
-                    let marked = (*entry.root_ref_count_ptr).get() > 0;
+                    let marked = entry.root_ref_count().get() > 0;
 
                     if in_scope {
                         stats.objects_scanned += 1;
@@ -2567,7 +2592,7 @@ impl GarbageCollector {
                             }
                         }
                     }
-                    (*entry.root_ref_count_ptr).set(0);
+                    entry.root_ref_count().set(0);
                 }
                 stats.objects_collected = collected_objects.len();
 
@@ -2969,8 +2994,8 @@ impl GarbageCollector {
                 // Combined pass: sweep + count + clear_trace in a single iteration.
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
                 for (id, entry) in gc_maps.objects.iter_mut() {
-                    let in_region = entry.region == region;
-                    let marked = (*entry.root_ref_count_ptr).get() > 0;
+                    let in_region = entry.region() == region;
+                    let marked = entry.root_ref_count().get() > 0;
 
                     if in_region {
                         stats.objects_scanned += 1;
@@ -2979,7 +3004,7 @@ impl GarbageCollector {
                             continue;
                         }
                     }
-                    (*entry.root_ref_count_ptr).set(0);
+                    entry.root_ref_count().set(0);
                 }
                 stats.objects_collected = collected_objects.len();
 
@@ -3106,9 +3131,9 @@ impl GarbageCollector {
                 let mut region_marked: HashMap<RegionId, usize> = HashMap::new();
 
                 for (_id, entry) in gc_maps.objects.iter() {
-                    *region_total.entry(entry.region).or_insert(0) += 1;
-                    if (*entry.root_ref_count_ptr).get() > 0 {
-                        *region_marked.entry(entry.region).or_insert(0) += 1;
+                    *region_total.entry(entry.region()).or_insert(0) += 1;
+                    if entry.root_ref_count().get() > 0 {
+                        *region_marked.entry(entry.region()).or_insert(0) += 1;
                     }
                 }
 
@@ -3143,8 +3168,8 @@ impl GarbageCollector {
                         .objects
                         .iter()
                         .filter(|(_id, e)| {
-                            e.region == *region
-                                && (*e.root_ref_count_ptr).get() == 0
+                            e.region() == *region
+                                && e.root_ref_count().get() == 0
                         })
                         .map(|(id, _)| id)
                         .collect();
@@ -3175,7 +3200,7 @@ impl GarbageCollector {
 
                 // Clear mark state for ALL surviving objects using inline access.
                 for entry in gc_maps.objects.values() {
-                    (*entry.root_ref_count_ptr).set(0);
+                    entry.root_ref_count().set(0);
                 }
 
                 (tracer_deallocs, object_deallocs)
@@ -3342,9 +3367,7 @@ impl GarbageCollector {
                     entry.ptr = new_fat_ptr;
                     let new_thin = entry.ptr.get_thin_ptr();
 
-                    // Update root_ref_count_ptr: same offset, new base address.
-                    let rrc_offset = entry.root_ref_count_ptr as usize - old_thin;
-                    entry.root_ref_count_ptr = (new_thin + rrc_offset) as *const Cell<usize>;
+                    // root_ref_count_offset is relative — no update needed after relocation.
 
                     // Replace memory tracking with compact block reference.
                     // Use std::mem::replace to properly move the old GcObjMem out,
@@ -3614,17 +3637,16 @@ impl LocalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
-            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const Cell<usize>;
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
                 layout: CompactLayout::from_layout(obj_layout),
-                gen_survive: 0,
+                gen_survive_region: region.0 & 0xFFFF,
                 dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: tracer_list,
-                region,
-                root_ref_count_ptr,
+                root_ref_count_offset,
             });
             self.core.track_alloc(obj_layout.size());
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
@@ -3715,18 +3737,16 @@ impl LocalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
-            let root_ref_count_ptr =
-                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize>;
+            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
                 layout: CompactLayout::from_layout(obj_layout),
-                gen_survive: 0,
+                gen_survive_region: region.0 & 0xFFFF,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: tracer_list,
-                region,
-                root_ref_count_ptr,
+                root_ref_count_offset,
             });
             self.core.track_alloc(obj_layout.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
@@ -3830,17 +3850,16 @@ impl LocalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
                 }
             }
-            let root_ref_count_ptr = &(*gc_ptr).info.root_ref_count as *const Cell<usize>;
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
                 layout: CompactLayout::from_layout(obj_layout),
-                gen_survive: 0,
+                gen_survive_region: region.0 & 0xFFFF,
                 dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: tracer_list,
-                region,
-                root_ref_count_ptr,
+                root_ref_count_offset,
             });
             self.core.track_alloc(obj_layout.size());
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
@@ -3910,18 +3929,16 @@ impl LocalGarbageCollector {
                     std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
                 }
             }
-            let root_ref_count_ptr =
-                &(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize>;
+            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
                 layout: CompactLayout::from_layout(obj_layout),
-                gen_survive: 0,
+                gen_survive_region: region.0 & 0xFFFF,
                 dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: tracer_list,
-                region,
-                root_ref_count_ptr,
+                root_ref_count_offset,
             });
             self.core.track_alloc(obj_layout.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
@@ -4431,7 +4448,7 @@ mod tests {
         eprintln!("ObjectEntry size: {}B", size);
         eprintln!("GcObjMem size: {}B", std::mem::size_of::<super::GcObjMem>());
         eprintln!("TracerList size: {}B", std::mem::size_of::<super::TracerList>());
-        assert!(size <= 88, "ObjectEntry grew unexpectedly to {size}B");
+        assert!(size <= 80, "ObjectEntry grew unexpectedly to {size}B");
     }
 
     #[test]
@@ -5890,7 +5907,7 @@ mod tests {
                 .core
                 .lock_gc_maps();
             assert!(
-                gc_maps.objects.values().any(|e| e.region.0 == 0),
+                gc_maps.objects.values().any(|e| e.region().0 == 0),
                 "new objects should be in region 0 (default)"
             );
         });
@@ -5913,7 +5930,7 @@ mod tests {
                 .core
                 .lock_gc_maps();
             assert!(
-                gc_maps.objects.values().any(|e| e.region == region_id),
+                gc_maps.objects.values().any(|e| e.region() == region_id),
                 "object should be in the new region"
             );
         });
