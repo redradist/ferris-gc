@@ -6,7 +6,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::basic_gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
-use crate::gc::{CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, Trace, TracerInfo, TracerList};
+use crate::gc::{
+    CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, Trace, TracerInfo,
+    TracerList,
+};
 use crate::slot_map::ObjectId;
 
 /// Convenience alias for an optional thread-safe GC pointer.
@@ -453,10 +456,7 @@ impl<T> GcCellInternal<T>
 where
     T: 'static + Sized + Trace,
 {
-    fn new(
-        ptr: *const RefCell<GcPtr<T>>,
-        object_id: ObjectId,
-    ) -> GcCellInternal<T> {
+    fn new(ptr: *const RefCell<GcPtr<T>>, object_id: ObjectId) -> GcCellInternal<T> {
         GcCellInternal {
             is_root: AtomicBool::new(true),
             ptr,
@@ -766,9 +766,7 @@ where
 {
     /// Create a weak reference that does not prevent collection.
     pub fn downgrade(this: &Gc<T>) -> GcWeak<T> {
-        let alive = GLOBAL_GC
-            .core
-            .get_or_create_weak_alive(this.object_id);
+        let alive = GLOBAL_GC.core.get_or_create_weak_alive(this.object_id);
         GcWeak {
             alive,
             ptr: this.ptr,
@@ -830,7 +828,9 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
+                as *const Cell<usize> as usize
+                - gc_ptr as usize) as u16;
             let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -861,7 +861,10 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.set(self.core.allocation_count.get() + 1);
+            self.core.allocation_count.store(
+                self.core.allocation_count.load(Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
             gc
         }
     }
@@ -913,7 +916,10 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
+            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
+                as *const AtomicUsize as *const Cell<usize>
+                as usize
+                - gc_ptr as usize) as u16;
             let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -934,10 +940,7 @@ impl GlobalGarbageCollector {
             self.core.track_alloc(mem_info_gc_ptr.1.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(
-                gc_cell_inter_ptr,
-                GcCellInternal::new(gc_ptr, obj_id),
-            );
+            std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
             drop(gc_maps);
 
             let gc = GcCell {
@@ -947,7 +950,10 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.set(self.core.allocation_count.get() + 1);
+            self.core.allocation_count.store(
+                self.core.allocation_count.load(Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
             gc
         }
     }
@@ -973,10 +979,7 @@ impl GlobalGarbageCollector {
             }
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(
-                gc_inter_ptr,
-                GcCellInternal::new(gc.ptr, object_id),
-            );
+            std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr, object_id));
             drop(gc_maps);
             let gc = GcCell {
                 internal_ptr: gc_inter_ptr,
@@ -1005,14 +1008,18 @@ impl GlobalGarbageCollector {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        mem_info_gc_ptr.0.dealloc_mem(gc_ptr as *mut u8, mem_info_gc_ptr.1);
+                        mem_info_gc_ptr
+                            .0
+                            .dealloc_mem(gc_ptr as *mut u8, mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
+                as *const Cell<usize> as usize
+                - gc_ptr as usize) as u16;
             let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -1042,7 +1049,10 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.set(self.core.allocation_count.get() + 1);
+            self.core.allocation_count.store(
+                self.core.allocation_count.load(Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
             Ok(gc)
         }
     }
@@ -1064,14 +1074,19 @@ impl GlobalGarbageCollector {
                     Ok(v) => v,
                     Err(e) => {
                         // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        mem_info_gc_ptr.0.dealloc_mem(gc_ptr as *mut u8, mem_info_gc_ptr.1);
+                        mem_info_gc_ptr
+                            .0
+                            .dealloc_mem(gc_ptr as *mut u8, mem_info_gc_ptr.1);
                         return Err(e);
                     }
                 };
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
+            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
+                as *const AtomicUsize as *const Cell<usize>
+                as usize
+                - gc_ptr as usize) as u16;
             let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
@@ -1092,10 +1107,7 @@ impl GlobalGarbageCollector {
             self.core.track_alloc(mem_info_gc_ptr.1.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(
-                gc_cell_inter_ptr,
-                GcCellInternal::new(gc_ptr, obj_id),
-            );
+            std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
             drop(gc_maps);
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
@@ -1104,7 +1116,10 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.set(self.core.allocation_count.get() + 1);
+            self.core.allocation_count.store(
+                self.core.allocation_count.load(Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
             Ok(gc)
         }
     }
@@ -1122,9 +1137,7 @@ impl GlobalGarbageCollector {
             // Re-check under gc_maps lock: the object may have been freed by a
             // concurrent drop (RC hybrid) between the alive check and this point.
             let object_id = weak.object_id;
-            if gc_maps.objects.get(object_id).is_none() {
-                return None;
-            }
+            gc_maps.objects.get(object_id)?;
             let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
             // RC hybrid: push tracer for upgraded object
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
@@ -1136,10 +1149,7 @@ impl GlobalGarbageCollector {
             }
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(
-                gc_inter_ptr,
-                GcInternal::new(weak.ptr, object_id),
-            );
+            std::ptr::write(gc_inter_ptr, GcInternal::new(weak.ptr, object_id));
             drop(gc_maps);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
@@ -2107,9 +2117,7 @@ mod tests {
         let (_guard, _) = setup();
         let _obj = Gc::new(1);
         let region = (*GLOBAL_GC).core.current_region();
-        let gc_maps = (*GLOBAL_GC)
-            .core
-            .lock_gc_maps();
+        let gc_maps = (*GLOBAL_GC).core.lock_gc_maps();
         assert!(
             gc_maps.objects.values().any(|e| e.region() == region),
             "object should be assigned to current region"
@@ -2151,11 +2159,13 @@ mod tests {
             let _obj = Gc::new(42);
         }
         // RC should have freed it — check tracers are back to baseline
-        let gc_maps = (*GLOBAL_GC)
-            .core
-            .lock_gc_maps();
+        let gc_maps = (*GLOBAL_GC).core.lock_gc_maps();
         assert_eq!(
-            gc_maps.objects.values().map(|e| e.tracers.len()).sum::<usize>(),
+            gc_maps
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>(),
             baseline,
             "RC should free object immediately"
         );
@@ -2166,17 +2176,9 @@ mod tests {
         let (_guard, _) = setup();
         let a = Gc::new(99);
         let b = a.clone();
-        let baseline = (*GLOBAL_GC)
-            .core
-            .lock_gc_maps()
-            .objects
-            .len();
+        let baseline = (*GLOBAL_GC).core.lock_gc_maps().objects.len();
         drop(a);
-        let after = (*GLOBAL_GC)
-            .core
-            .lock_gc_maps()
-            .objects
-            .len();
+        let after = (*GLOBAL_GC).core.lock_gc_maps().objects.len();
         assert_eq!(after, baseline, "object should survive when clone exists");
         assert_eq!(**b, 99);
     }

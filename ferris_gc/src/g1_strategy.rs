@@ -83,8 +83,8 @@ pub fn g1_local_strategy(
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config_bg.poll_interval);
 
-                let current = gc.core.current_heap_size.get();
-                let peak = gc.core.peak_heap_size.get();
+                let current = gc.core.current_heap_size.load(Ordering::Relaxed);
+                let peak = gc.core.peak_heap_size.load(Ordering::Relaxed);
 
                 if peak > 0
                     && current as f64 > peak as f64 * config_bg.initiating_heap_occupancy_percent
@@ -134,7 +134,7 @@ pub fn g1_local_strategy(
         Some(thread::spawn(move || {
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config_fg.poll_interval);
-                let allocs = gc.core.allocation_count.get();
+                let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
                 if allocs >= config_fg.young_gen_threshold {
                     unsafe {
                         gc.core.collect_garbage_first(config_fg.pause_target);
@@ -178,8 +178,8 @@ pub fn g1_global_strategy(
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config_bg.poll_interval);
 
-                let current = gc.core.current_heap_size.get();
-                let peak = gc.core.peak_heap_size.get();
+                let current = gc.core.current_heap_size.load(Ordering::Relaxed);
+                let peak = gc.core.peak_heap_size.load(Ordering::Relaxed);
 
                 if peak > 0
                     && current as f64 > peak as f64 * config_bg.initiating_heap_occupancy_percent
@@ -227,7 +227,7 @@ pub fn g1_global_strategy(
         Some(thread::spawn(move || {
             while is_active.load(Ordering::Acquire) {
                 thread::sleep(config_fg.poll_interval);
-                let allocs = gc.core.allocation_count.get();
+                let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
                 if allocs >= config_fg.young_gen_threshold {
                     unsafe {
                         gc.core.collect_garbage_first(config_fg.pause_target);

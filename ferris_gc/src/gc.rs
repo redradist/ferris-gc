@@ -578,10 +578,7 @@ impl<T> GcCellInternal<T>
 where
     T: 'static + Sized + Trace,
 {
-    fn new(
-        ptr: *const RefCell<GcPtr<T>>,
-        object_id: ObjectId,
-    ) -> GcCellInternal<T> {
+    fn new(ptr: *const RefCell<GcPtr<T>>, object_id: ObjectId) -> GcCellInternal<T> {
         GcCellInternal {
             is_root: Cell::new(true),
             ptr: Cell::new(ptr),
@@ -936,9 +933,7 @@ where
     pub fn downgrade(this: &Gc<T>) -> GcWeak<T> {
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let alive = gc_ref
-                .core
-                .get_or_create_weak_alive(this.object_id);
+            let alive = gc_ref.core.get_or_create_weak_alive(this.object_id);
             GcWeak {
                 alive,
                 ptr: this.ptr,
@@ -1047,7 +1042,8 @@ pub(crate) enum TracerList {
     Inline(*const dyn Trace),
     /// Single tracer with separate allocation (needs dealloc info).
     One(Box<TracerInfo>),
-    /// Multiple tracers (e.g. after Gc::clone). Heap-allocated.
+    /// Multiple tracers (e.g. after Gc::clone). Boxed to keep enum size == 1 pointer.
+    #[allow(clippy::box_collection)]
     Many(Box<Vec<TracerInfo>>),
     /// Sentinel for drain operations.
     Empty,
@@ -1079,7 +1075,10 @@ impl TracerList {
                 TracerList::Many(Box::new(vec![first, t]))
             }
             TracerList::One(first) => TracerList::Many(Box::new(vec![*first, t])),
-            TracerList::Many(mut v) => { v.push(t); TracerList::Many(v) }
+            TracerList::Many(mut v) => {
+                v.push(t);
+                TracerList::Many(v)
+            }
             TracerList::Empty => TracerList::One(Box::new(t)),
         };
     }
@@ -1104,7 +1103,11 @@ impl TracerList {
         match self {
             TracerList::Inline(ptr) => f(*ptr),
             TracerList::One(t) => f(t.tracer_ptr),
-            TracerList::Many(v) => { for t in v.iter() { f(t.tracer_ptr); } }
+            TracerList::Many(v) => {
+                for t in v.iter() {
+                    f(t.tracer_ptr);
+                }
+            }
             TracerList::Empty => {}
         }
     }
@@ -1142,7 +1145,8 @@ impl TracerList {
                 if let Some(pos) = v.iter().position(|t| (t.tracer_ptr as *const u8) == ptr) {
                     let removed = v.swap_remove(pos);
                     if v.len() == 1 {
-                        if let TracerList::Many(mut v) = std::mem::replace(self, TracerList::Empty) {
+                        if let TracerList::Many(mut v) = std::mem::replace(self, TracerList::Empty)
+                        {
                             let last = v.pop().unwrap();
                             *self = TracerList::One(Box::new(last));
                         }
@@ -1296,7 +1300,7 @@ impl ObjectEntry {
 
     #[inline]
     pub(crate) fn region(&self) -> RegionId {
-        RegionId((self.gen_survive_region & 0xFFFF) as u32)
+        RegionId(self.gen_survive_region & 0xFFFF)
     }
 
     /// Get a reference to root_ref_count by deriving from the thin pointer + offset.
@@ -1304,7 +1308,8 @@ impl ObjectEntry {
     #[inline]
     unsafe fn root_ref_count(&self) -> &Cell<usize> {
         unsafe {
-            &*((self.ptr.get_thin_ptr() + self.root_ref_count_offset as usize) as *const Cell<usize>)
+            &*((self.ptr.get_thin_ptr() + self.root_ref_count_offset as usize)
+                as *const Cell<usize>)
         }
     }
 }
@@ -1408,9 +1413,7 @@ pub(crate) struct GarbageCollector {
     /// Mutex for thread-safe gc_maps access (used by GlobalGC and background strategies).
     pub(crate) gc_maps_lock: Mutex<()>,
     /// Allocation counter for adaptive collection triggering.
-    /// Cell instead of AtomicUsize: thread-local GC is single-threaded,
-    /// sync GC always holds gc_maps_lock. Saves ~15ns per alloc (no `lock xadd`).
-    pub(crate) allocation_count: Cell<usize>,
+    pub(crate) allocation_count: AtomicUsize,
     pub(crate) card_table: CardTable,
     pub(crate) stw_lock: RwLock<()>,
     pub(crate) incremental: Mutex<IncrementalState>,
@@ -1423,16 +1426,14 @@ pub(crate) struct GarbageCollector {
     /// Configurable promotion thresholds per generation.
     pub(crate) promotion_config: Mutex<PromotionConfig>,
     /// Current total heap size in bytes.
-    /// Cell: same safety argument as allocation_count.
-    pub(crate) current_heap_size: Cell<usize>,
+    pub(crate) current_heap_size: AtomicUsize,
     /// High-water mark of heap usage in bytes.
-    pub(crate) peak_heap_size: Cell<usize>,
+    pub(crate) peak_heap_size: AtomicUsize,
     /// Optional callback invoked after each collection cycle.
     #[allow(clippy::type_complexity)]
     pub(crate) on_collection: Mutex<Option<Box<dyn Fn(&CollectionStats) + Send + Sync>>>,
     /// Adaptive allocation threshold for maybe_collect.
-    /// Cell: same safety argument as allocation_count.
-    pub(crate) alloc_threshold: Cell<usize>,
+    pub(crate) alloc_threshold: AtomicUsize,
 }
 
 // SAFETY: GcMaps is behind UnsafeCell but protected by gc_maps_lock (Mutex<()>)
@@ -1452,7 +1453,7 @@ impl GarbageCollector {
                 gen0_ids: Vec::new(),
             }),
             gc_maps_lock: Mutex::new(()),
-            allocation_count: Cell::new(0),
+            allocation_count: AtomicUsize::new(0),
             card_table: CardTable::new(),
             stw_lock: RwLock::new(()),
             incremental: Mutex::new(IncrementalState::new()),
@@ -1461,9 +1462,9 @@ impl GarbageCollector {
             current_region: AtomicU32::new(0),
             next_region_id: AtomicU32::new(1),
             promotion_config: Mutex::new(PromotionConfig::default()),
-            current_heap_size: Cell::new(0),
-            peak_heap_size: Cell::new(0),
-            alloc_threshold: Cell::new(LOCAL_GC_ALLOC_THRESHOLD),
+            current_heap_size: AtomicUsize::new(0),
+            peak_heap_size: AtomicUsize::new(0),
+            alloc_threshold: AtomicUsize::new(LOCAL_GC_ALLOC_THRESHOLD),
             on_collection: Mutex::new(None),
         }
     }
@@ -1486,6 +1487,7 @@ impl GarbageCollector {
     /// Caller must guarantee no concurrent access (e.g., from a thread_local!
     /// context with no background collection thread accessing gc_maps).
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn gc_maps_unsync(&self) -> &mut GcMaps {
         unsafe { &mut *self.gc_maps.get() }
     }
@@ -1524,7 +1526,11 @@ impl GarbageCollector {
         GcStats {
             heap_size,
             live_objects: gc_maps.objects.len(),
-            live_tracers: gc_maps.objects.values().map(|e| e.tracers.len()).sum::<usize>(),
+            live_tracers: gc_maps
+                .objects
+                .values()
+                .map(|e| e.tracers.len())
+                .sum::<usize>(),
             gen0_objects: gen0,
             gen1_objects: gen1,
             gen2_objects: gen2,
@@ -1533,8 +1539,8 @@ impl GarbageCollector {
                 .last_collection
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
-            allocation_count: self.allocation_count.get(),
-            peak_heap_size: self.peak_heap_size.get(),
+            allocation_count: self.allocation_count.load(Ordering::Relaxed),
+            peak_heap_size: self.peak_heap_size.load(Ordering::Relaxed),
         }
     }
 
@@ -1560,17 +1566,22 @@ impl GarbageCollector {
     /// Track heap growth after an allocation.
     #[inline]
     fn track_alloc(&self, size: usize) {
-        let new_size = self.current_heap_size.get() + size;
-        self.current_heap_size.set(new_size);
-        if new_size > self.peak_heap_size.get() {
-            self.peak_heap_size.set(new_size);
+        let new_size = self.current_heap_size.load(Ordering::Relaxed) + size;
+        self.current_heap_size.store(new_size, Ordering::Relaxed);
+        if new_size > self.peak_heap_size.load(Ordering::Relaxed) {
+            self.peak_heap_size.store(new_size, Ordering::Relaxed);
         }
     }
 
     /// Track heap shrinkage after a deallocation.
     #[inline]
     fn track_dealloc(&self, size: usize) {
-        self.current_heap_size.set(self.current_heap_size.get().saturating_sub(size));
+        self.current_heap_size.store(
+            self.current_heap_size
+                .load(Ordering::Relaxed)
+                .saturating_sub(size),
+            Ordering::Relaxed,
+        );
     }
 
     /// Finalize, drop, and deallocate a collected object.
@@ -1744,7 +1755,11 @@ impl GarbageCollector {
         if let Some(obj_entry) = gc_maps.objects.get_mut(object_id) {
             // Find and remove the tracer matching tracer_ptr
             if let Some(removed) = obj_entry.tracers.remove_by_ptr(tracer_ptr) {
-                tracer_dealloc = Some((removed.tracer_ptr.get_thin_ptr() as *mut u8, removed.mem, removed.layout));
+                tracer_dealloc = Some((
+                    removed.tracer_ptr.get_thin_ptr() as *mut u8,
+                    removed.mem,
+                    removed.layout,
+                ));
 
                 // RC hybrid: eagerly dealloc object if no tracers remain
                 if obj_entry.tracers.is_empty() {
@@ -1773,7 +1788,11 @@ impl GarbageCollector {
     }
 
     #[inline]
-    fn finalize_remove_tracer(&self, tracer_dealloc: Option<(*mut u8, GcObjMem, Layout)>, object_dealloc: Option<ObjectEntryRef>) {
+    fn finalize_remove_tracer(
+        &self,
+        tracer_dealloc: Option<(*mut u8, GcObjMem, Layout)>,
+        object_dealloc: Option<ObjectEntryRef>,
+    ) {
         // Dealloc tracer outside lock scope
         if let Some((ptr, mem, layout)) = tracer_dealloc {
             // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
@@ -1825,8 +1844,8 @@ impl GarbageCollector {
                 // collections or create_gc's reset_root call.
                 // Use gen0_ids only when it's smaller than total objects (avoids
                 // stale entries from RC-hybrid drops bloating iteration).
-                let use_gen0_ids = max_gen == Generation::Gen0
-                    && gc_maps.gen0_ids.len() <= gc_maps.objects.len();
+                let use_gen0_ids =
+                    max_gen == Generation::Gen0 && gc_maps.gen0_ids.len() <= gc_maps.objects.len();
 
                 if max_gen >= Generation::Gen2 {
                     for entry in gc_maps.objects.values() {
@@ -2023,7 +2042,11 @@ impl GarbageCollector {
                         // Drain tracers before consuming the object entry
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
+                            tracer_deallocs.push((
+                                tracer.tracer_ptr.get_thin_ptr() as *mut u8,
+                                tracer.mem,
+                                tracer.layout,
+                            ));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2039,7 +2062,7 @@ impl GarbageCollector {
 
             // Reset allocation counter after gen0 collection
             if max_gen >= Generation::Gen0 {
-                self.allocation_count.set(0);
+                self.allocation_count.store(0, Ordering::Relaxed);
             }
 
             // Dealloc phase: all locks released.
@@ -2092,14 +2115,18 @@ impl GarbageCollector {
                     .into_iter()
                     .map(|(_, mut entry)| {
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
+                            tracer_deallocs.push((
+                                tracer.tracer_ptr.get_thin_ptr() as *mut u8,
+                                tracer.mem,
+                                tracer.layout,
+                            ));
                         }
                         entry
                     })
                     .collect();
                 (tracer_deallocs, object_deallocs)
             };
-            self.allocation_count.set(0);
+            self.allocation_count.store(0, Ordering::Relaxed);
             // Object drops must happen BEFORE tracer deallocs, because dropping
             // an object may drop inner Gc<T> handles whose Drop impl calls
             // remove_tracer (which looks up object_id in gc_maps — the object
@@ -2219,7 +2246,11 @@ impl GarbageCollector {
                         }
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
+                            tracer_deallocs.push((
+                                tracer.tracer_ptr.get_thin_ptr() as *mut u8,
+                                tracer.mem,
+                                tracer.layout,
+                            ));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2256,7 +2287,7 @@ impl GarbageCollector {
 
             // Reset allocation counter after gen0 collection
             if max_gen >= Generation::Gen0 {
-                self.allocation_count.set(0);
+                self.allocation_count.store(0, Ordering::Relaxed);
             }
 
             // Parallel dealloc phase: all locks released.
@@ -2290,12 +2321,10 @@ impl GarbageCollector {
 
             let obj_dealloc_items: Vec<SendObjectDealloc> = object_deallocs
                 .into_iter()
-                .map(|entry| {
-                    SendObjectDealloc {
-                        fat_ptr: entry.ptr,
-                        mem: entry.mem,
-                        layout: entry.layout.to_layout(),
-                    }
+                .map(|entry| SendObjectDealloc {
+                    fat_ptr: entry.ptr,
+                    mem: entry.mem,
+                    layout: entry.layout.to_layout(),
                 })
                 .collect();
 
@@ -2448,7 +2477,11 @@ impl GarbageCollector {
                         }
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
+                            tracer_deallocs.push((
+                                tracer.tracer_ptr.get_thin_ptr() as *mut u8,
+                                tracer.mem,
+                                tracer.layout,
+                            ));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2483,7 +2516,7 @@ impl GarbageCollector {
             };
 
             if max_gen >= Generation::Gen0 {
-                self.allocation_count.set(0);
+                self.allocation_count.store(0, Ordering::Relaxed);
             }
 
             // Parallel dealloc (same as collect_parallel)
@@ -2505,12 +2538,10 @@ impl GarbageCollector {
 
             let obj_dealloc_items: Vec<SendObjectDealloc> = object_deallocs
                 .into_iter()
-                .map(|entry| {
-                    SendObjectDealloc {
-                        fat_ptr: entry.ptr,
-                        mem: entry.mem,
-                        layout: entry.layout.to_layout(),
-                    }
+                .map(|entry| SendObjectDealloc {
+                    fat_ptr: entry.ptr,
+                    mem: entry.mem,
+                    layout: entry.layout.to_layout(),
                 })
                 .collect();
 
@@ -2755,7 +2786,11 @@ impl GarbageCollector {
                         }
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
+                            tracer_deallocs.push((
+                                tracer.tracer_ptr.get_thin_ptr() as *mut u8,
+                                tracer.mem,
+                                tracer.layout,
+                            ));
                         }
                         object_deallocs.push(entry);
                     }
@@ -2776,7 +2811,7 @@ impl GarbageCollector {
 
             // Reset allocation counter
             if max_gen >= Generation::Gen0 {
-                self.allocation_count.set(0);
+                self.allocation_count.store(0, Ordering::Relaxed);
             }
 
             // Dealloc phase: all locks released.
@@ -3167,7 +3202,11 @@ impl GarbageCollector {
                         }
                         stats.tracers_collected += entry.tracers.len();
                         for tracer in entry.tracers.drain() {
-                            tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
+                            tracer_deallocs.push((
+                                tracer.tracer_ptr.get_thin_ptr() as *mut u8,
+                                tracer.mem,
+                                tracer.layout,
+                            ));
                         }
                         object_deallocs.push(entry);
                     }
@@ -3312,10 +3351,7 @@ impl GarbageCollector {
                     let dead_in_region: Vec<ObjectId> = gc_maps
                         .objects
                         .iter()
-                        .filter(|(_id, e)| {
-                            e.region() == *region
-                                && e.root_ref_count().get() == 0
-                        })
+                        .filter(|(_id, e)| e.region() == *region && e.root_ref_count().get() == 0)
                         .map(|(id, _)| id)
                         .collect();
 
@@ -3335,7 +3371,11 @@ impl GarbageCollector {
                             }
                             stats.tracers_collected += entry.tracers.len();
                             for tracer in entry.tracers.drain() {
-                                tracer_deallocs.push((tracer.tracer_ptr.get_thin_ptr() as *mut u8, tracer.mem, tracer.layout));
+                                tracer_deallocs.push((
+                                    tracer.tracer_ptr.get_thin_ptr() as *mut u8,
+                                    tracer.mem,
+                                    tracer.layout,
+                                ));
                             }
                             object_deallocs.push(entry);
                         }
@@ -3517,10 +3557,8 @@ impl GarbageCollector {
                     // Replace memory tracking with compact block reference.
                     // Use std::mem::replace to properly move the old GcObjMem out,
                     // avoiding double-drop of Arc refs in Compact/Tlab variants.
-                    let old_mem = std::mem::replace(
-                        &mut entry.mem,
-                        GcObjMem::Compact(compact_block.clone()),
-                    );
+                    let old_mem =
+                        std::mem::replace(&mut entry.mem, GcObjMem::Compact(compact_block.clone()));
                     old_mems.push((old_thin as *mut u8, old_mem, *layout));
                     entry.layout = CompactLayout::from_layout(*layout);
 
@@ -3656,7 +3694,14 @@ impl LocalGarbageCollector {
     #[inline]
     unsafe fn try_alloc_triple_tlab<A: Sized, B: Sized>(
         &mut self,
-    ) -> Option<(*mut A, *mut B, *mut ObjectEntry, GcObjMem, Layout, *mut crate::tlab::TlabBlock)> {
+    ) -> Option<(
+        *mut A,
+        *mut B,
+        *mut ObjectEntry,
+        GcObjMem,
+        Layout,
+        *mut crate::tlab::TlabBlock,
+    )> {
         let layout_a = Layout::new::<A>();
         let layout_b = Layout::new::<B>();
         let layout_c = Layout::new::<ObjectEntry>();
@@ -3695,14 +3740,12 @@ impl LocalGarbageCollector {
             if let Some((ptr, block)) = tlab.alloc_or_grow(layout) {
                 return (ptr as *mut ObjectEntry, block);
             }
-        } else {
-            if let Some(mut tlab) = crate::tlab::Tlab::new() {
-                if let Some((ptr, block)) = tlab.alloc(layout) {
-                    self.tlab = Some(tlab);
-                    return (ptr as *mut ObjectEntry, block);
-                }
+        } else if let Some(mut tlab) = crate::tlab::Tlab::new() {
+            if let Some((ptr, block)) = tlab.alloc(layout) {
                 self.tlab = Some(tlab);
+                return (ptr as *mut ObjectEntry, block);
             }
+            self.tlab = Some(tlab);
         }
 
         // Fall back to system allocator
@@ -3783,24 +3826,23 @@ impl LocalGarbageCollector {
     /// (down to 1K) to reclaim memory promptly.
     #[inline]
     unsafe fn maybe_collect(&self) {
-        let count = self.core.allocation_count.get();
-        let threshold = self.core.alloc_threshold.get();
+        let count = self.core.allocation_count.load(Ordering::Relaxed);
+        let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
         if count >= threshold {
             let stats = unsafe { self.core.collect_generation(Generation::Gen0) };
             // Adapt threshold based on collection efficiency
             if stats.objects_scanned > 0 {
-                let collected_ratio =
-                    stats.objects_collected as f64 / stats.objects_scanned as f64;
+                let collected_ratio = stats.objects_collected as f64 / stats.objects_scanned as f64;
                 if collected_ratio < 0.05 {
                     // Almost no garbage — scale threshold to live set size.
                     // Similar to Go's GOGC=100%: don't collect again until we've
                     // allocated as many objects as are currently alive.
                     let new = stats.objects_scanned.max(threshold * 2);
-                    self.core.alloc_threshold.set(new);
+                    self.core.alloc_threshold.store(new, Ordering::Relaxed);
                 } else if collected_ratio > 0.25 {
                     // More than 25% garbage — shrink threshold to collect sooner
                     let new = (threshold / 2).max(LOCAL_GC_ALLOC_THRESHOLD);
-                    self.core.alloc_threshold.set(new);
+                    self.core.alloc_threshold.store(new, Ordering::Relaxed);
                 }
             }
         }
@@ -3854,16 +3896,21 @@ impl LocalGarbageCollector {
             }
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
-            std::ptr::write(oe_ptr, ObjectEntry {
-                ptr: gc_ptr as *const dyn Trace,
-                mem: obj_mem,
-                layout: CompactLayout::from_layout(obj_layout),
-                gen_survive_region: region.0 & 0xFFFF,
-                tracers: tracer_list,
-                root_ref_count_offset,
-                entry_block: oe_block,
-            });
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize>
+                as usize
+                - gc_ptr as usize) as u16;
+            std::ptr::write(
+                oe_ptr,
+                ObjectEntry {
+                    ptr: gc_ptr as *const dyn Trace,
+                    mem: obj_mem,
+                    layout: CompactLayout::from_layout(obj_layout),
+                    gen_survive_region: region.0 & 0xFFFF,
+                    tracers: tracer_list,
+                    root_ref_count_offset,
+                    entry_block: oe_block,
+                },
+            );
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             gc_maps.gen0_ids.push(obj_id);
@@ -3878,7 +3925,10 @@ impl LocalGarbageCollector {
             // SAFETY: gc_ptr was just initialized above; call reset_root directly
             // instead of going through gc.internal_ptr→ptr.get() (avoids triple dereference).
             (*gc_ptr).reset_root();
-            self.core.allocation_count.set(self.core.allocation_count.get() + 1);
+            self.core.allocation_count.store(
+                self.core.allocation_count.load(Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
             self.maybe_collect();
             gc
         }
@@ -3961,26 +4011,28 @@ impl LocalGarbageCollector {
             }
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
-            std::ptr::write(oe_ptr, ObjectEntry {
-                ptr: gc_ptr as *const dyn Trace,
-                mem: obj_mem,
-                layout: CompactLayout::from_layout(obj_layout),
-                gen_survive_region: region.0 & 0xFFFF,
-                tracers: tracer_list,
-                root_ref_count_offset,
-                entry_block: oe_block,
-            });
+            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
+                as *const Cell<usize> as usize
+                - gc_ptr as usize) as u16;
+            std::ptr::write(
+                oe_ptr,
+                ObjectEntry {
+                    ptr: gc_ptr as *const dyn Trace,
+                    mem: obj_mem,
+                    layout: CompactLayout::from_layout(obj_layout),
+                    gen_survive_region: region.0 & 0xFFFF,
+                    tracers: tracer_list,
+                    root_ref_count_offset,
+                    entry_block: oe_block,
+                },
+            );
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(
-                gc_cell_inter_ptr,
-                GcCellInternal::new(gc_ptr, obj_id),
-            );
+            std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
 
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
@@ -3989,7 +4041,10 @@ impl LocalGarbageCollector {
             };
             // SAFETY: gc_ptr/gc.ptr was initialized above; call reset_root directly.
             (*gc.ptr).reset_root();
-            self.core.allocation_count.set(self.core.allocation_count.get() + 1);
+            self.core.allocation_count.store(
+                self.core.allocation_count.load(Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
             self.maybe_collect();
             gc
         }
@@ -4015,10 +4070,7 @@ impl LocalGarbageCollector {
             }
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(
-                gc_inter_ptr,
-                GcCellInternal::new(gc.ptr, object_id),
-            );
+            std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr, object_id));
             let gc = GcCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
@@ -4047,14 +4099,13 @@ impl LocalGarbageCollector {
                 tracer_list = TracerList::new_inline(b as *const dyn Trace);
             } else {
                 let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<GcPtr<T>>()?;
-                let (b, (mem_b, layout_b)) =
-                    match self.try_alloc_mem_tlab::<GcInternal<T>>() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            mem_a.dealloc_mem(a as *mut u8, layout_a);
-                            return Err(e);
-                        }
-                    };
+                let (b, (mem_b, layout_b)) = match self.try_alloc_mem_tlab::<GcInternal<T>>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        mem_a.dealloc_mem(a as *mut u8, layout_a);
+                        return Err(e);
+                    }
+                };
                 gc_ptr = a;
                 gc_inter_ptr = b;
                 obj_mem = mem_a;
@@ -4067,17 +4118,22 @@ impl LocalGarbageCollector {
             }
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize>
+                as usize
+                - gc_ptr as usize) as u16;
             let (oe_ptr, oe_block) = self.alloc_entry_tlab();
-            std::ptr::write(oe_ptr, ObjectEntry {
-                ptr: gc_ptr as *const dyn Trace,
-                mem: obj_mem,
-                layout: CompactLayout::from_layout(obj_layout),
-                gen_survive_region: region.0 & 0xFFFF,
-                tracers: tracer_list,
-                root_ref_count_offset,
-                entry_block: oe_block,
-            });
+            std::ptr::write(
+                oe_ptr,
+                ObjectEntry {
+                    ptr: gc_ptr as *const dyn Trace,
+                    mem: obj_mem,
+                    layout: CompactLayout::from_layout(obj_layout),
+                    gen_survive_region: region.0 & 0xFFFF,
+                    tracers: tracer_list,
+                    root_ref_count_offset,
+                    entry_block: oe_block,
+                },
+            );
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             gc_maps.gen0_ids.push(obj_id);
@@ -4091,7 +4147,10 @@ impl LocalGarbageCollector {
             };
             // SAFETY: gc_ptr/gc.ptr was initialized above; call reset_root directly.
             (*gc.ptr).reset_root();
-            self.core.allocation_count.set(self.core.allocation_count.get() + 1);
+            self.core.allocation_count.store(
+                self.core.allocation_count.load(Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
             self.maybe_collect();
             Ok(gc)
         }
@@ -4118,14 +4177,13 @@ impl LocalGarbageCollector {
                 tracer_list = TracerList::new_inline(b as *const dyn Trace);
             } else {
                 let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<RefCell<GcPtr<T>>>()?;
-                let (b, (mem_b, layout_b)) =
-                    match self.try_alloc_mem_tlab::<GcCellInternal<T>>() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            mem_a.dealloc_mem(a as *mut u8, layout_a);
-                            return Err(e);
-                        }
-                    };
+                let (b, (mem_b, layout_b)) = match self.try_alloc_mem_tlab::<GcCellInternal<T>>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        mem_a.dealloc_mem(a as *mut u8, layout_a);
+                        return Err(e);
+                    }
+                };
                 gc_ptr = a;
                 gc_cell_inter_ptr = b;
                 obj_mem = mem_a;
@@ -4138,27 +4196,29 @@ impl LocalGarbageCollector {
             }
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
+            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
+                as *const Cell<usize> as usize
+                - gc_ptr as usize) as u16;
             let (oe_ptr, oe_block) = self.alloc_entry_tlab();
-            std::ptr::write(oe_ptr, ObjectEntry {
-                ptr: gc_ptr as *const dyn Trace,
-                mem: obj_mem,
-                layout: CompactLayout::from_layout(obj_layout),
-                gen_survive_region: region.0 & 0xFFFF,
-                tracers: tracer_list,
-                root_ref_count_offset,
-                entry_block: oe_block,
-            });
+            std::ptr::write(
+                oe_ptr,
+                ObjectEntry {
+                    ptr: gc_ptr as *const dyn Trace,
+                    mem: obj_mem,
+                    layout: CompactLayout::from_layout(obj_layout),
+                    gen_survive_region: region.0 & 0xFFFF,
+                    tracers: tracer_list,
+                    root_ref_count_offset,
+                    entry_block: oe_block,
+                },
+            );
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
             // Initialize tracer memory BEFORE releasing the lock, so the background
             // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(
-                gc_cell_inter_ptr,
-                GcCellInternal::new(gc_ptr, obj_id),
-            );
+            std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
 
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
@@ -4167,7 +4227,10 @@ impl LocalGarbageCollector {
             };
             // SAFETY: gc_ptr/gc.ptr was initialized above; call reset_root directly.
             (*gc.ptr).reset_root();
-            self.core.allocation_count.set(self.core.allocation_count.get() + 1);
+            self.core.allocation_count.store(
+                self.core.allocation_count.load(Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
             self.maybe_collect();
             Ok(gc)
         }
@@ -4193,10 +4256,7 @@ impl LocalGarbageCollector {
             }
 
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcInternal<T>.
-            std::ptr::write(
-                gc_inter_ptr,
-                GcInternal::new(weak.ptr, object_id),
-            );
+            std::ptr::write(gc_inter_ptr, GcInternal::new(weak.ptr, object_id));
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: weak.ptr,
@@ -4660,7 +4720,10 @@ mod tests {
         let size = std::mem::size_of::<super::ObjectEntry>();
         eprintln!("ObjectEntry size: {}B", size);
         eprintln!("GcObjMem size: {}B", std::mem::size_of::<super::GcObjMem>());
-        eprintln!("TracerList size: {}B", std::mem::size_of::<super::TracerList>());
+        eprintln!(
+            "TracerList size: {}B",
+            std::mem::size_of::<super::TracerList>()
+        );
         // ObjectEntry is now TLAB-allocated (not in SlotMap), so size is less critical.
         // SlotMap stores ObjectEntryRef (8B pointer) instead.
         assert!(size <= 80, "ObjectEntry grew unexpectedly to {size}B");
@@ -4669,21 +4732,12 @@ mod tests {
     #[test]
     fn one_object() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .total_tracers()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
         let _one = Gc::new(1);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow()
-                    .core
-                    .lock_gc_maps()
-                    .total_tracers()
-                    - baseline,
+                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
                 1
             );
         });
@@ -4692,23 +4746,14 @@ mod tests {
     #[test]
     fn gc_collect_one_from_one() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .total_tracers()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
         {
             let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow()
-                    .core
-                    .lock_gc_maps()
-                    .total_tracers()
-                    - baseline,
+                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
                 0
             );
         });
@@ -4720,21 +4765,12 @@ mod tests {
         // Reassigning drops the old Gc (remove_tracer removes it from trs),
         // so only 1 tracer remains for the surviving Gc.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .total_tracers()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| {
             assert_eq!(
-                gc.borrow()
-                    .core
-                    .lock_gc_maps()
-                    .total_tracers()
-                    - baseline,
+                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
                 1
             );
         });
@@ -4746,22 +4782,13 @@ mod tests {
     fn gc_collect_after_reassign() {
         // After reassign, one live Gc remains. collect() keeps live objects.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .total_tracers()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow()
-                    .core
-                    .lock_gc_maps()
-                    .total_tracers()
-                    - baseline,
+                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
                 1
             );
         });
@@ -4772,12 +4799,7 @@ mod tests {
     #[allow(unused_assignments)]
     fn gc_collect_two_from_two() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .total_tracers()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
         {
             let mut one = Gc::new(1);
             one = Gc::new(2);
@@ -4786,11 +4808,7 @@ mod tests {
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow()
-                    .core
-                    .lock_gc_maps()
-                    .total_tracers()
-                    - baseline,
+                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
                 0
             );
         });
@@ -4799,39 +4817,19 @@ mod tests {
     #[test]
     fn ptr_to_object_cleaned_on_collect() {
         clean_gc_state();
-        let baseline_trs = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .total_tracers()
-        });
-        let baseline_p2o = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .ptr_to_object
-                .len()
-        });
+        let baseline_trs = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
+        let baseline_p2o = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().ptr_to_object.len());
         {
             let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow()
-                    .core
-                    .lock_gc_maps()
-                    .total_tracers()
-                    - baseline_trs,
+                gc.borrow().core.lock_gc_maps().total_tracers() - baseline_trs,
                 0
             );
             assert_eq!(
-                gc.borrow()
-                    .core
-                    .lock_gc_maps()
-                    .ptr_to_object
-                    .len()
-                    - baseline_p2o,
+                gc.borrow().core.lock_gc_maps().ptr_to_object.len() - baseline_p2o,
                 0
             );
         });
@@ -4840,12 +4838,7 @@ mod tests {
     #[test]
     fn collect_from_another_thread() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .total_tracers()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
         let _one = Gc::new(42);
         LOCAL_GC.with(|gc| {
             let gc_ptr = gc.as_ptr();
@@ -4856,11 +4849,7 @@ mod tests {
                 });
             });
             assert_eq!(
-                gc.borrow()
-                    .core
-                    .lock_gc_maps()
-                    .total_tracers()
-                    - baseline,
+                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
                 1
             );
         });
@@ -4916,22 +4905,12 @@ mod tests {
     #[test]
     fn clone_from_registers_with_gc() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .total_tracers()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
         let source = Gc::new(42);
         let mut target = Gc::new(99);
         target.clone_from(&source);
         LOCAL_GC.with(|gc| {
-            let delta = gc
-                .borrow()
-                .core
-                .lock_gc_maps()
-                .total_tracers()
-                - baseline;
+            let delta = gc.borrow().core.lock_gc_maps().total_tracers() - baseline;
             // source + target + the new clone's tracer = at least 2 alive
             assert!(
                 delta >= 2,
@@ -4978,9 +4957,7 @@ mod tests {
         let _obj = Gc::new(42);
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let gc_maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let gc_maps = gc_ref.core.lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -5007,9 +4984,7 @@ mod tests {
             }
             // Verify object was promoted to Gen1
             {
-                let gc_maps = gc_ref
-                    .core
-                    .lock_gc_maps();
+                let gc_maps = gc_ref.core.lock_gc_maps();
                 assert!(
                     gc_maps
                         .objects
@@ -5019,22 +4994,14 @@ mod tests {
                 );
             }
 
-            let baseline_objs = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let baseline_objs = gc_ref.core.lock_gc_maps().objects.len();
             // Gen0-only collection should not touch Gen1 objects
             unsafe {
                 gc_ref
                     .core
                     .collect_generation(crate::generation::Generation::Gen0);
             }
-            let after_objs = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let after_objs = gc_ref.core.lock_gc_maps().objects.len();
             assert_eq!(
                 baseline_objs, after_objs,
                 "Gen0 collection must not collect Gen1 objects"
@@ -5058,9 +5025,7 @@ mod tests {
             }
             // Still Gen0 after 2 survivals
             {
-                let gc_maps = gc_ref
-                    .core
-                    .lock_gc_maps();
+                let gc_maps = gc_ref.core.lock_gc_maps();
                 assert!(
                     gc_maps
                         .objects
@@ -5076,9 +5041,7 @@ mod tests {
                     .core
                     .collect_generation(crate::generation::Generation::Gen0);
             }
-            let gc_maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let gc_maps = gc_ref.core.lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -5111,9 +5074,7 @@ mod tests {
                         .collect_generation(crate::generation::Generation::Gen1);
                 }
             }
-            let gc_maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let gc_maps = gc_ref.core.lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -5129,23 +5090,11 @@ mod tests {
         // RC hybrid: object is freed immediately when last handle drops.
         // Verify the object is gone without needing an explicit Gen0 collection.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         {
             let _obj = Gc::new(99);
         }
-        let after = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         assert_eq!(
             after, baseline,
             "RC hybrid should free object immediately when last handle drops"
@@ -5155,10 +5104,10 @@ mod tests {
     #[test]
     fn allocation_count_tracks_new_objects() {
         clean_gc_state();
-        let before = LOCAL_GC.with(|gc| gc.borrow().core.allocation_count.get());
+        let before = LOCAL_GC.with(|gc| gc.borrow().core.allocation_count.load(Ordering::Relaxed));
         let _a = Gc::new(1);
         let _b = Gc::new(2);
-        let after = LOCAL_GC.with(|gc| gc.borrow().core.allocation_count.get());
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.allocation_count.load(Ordering::Relaxed));
         assert_eq!(
             after - before,
             2,
@@ -5183,9 +5132,7 @@ mod tests {
                 }
             }
             // Verify it's in Gen1 (check by value to avoid fat pointer comparison issues)
-            let gc_maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let gc_maps = gc_ref.core.lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -5290,21 +5237,13 @@ mod tests {
         // it's referenced by an old-gen object tracked via the card table
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_before = gc_ref.core.lock_gc_maps().objects.len();
             unsafe {
                 gc_ref
                     .core
                     .collect_generation(crate::generation::Generation::Gen0);
             }
-            let objs_after = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_after = gc_ref.core.lock_gc_maps().objects.len();
             assert_eq!(
                 objs_before, objs_after,
                 "young object referenced from old-gen (via card table) must survive Gen0 collection"
@@ -5445,25 +5384,13 @@ mod tests {
         // RC hybrid: object is freed immediately when last strong handle drops.
         // Weak reference does not count as a tracer, so it doesn't affect RC.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         let weak = {
             let strong = Gc::new(123);
             Gc::downgrade(&strong)
         };
         // RC should have freed the object immediately
-        let after = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         assert_eq!(
             after, baseline,
             "RC hybrid should free object immediately, weak doesn't prevent it"
@@ -5480,24 +5407,12 @@ mod tests {
     fn incremental_collects_dead_objects() {
         // RC hybrid frees non-cyclic objects immediately. Verify object is gone.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         {
             let _obj = Gc::new(42);
         }
         // Object already freed by RC
-        let after = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         assert_eq!(
             after, baseline,
             "RC hybrid should free dead object immediately"
@@ -5519,11 +5434,7 @@ mod tests {
         let _live = Gc::new(99);
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_before = gc_ref.core.lock_gc_maps().objects.len();
             let stats = unsafe {
                 gc_ref
                     .core
@@ -5533,14 +5444,7 @@ mod tests {
                 stats.objects_collected, 0,
                 "incremental must not collect live objects"
             );
-            assert_eq!(
-                gc_ref
-                    .core
-                    .lock_gc_maps()
-                    .objects
-                    .len(),
-                objs_before
-            );
+            assert_eq!(gc_ref.core.lock_gc_maps().objects.len(), objs_before);
         });
     }
 
@@ -5552,11 +5456,7 @@ mod tests {
         let _live = Gc::new(2);
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_before = gc_ref.core.lock_gc_maps().objects.len();
             unsafe {
                 gc_ref
                     .core
@@ -5568,11 +5468,7 @@ mod tests {
                     "live object must not be collected"
                 );
             }
-            let objs_after = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_after = gc_ref.core.lock_gc_maps().objects.len();
             assert_eq!(objs_before, objs_after, "live object count must not change");
         });
     }
@@ -5589,21 +5485,13 @@ mod tests {
 
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_before = gc_ref.core.lock_gc_maps().objects.len();
             unsafe {
                 gc_ref
                     .core
                     .collect_incremental(crate::generation::Generation::Gen2, 1);
             }
-            let objs_after = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_after = gc_ref.core.lock_gc_maps().objects.len();
             assert_eq!(
                 objs_before, objs_after,
                 "child referenced from parent must survive incremental collection"
@@ -5625,9 +5513,7 @@ mod tests {
                         .collect_incremental(crate::generation::Generation::Gen0, 10);
                 }
             }
-            let gc_maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let gc_maps = gc_ref.core.lock_gc_maps();
             assert!(
                 gc_maps
                     .objects
@@ -5723,26 +5609,14 @@ mod tests {
     #[test]
     fn try_new_object_participates_in_gc() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         {
             let _obj = Gc::try_new(77).unwrap();
         }
         LOCAL_GC.with(|gc| unsafe {
             gc.borrow_mut().collect();
         });
-        let after = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         assert_eq!(
             after, baseline,
             "try_new objects should be collected when dead"
@@ -6038,21 +5912,13 @@ mod tests {
         }
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_before = gc_ref.core.lock_gc_maps().objects.len();
             let _stats = unsafe {
                 gc_ref
                     .core
                     .collect_concurrent(crate::generation::Generation::Gen2, 10)
             };
-            let objs_after = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_after = gc_ref.core.lock_gc_maps().objects.len();
             assert!(
                 objs_after < objs_before,
                 "concurrent collection should collect cyclic garbage"
@@ -6066,11 +5932,7 @@ mod tests {
         let _live = Gc::new(42);
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_before = gc_ref.core.lock_gc_maps().objects.len();
             let stats = unsafe {
                 gc_ref
                     .core
@@ -6080,11 +5942,7 @@ mod tests {
                 stats.objects_collected, 0,
                 "concurrent must not collect live objects"
             );
-            let objs_after = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_after = gc_ref.core.lock_gc_maps().objects.len();
             assert_eq!(objs_before, objs_after);
         });
     }
@@ -6118,9 +5976,7 @@ mod tests {
         let _obj = Gc::new(42);
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let gc_maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let gc_maps = gc_ref.core.lock_gc_maps();
             assert!(
                 gc_maps.objects.values().any(|e| e.region().0 == 0),
                 "new objects should be in region 0 (default)"
@@ -6141,9 +5997,7 @@ mod tests {
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
             let region_id = gc_ref.core.current_region();
-            let gc_maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let gc_maps = gc_ref.core.lock_gc_maps();
             assert!(
                 gc_maps.objects.values().any(|e| e.region() == region_id),
                 "object should be in the new region"
@@ -6194,31 +6048,13 @@ mod tests {
     #[test]
     fn rc_immediate_dealloc_on_last_drop() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         {
             let _obj = Gc::new(42);
-            let during = LOCAL_GC.with(|gc| {
-                gc.borrow()
-                    .core
-                    .lock_gc_maps()
-                    .objects
-                    .len()
-            });
+            let during = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
             assert_eq!(during - baseline, 1, "object should be alive during scope");
         }
-        let after = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         assert_eq!(
             after, baseline,
             "RC should free object immediately when last handle drops"
@@ -6228,24 +6064,12 @@ mod tests {
     #[test]
     fn rc_clone_keeps_object_alive() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         let a = Gc::new(99);
         let b = a.clone();
         drop(a);
         // Object should still be alive (b holds a reference)
-        let after_drop_a = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let after_drop_a = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         assert_eq!(
             after_drop_a - baseline,
             1,
@@ -6254,13 +6078,7 @@ mod tests {
         assert_eq!(**b, 99);
         drop(b);
         // Now object should be freed
-        let after_drop_b = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let after_drop_b = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         assert_eq!(
             after_drop_b, baseline,
             "RC should free object when last clone drops"
@@ -6272,13 +6090,7 @@ mod tests {
         // Cycles keep ref_count > 0, so RC doesn't free them.
         // Tracing GC is needed.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         {
             let a = Gc::new(CyclicNode {
                 next: std::cell::RefCell::new(None),
@@ -6292,26 +6104,14 @@ mod tests {
             drop(b);
         }
         // Cycle objects should still be alive (ref_count > 0 due to internal refs)
-        let after = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let after = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         assert!(after > baseline, "cyclic objects should not be freed by RC");
 
         // Tracing GC should collect them
         LOCAL_GC.with(|gc| unsafe {
             gc.borrow_mut().collect();
         });
-        let final_count = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let final_count = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         assert_eq!(
             final_count, baseline,
             "tracing GC should collect cycles that RC cannot"
@@ -6323,21 +6123,10 @@ mod tests {
         // Verify RC behavior: object stays alive while any handle exists,
         // freed when last handle drops.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()
-        });
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         let a = Gc::new(42);
         assert_eq!(
-            LOCAL_GC.with(|gc| gc
-                .borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()),
+            LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len()),
             baseline + 1,
             "one object after creation"
         );
@@ -6345,12 +6134,7 @@ mod tests {
         let b = a.clone();
         // Clone shares the same object — count unchanged
         assert_eq!(
-            LOCAL_GC.with(|gc| gc
-                .borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()),
+            LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len()),
             baseline + 1,
             "still one object after clone"
         );
@@ -6358,12 +6142,7 @@ mod tests {
         drop(b);
         // Object survives (a still holds it)
         assert_eq!(
-            LOCAL_GC.with(|gc| gc
-                .borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()),
+            LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len()),
             baseline + 1,
             "object alive while handle exists"
         );
@@ -6372,12 +6151,7 @@ mod tests {
         drop(a);
         // Last handle dropped — RC frees object
         assert_eq!(
-            LOCAL_GC.with(|gc| gc
-                .borrow()
-                .core
-                .lock_gc_maps()
-                .objects
-                .len()),
+            LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len()),
             baseline,
             "object freed after last handle dropped"
         );
@@ -6392,11 +6166,7 @@ mod tests {
 
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_before = gc_ref.core.lock_gc_maps().objects.len();
             unsafe {
                 let stats = gc_ref.core.collect_incremental_timed(
                     crate::generation::Generation::Gen2,
@@ -6406,11 +6176,7 @@ mod tests {
                 assert_eq!(stats.objects_collected, 0);
                 assert!(stats.objects_scanned > 0);
             }
-            let objs_after = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_after = gc_ref.core.lock_gc_maps().objects.len();
             assert_eq!(objs_before, objs_after, "no objects should be collected");
         });
         drop(v);
@@ -6424,11 +6190,7 @@ mod tests {
 
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let objs_before = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_before = gc_ref.core.lock_gc_maps().objects.len();
             unsafe {
                 let stats = gc_ref.core.collect_concurrent_timed(
                     crate::generation::Generation::Gen2,
@@ -6437,11 +6199,7 @@ mod tests {
                 assert_eq!(stats.objects_collected, 0);
                 assert!(stats.objects_scanned > 0);
             }
-            let objs_after = gc_ref
-                .core
-                .lock_gc_maps()
-                .objects
-                .len();
+            let objs_after = gc_ref.core.lock_gc_maps().objects.len();
             assert_eq!(objs_before, objs_after, "no objects should be collected");
         });
         drop(v);
@@ -6715,9 +6473,7 @@ mod tests {
                 stats.bytes_freed,
             );
             // No objects should remain from this batch
-            let maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let maps = gc_ref.core.lock_gc_maps();
             assert_eq!(
                 maps.objects.len(),
                 0,
@@ -6759,9 +6515,7 @@ mod tests {
             // The live object should still be accessible
             assert_eq!(**live, 42);
             // There should be exactly 1 object remaining (the live one)
-            let maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let maps = gc_ref.core.lock_gc_maps();
             assert_eq!(
                 maps.objects.len(),
                 1,
@@ -6800,9 +6554,7 @@ mod tests {
                 "expected at least 2 cyclic objects collected, got {}",
                 stats.objects_collected,
             );
-            let maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let maps = gc_ref.core.lock_gc_maps();
             assert_eq!(
                 maps.objects.len(),
                 0,
@@ -6898,9 +6650,7 @@ mod tests {
             gc.borrow_mut().collect();
             // After collection, all objects should be gone
             let gc_ref = gc.borrow();
-            let maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let maps = gc_ref.core.lock_gc_maps();
             assert_eq!(
                 maps.objects.len(),
                 0,
@@ -6946,9 +6696,7 @@ mod tests {
         LOCAL_GC.with(|gc| unsafe {
             gc.borrow_mut().collect();
             let gc_ref = gc.borrow();
-            let maps = gc_ref
-                .core
-                .lock_gc_maps();
+            let maps = gc_ref.core.lock_gc_maps();
             assert_eq!(maps.objects.len(), 0, "all objects should be collected");
         });
     }

@@ -29,7 +29,6 @@ impl SlotKey for ObjectId {
     }
 }
 
-
 const SENTINEL: u32 = u32::MAX;
 
 enum SlotValue<V> {
