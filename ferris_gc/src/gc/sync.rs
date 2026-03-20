@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::basic_gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
-use crate::gc::{CompactLayout, Finalize, GarbageCollector, ObjectEntry, Trace, TracerInfo, TracerList};
+use crate::gc::{CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, Trace, TracerInfo, TracerList};
 use crate::slot_map::ObjectId;
 
 /// Convenience alias for an optional thread-safe GC pointer.
@@ -830,21 +830,22 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let mut gc_maps = self.core.lock_gc_maps();
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
-            let obj_id = gc_maps.objects.insert(ObjectEntry {
+            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
                 gen_survive_region: region.0 & 0xFFFF,
-
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_inter_ptr as *const dyn Trace,
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
                 root_ref_count_offset,
-            });
+                entry_block: std::ptr::null_mut(),
+            }));
+            let mut gc_maps = self.core.lock_gc_maps();
+            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
@@ -912,21 +913,22 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let mut gc_maps = self.core.lock_gc_maps();
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
-            let obj_id = gc_maps.objects.insert(ObjectEntry {
+            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
                 gen_survive_region: region.0 & 0xFFFF,
-
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
                 root_ref_count_offset,
-            });
+                entry_block: std::ptr::null_mut(),
+            }));
+            let mut gc_maps = self.core.lock_gc_maps();
+            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
@@ -1010,21 +1012,22 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
-            let mut gc_maps = self.core.lock_gc_maps();
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
-            let obj_id = gc_maps.objects.insert(ObjectEntry {
+            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
                 gen_survive_region: region.0 & 0xFFFF,
-
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_inter_ptr as *const dyn Trace,
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
                 root_ref_count_offset,
-            });
+                entry_block: std::ptr::null_mut(),
+            }));
+            let mut gc_maps = self.core.lock_gc_maps();
+            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
@@ -1068,21 +1071,22 @@ impl GlobalGarbageCollector {
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
-            let mut gc_maps = self.core.lock_gc_maps();
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
-            let obj_id = gc_maps.objects.insert(ObjectEntry {
+            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
                 gen_survive_region: region.0 & 0xFFFF,
-
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
                 root_ref_count_offset,
-            });
+                entry_block: std::ptr::null_mut(),
+            }));
+            let mut gc_maps = self.core.lock_gc_maps();
+            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
