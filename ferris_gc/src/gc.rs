@@ -260,14 +260,18 @@ impl<T> Finalize for RefCell<GcPtr<T>>
 where
     T: Sized + Trace,
 {
-    fn finalize(&self) {}
+    fn finalize(&self) {
+        self.borrow().t.finalize();
+    }
 }
 
 impl<T> Finalize for GcPtr<T>
 where
     T: Sized + Trace,
 {
-    fn finalize(&self) {}
+    fn finalize(&self) {
+        self.t.finalize();
+    }
 }
 
 #[allow(dead_code)]
@@ -1029,10 +1033,6 @@ impl GcObjMem {
     }
 }
 
-/// Combined finalize + drop function pointer. Called during deallocation.
-/// Finalizes the object first (catching panics), then drops it.
-pub(crate) type DeallocFn = unsafe fn(*mut u8);
-
 /// Per-tracer metadata stored inline in ObjectEntry's tracers Vec.
 pub(crate) struct TracerInfo {
     pub(crate) tracer_ptr: *const dyn Trace,
@@ -1223,7 +1223,6 @@ pub(crate) struct ObjectEntry {
     pub(crate) layout: CompactLayout,
     /// Packed generation (bits 31:30) + survive_count (bits 29:16, 14 bits) + region (bits 15:0).
     pub(crate) gen_survive_region: u32,
-    pub(crate) dealloc_fn: DeallocFn,
     /// All Gc<T>/GcCell<T> handles pointing to this object.
     /// RC hybrid: when tracers is empty, the object is eagerly deallocated.
     pub(crate) tracers: TracerList,
@@ -1558,12 +1557,14 @@ impl GarbageCollector {
     /// The `ObjectEntry` must refer to a valid, initialized object that has been
     /// removed from the GC maps and is no longer reachable.
     unsafe fn dealloc_object_entry(entry: ObjectEntry) {
-        let mem_ptr = entry.ptr.get_thin_ptr() as *mut u8;
-        let dealloc_fn = entry.dealloc_fn;
+        let fat_ptr = entry.ptr;
+        let mem_ptr = fat_ptr.get_thin_ptr() as *mut u8;
+        // Finalize through vtable (GcPtr<T>::finalize delegates to T::finalize).
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: dealloc_fn finalizes then drops; wrapped in catch_unwind for panic safety.
-            unsafe { (dealloc_fn)(mem_ptr) };
+            unsafe { (&*fat_ptr).finalize() };
         }));
+        // Drop through vtable drop glue (drops GcPtr<T> which drops T).
+        unsafe { std::ptr::drop_in_place(fat_ptr as *mut dyn Trace) };
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
         unsafe { entry.mem.dealloc_mem(mem_ptr, entry.layout.to_layout()) };
     }
@@ -2121,10 +2122,9 @@ impl GarbageCollector {
             // (finalize, drop, dealloc) and each entry is disjoint — no two
             // entries alias the same memory.
             struct SendObjectDealloc {
-                ptr: *mut u8,
+                fat_ptr: *const dyn Trace,
                 mem: GcObjMem,
                 layout: Layout,
-                dealloc_fn: DeallocFn,
             }
             // SAFETY: Each SendObjectDealloc owns a unique allocation.
             // The raw pointer is only used for dealloc and is never shared between threads.
@@ -2143,12 +2143,10 @@ impl GarbageCollector {
             let obj_dealloc_items: Vec<SendObjectDealloc> = object_deallocs
                 .into_iter()
                 .map(|entry| {
-                    let ptr = entry.ptr.get_thin_ptr() as *mut u8;
                     SendObjectDealloc {
-                        ptr,
+                        fat_ptr: entry.ptr,
                         mem: entry.mem,
                         layout: entry.layout.to_layout(),
-                        dealloc_fn: entry.dealloc_fn,
                     }
                 })
                 .collect();
@@ -2159,13 +2157,14 @@ impl GarbageCollector {
                 .collect();
 
             obj_dealloc_items.into_par_iter().for_each(|item| {
-                let mem_ptr = item.ptr;
+                let mem_ptr = item.fat_ptr.get_thin_ptr() as *mut u8;
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: dealloc_fn finalizes+drops; wrapped in catch_unwind for panic safety.
-                    (item.dealloc_fn)(mem_ptr);
+                    // Finalize through vtable, then drop through vtable drop glue.
+                    unsafe { (&*item.fat_ptr).finalize() };
                 }));
+                unsafe { std::ptr::drop_in_place(item.fat_ptr as *mut dyn Trace) };
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
-                unsafe { item.mem.dealloc_mem(item.ptr, item.layout) };
+                unsafe { item.mem.dealloc_mem(mem_ptr, item.layout) };
             });
             tracer_dealloc_items.into_par_iter().for_each(|item| {
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem.
@@ -2341,10 +2340,9 @@ impl GarbageCollector {
 
             // Parallel dealloc (same as collect_parallel)
             struct SendObjectDealloc {
-                ptr: *mut u8,
+                fat_ptr: *const dyn Trace,
                 mem: GcObjMem,
                 layout: Layout,
-                dealloc_fn: DeallocFn,
             }
             unsafe impl Send for SendObjectDealloc {}
             unsafe impl Sync for SendObjectDealloc {}
@@ -2360,12 +2358,10 @@ impl GarbageCollector {
             let obj_dealloc_items: Vec<SendObjectDealloc> = object_deallocs
                 .into_iter()
                 .map(|entry| {
-                    let ptr = entry.ptr.get_thin_ptr() as *mut u8;
                     SendObjectDealloc {
-                        ptr,
+                        fat_ptr: entry.ptr,
                         mem: entry.mem,
                         layout: entry.layout.to_layout(),
-                        dealloc_fn: entry.dealloc_fn,
                     }
                 })
                 .collect();
@@ -2376,13 +2372,14 @@ impl GarbageCollector {
                 .collect();
 
             obj_dealloc_items.into_par_iter().for_each(|item| {
-                let mem_ptr = item.ptr;
+                let mem_ptr = item.fat_ptr.get_thin_ptr() as *mut u8;
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: dealloc_fn finalizes+drops; wrapped in catch_unwind for panic safety.
-                    (item.dealloc_fn)(mem_ptr);
+                    // Finalize through vtable, then drop through vtable drop glue.
+                    unsafe { (&*item.fat_ptr).finalize() };
                 }));
+                unsafe { std::ptr::drop_in_place(item.fat_ptr as *mut dyn Trace) };
                 // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
-                unsafe { item.mem.dealloc_mem(item.ptr, item.layout) };
+                unsafe { item.mem.dealloc_mem(mem_ptr, item.layout) };
             });
             tracer_dealloc_items.into_par_iter().for_each(|item| {
                 // SAFETY: Tracer memory was allocated with the same layout via alloc/alloc_mem.
@@ -3629,21 +3626,12 @@ impl LocalGarbageCollector {
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let gc_maps = self.core.gc_maps_unsync();
-            unsafe fn dealloc_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (*(ptr as *const GcPtr<T>)).t.finalize();
-                    }));
-                    std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
-                }
-            }
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
                 layout: CompactLayout::from_layout(obj_layout),
                 gen_survive_region: region.0 & 0xFFFF,
-                dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: tracer_list,
                 root_ref_count_offset,
@@ -3727,23 +3715,12 @@ impl LocalGarbageCollector {
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let gc_maps = self.core.gc_maps_unsync();
-            unsafe fn dealloc_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
-                            .t
-                            .finalize();
-                    }));
-                    std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
-                }
-            }
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
                 layout: CompactLayout::from_layout(obj_layout),
                 gen_survive_region: region.0 & 0xFFFF,
-                dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: tracer_list,
                 root_ref_count_offset,
@@ -3842,21 +3819,12 @@ impl LocalGarbageCollector {
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let gc_maps = self.core.gc_maps_unsync();
-            unsafe fn dealloc_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (*(ptr as *const GcPtr<T>)).t.finalize();
-                    }));
-                    std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
-                }
-            }
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
                 layout: CompactLayout::from_layout(obj_layout),
                 gen_survive_region: region.0 & 0xFFFF,
-                dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: tracer_list,
                 root_ref_count_offset,
@@ -3919,23 +3887,12 @@ impl LocalGarbageCollector {
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let gc_maps = self.core.gc_maps_unsync();
-            unsafe fn dealloc_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
-                            .t
-                            .finalize();
-                    }));
-                    std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
-                }
-            }
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
                 layout: CompactLayout::from_layout(obj_layout),
                 gen_survive_region: region.0 & 0xFFFF,
-                dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: tracer_list,
                 root_ref_count_offset,
@@ -4448,7 +4405,7 @@ mod tests {
         eprintln!("ObjectEntry size: {}B", size);
         eprintln!("GcObjMem size: {}B", std::mem::size_of::<super::GcObjMem>());
         eprintln!("TracerList size: {}B", std::mem::size_of::<super::TracerList>());
-        assert!(size <= 80, "ObjectEntry grew unexpectedly to {size}B");
+        assert!(size <= 72, "ObjectEntry grew unexpectedly to {size}B");
     }
 
     #[test]

@@ -831,21 +831,12 @@ impl GlobalGarbageCollector {
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let mut gc_maps = self.core.lock_gc_maps();
-            unsafe fn dealloc_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (*(ptr as *const GcPtr<T>)).t.finalize();
-                    }));
-                    std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
-                }
-            }
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
                 gen_survive_region: region.0 & 0xFFFF,
-                dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_inter_ptr as *const dyn Trace,
@@ -922,23 +913,12 @@ impl GlobalGarbageCollector {
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let mut gc_maps = self.core.lock_gc_maps();
-            unsafe fn dealloc_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
-                            .t
-                            .finalize();
-                    }));
-                    std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
-                }
-            }
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
                 gen_survive_region: region.0 & 0xFFFF,
-                dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
@@ -1031,21 +1011,12 @@ impl GlobalGarbageCollector {
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let mut gc_maps = self.core.lock_gc_maps();
-            unsafe fn dealloc_gc_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (*(ptr as *const GcPtr<T>)).t.finalize();
-                    }));
-                    std::ptr::drop_in_place(ptr as *mut GcPtr<T>);
-                }
-            }
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
                 gen_survive_region: region.0 & 0xFFFF,
-                dealloc_fn: dealloc_gc_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_inter_ptr as *const dyn Trace,
@@ -1098,23 +1069,12 @@ impl GlobalGarbageCollector {
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let mut gc_maps = self.core.lock_gc_maps();
-            unsafe fn dealloc_gc_cell_ptr<T: 'static + Trace + Finalize>(ptr: *mut u8) {
-                unsafe {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (*(*(ptr as *const RefCell<GcPtr<T>>)).as_ptr())
-                            .t
-                            .finalize();
-                    }));
-                    std::ptr::drop_in_place(ptr as *mut RefCell<GcPtr<T>>);
-                }
-            }
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const AtomicUsize as *const Cell<usize> as usize - gc_ptr as usize) as u16;
             let obj_id = gc_maps.objects.insert(ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
                 gen_survive_region: region.0 & 0xFFFF,
-                dealloc_fn: dealloc_gc_cell_ptr::<T>,
 
                 tracers: TracerList::new(TracerInfo {
                     tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
