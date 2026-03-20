@@ -493,13 +493,12 @@ where
     fn drop(&mut self) {
         let tracer_ptr = self.internal_ptr as *const u8;
         let object_id = self.object_id;
-        // SAFETY: Thread-local access ensures single-threaded borrow; try_borrow_mut avoids re-entrant panic.
+        // SAFETY: Thread-local access ensures single-threaded operation.
+        // Re-entrant drops (from RC hybrid dealloc cascading through inner Gc fields)
+        // are safe because gc_maps borrows don't overlap: remove_tracer_inner finishes
+        // its &mut GcMaps borrow before finalize_remove_tracer triggers nested drops.
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
-            // Use try_borrow_mut to avoid panic from re-entrant drops:
-            // RC hybrid dealloc may drop inner Gc fields whose drop also calls remove_tracer.
-            if let Ok(gc) = gc.try_borrow_mut() {
-                gc.remove_tracer(object_id, tracer_ptr);
-            }
+            (*gc.as_ptr()).remove_tracer(object_id, tracer_ptr);
         });
     }
 }
@@ -673,13 +672,12 @@ where
     fn drop(&mut self) {
         let tracer_ptr = self.internal_ptr as *const u8;
         let object_id = self.object_id;
-        // SAFETY: Thread-local access ensures single-threaded borrow; try_borrow_mut avoids re-entrant panic.
+        // SAFETY: Thread-local access ensures single-threaded operation.
+        // Re-entrant drops (from RC hybrid dealloc cascading through inner Gc fields)
+        // are safe because gc_maps borrows don't overlap: remove_tracer_inner finishes
+        // its &mut GcMaps borrow before finalize_remove_tracer triggers nested drops.
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
-            // Use try_borrow_mut to avoid panic from re-entrant drops:
-            // RC hybrid dealloc may drop inner Gc fields whose drop also calls remove_tracer.
-            if let Ok(gc) = gc.try_borrow_mut() {
-                gc.remove_tracer(object_id, tracer_ptr);
-            }
+            (*gc.as_ptr()).remove_tracer(object_id, tracer_ptr);
         });
     }
 }
@@ -1587,9 +1585,7 @@ impl GarbageCollector {
 
         let mem_ptr = fat_ptr.get_thin_ptr() as *mut u8;
         // Finalize through vtable (GcPtr<T>::finalize delegates to T::finalize).
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            unsafe { (&*fat_ptr).finalize() };
-        }));
+        unsafe { (&*fat_ptr).finalize() };
         // Drop through vtable drop glue (drops GcPtr<T> which drops T).
         unsafe { std::ptr::drop_in_place(fat_ptr as *mut dyn Trace) };
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
@@ -1719,6 +1715,7 @@ impl GarbageCollector {
     ///
     /// # Safety
     /// Must only be called from the owning thread (thread-local GC).
+    #[inline]
     pub(crate) unsafe fn remove_tracer_unsync(&self, object_id: ObjectId, tracer_ptr: *const u8) {
         let gc_maps = unsafe { self.gc_maps_unsync() };
         let (tracer_dealloc, object_dealloc) =
@@ -1727,6 +1724,7 @@ impl GarbageCollector {
         Self::finalize_remove_tracer(self, tracer_dealloc, object_dealloc);
     }
 
+    #[inline]
     fn remove_tracer_inner(
         gc_maps: &mut GcMaps,
         card_table: &CardTable,
@@ -1766,6 +1764,7 @@ impl GarbageCollector {
         (tracer_dealloc, object_dealloc)
     }
 
+    #[inline]
     fn finalize_remove_tracer(&self, tracer_dealloc: Option<(*mut u8, GcObjMem, Layout)>, object_dealloc: Option<ObjectEntryRef>) {
         // Dealloc tracer outside lock scope
         if let Some((ptr, mem, layout)) = tracer_dealloc {
@@ -3535,6 +3534,40 @@ impl LocalGarbageCollector {
         Some((ptr_a, ptr_b, GcObjMem::Tlab(block), combined))
     }
 
+    /// Try to allocate [A | B | ObjectEntry] in a single TLAB bump.
+    /// Returns pointers to all three plus the obj_mem, layout, and the entry's block pointer.
+    /// The block gets two add_refs: one for obj dealloc, one for entry dealloc.
+    ///
+    /// # Safety
+    /// All three returned pointers must be initialized via ptr::write before use.
+    #[inline]
+    unsafe fn try_alloc_triple_tlab<A: Sized, B: Sized>(
+        &mut self,
+    ) -> Option<(*mut A, *mut B, *mut ObjectEntry, GcObjMem, Layout, *mut crate::tlab::TlabBlock)> {
+        let layout_a = Layout::new::<A>();
+        let layout_b = Layout::new::<B>();
+        let layout_c = Layout::new::<ObjectEntry>();
+        let (ab, offset_b) = layout_a.extend(layout_b).ok()?;
+        let (abc, offset_c) = ab.extend(layout_c).ok()?;
+        let abc = abc.pad_to_align();
+
+        let tlab_result = if let Some(ref mut tlab) = self.tlab {
+            tlab.alloc_or_grow(abc)
+        } else {
+            let mut tlab = crate::tlab::Tlab::new()?;
+            let r = tlab.alloc(abc);
+            self.tlab = Some(tlab);
+            r
+        };
+        let (ptr, block) = tlab_result?;
+        let ptr_a = ptr as *mut A;
+        let ptr_b = unsafe { ptr.add(offset_b) } as *mut B;
+        let ptr_c = unsafe { ptr.add(offset_c) } as *mut ObjectEntry;
+        // Second add_ref for the entry's separate dealloc path.
+        unsafe { crate::tlab::TlabBlock::add_ref(block) };
+        Some((ptr_a, ptr_b, ptr_c, GcObjMem::Tlab(block), abc, block))
+    }
+
     /// Allocate an ObjectEntry in the TLAB. Returns a raw pointer to uninitialized
     /// memory and the TlabBlock pointer for later release.
     /// Falls back to system allocator if TLAB is unavailable.
@@ -3664,9 +3697,19 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            // Try combined allocation: [GcPtr<T> | GcInternal<T>] in one TLAB bump.
-            let (gc_ptr, gc_inter_ptr, obj_mem, obj_layout, tracer_list);
-            if let Some((a, b, mem, layout)) =
+            // Try triple allocation: [GcPtr<T> | GcInternal<T> | ObjectEntry] in one TLAB bump.
+            let (gc_ptr, gc_inter_ptr, oe_ptr, obj_mem, obj_layout, tracer_list, oe_block);
+            if let Some((a, b, c, mem, layout, block)) =
+                self.try_alloc_triple_tlab::<GcPtr<T>, GcInternal<T>>()
+            {
+                gc_ptr = a;
+                gc_inter_ptr = b;
+                oe_ptr = c;
+                obj_mem = mem;
+                obj_layout = layout;
+                tracer_list = TracerList::new_inline(b as *const dyn Trace);
+                oe_block = block;
+            } else if let Some((a, b, mem, layout)) =
                 self.try_alloc_combined_tlab::<GcPtr<T>, GcInternal<T>>()
             {
                 gc_ptr = a;
@@ -3674,6 +3717,9 @@ impl LocalGarbageCollector {
                 obj_mem = mem;
                 obj_layout = layout;
                 tracer_list = TracerList::new_inline(b as *const dyn Trace);
+                let (c, block) = self.alloc_entry_tlab();
+                oe_ptr = c;
+                oe_block = block;
             } else {
                 // Fallback: separate allocations
                 let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<GcPtr<T>>();
@@ -3687,11 +3733,13 @@ impl LocalGarbageCollector {
                     mem: mem_b,
                     layout: layout_b,
                 });
+                let (c, block) = self.alloc_entry_tlab();
+                oe_ptr = c;
+                oe_block = block;
             }
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
-            let (oe_ptr, oe_block) = self.alloc_entry_tlab();
             std::ptr::write(oe_ptr, ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
@@ -3757,8 +3805,18 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let (gc_ptr, gc_cell_inter_ptr, obj_mem, obj_layout, tracer_list);
-            if let Some((a, b, mem, layout)) =
+            let (gc_ptr, gc_cell_inter_ptr, oe_ptr, obj_mem, obj_layout, tracer_list, oe_block);
+            if let Some((a, b, c, mem, layout, block)) =
+                self.try_alloc_triple_tlab::<RefCell<GcPtr<T>>, GcCellInternal<T>>()
+            {
+                gc_ptr = a;
+                gc_cell_inter_ptr = b;
+                oe_ptr = c;
+                obj_mem = mem;
+                obj_layout = layout;
+                tracer_list = TracerList::new_inline(b as *const dyn Trace);
+                oe_block = block;
+            } else if let Some((a, b, mem, layout)) =
                 self.try_alloc_combined_tlab::<RefCell<GcPtr<T>>, GcCellInternal<T>>()
             {
                 gc_ptr = a;
@@ -3766,6 +3824,9 @@ impl LocalGarbageCollector {
                 obj_mem = mem;
                 obj_layout = layout;
                 tracer_list = TracerList::new_inline(b as *const dyn Trace);
+                let (c, block) = self.alloc_entry_tlab();
+                oe_ptr = c;
+                oe_block = block;
             } else {
                 let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<RefCell<GcPtr<T>>>();
                 let (b, (mem_b, layout_b)) = self.alloc_mem_tlab::<GcCellInternal<T>>();
@@ -3778,11 +3839,13 @@ impl LocalGarbageCollector {
                     mem: mem_b,
                     layout: layout_b,
                 });
+                let (c, block) = self.alloc_entry_tlab();
+                oe_ptr = c;
+                oe_block = block;
             }
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count as *const Cell<usize> as usize - gc_ptr as usize) as u16;
-            let (oe_ptr, oe_block) = self.alloc_entry_tlab();
             std::ptr::write(oe_ptr, ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: obj_mem,
@@ -4074,6 +4137,7 @@ impl LocalGarbageCollector {
         unsafe { self.core.collect_parallel_mark(max_gen) }
     }
 
+    #[inline]
     pub(crate) unsafe fn remove_tracer(&self, object_id: ObjectId, tracer_ptr: *const u8) {
         // SAFETY: Thread-local GC, no concurrent access; caller provides valid object_id and tracer_ptr.
         unsafe {
@@ -6288,16 +6352,13 @@ mod tests {
     #[test]
     fn stats_tracks_bytes_freed() {
         clean_gc_state();
-        // Create two objects forming a cycle so RC hybrid does NOT eagerly free them.
+        // Create a self-cycle so RC hybrid cannot eagerly free it.
         // Only mark-sweep collection can reclaim cycles.
-        let a = Gc::new(GcCell::new(
-            Option::<Gc<GcCell<Option<Gc<GcCell<Option<i32>>>>>>>::None,
-        ));
-        let b = Gc::new(GcCell::new(Some(a.clone())));
-        // We just need objects that survive past drop for the collector to find them.
-        // Instead, use a simpler approach: just allocate, drop, and collect in separate scopes.
+        let a = Gc::new(CyclicNode {
+            next: std::cell::RefCell::new(None),
+        });
+        *a.next.borrow_mut() = Some(a.clone());
         drop(a);
-        drop(b);
         LOCAL_GC.with(|gc| unsafe {
             gc.borrow().core.collect();
         });
