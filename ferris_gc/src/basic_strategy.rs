@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// When set to `true`, `basic_gc_strategy_start()` becomes a no-op.
+/// When set to `true`, `basic_strategy_start()` becomes a no-op.
 /// Used by `#[ferris_gc_main(strategy = "...")]` to prevent the basic
 /// background thread from starting when a different strategy is configured.
 pub static BASIC_STRATEGY_DISABLED: AtomicBool = AtomicBool::new(false);
@@ -39,7 +39,7 @@ impl Drop for ApplicationCleanup {
     }
 }
 
-pub fn basic_gc_strategy_start() {
+pub fn basic_strategy_start() {
     if BASIC_STRATEGY_DISABLED.load(Ordering::Acquire) {
         return;
     }

@@ -53,7 +53,7 @@ Internal type hierarchy per GC: `Gc<T>` → `GcInternal<T>` (ref counting + root
 - `#[derive(Finalize)]` — Generates empty finalize impl.
 - `#[ferris_gc_main]` — Wraps `main()` to inject `ApplicationCleanup` for graceful background-thread shutdown.
 
-### Collection Strategy (`basic_gc_strategy.rs`)
+### Collection Strategy (`basic_strategy.rs`)
 
 Background thread wakes every 500ms to call `collect()` on registered GCs. `ApplicationCleanup` (RAII) signals shutdown via `APPLICATION_ACTIVE` atomic flag and joins background threads.
 

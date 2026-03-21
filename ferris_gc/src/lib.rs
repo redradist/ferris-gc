@@ -26,7 +26,7 @@ mod adaptive_strategy;
 #[cfg(feature = "std")]
 mod background_strategy;
 #[cfg(feature = "std")]
-mod basic_gc_strategy;
+mod basic_strategy;
 #[cfg(feature = "std")]
 mod card_table;
 #[cfg(feature = "std")]
@@ -52,7 +52,7 @@ pub use background_strategy::{
     BackgroundConfig, background_global_strategy, background_local_strategy,
 };
 #[cfg(feature = "std")]
-pub use basic_gc_strategy::{
+pub use basic_strategy::{
     ApplicationCleanup, BASIC_POLL_INTERVAL_MS, BASIC_STRATEGY_DISABLED, BASIC_STRATEGY_GLOBAL_GC,
     BASIC_STRATEGY_LOCAL_GCS,
 };

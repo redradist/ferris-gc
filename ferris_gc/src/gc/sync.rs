@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::basic_gc_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_gc_strategy_start};
+use crate::basic_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_strategy_start};
 use crate::gc::{
     CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, Trace, TracerInfo,
     TracerList,
@@ -326,7 +326,7 @@ where
     /// Allocate a new thread-safe GC-managed object on the global collector.
     /// Starts the background collection strategy if not already active.
     pub fn new(t: T) -> Gc<T> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe {
@@ -337,7 +337,7 @@ where
 
     /// Allocate a new thread-safe GC-managed object in the specified region.
     pub fn new_in(t: T, region: SyncRegionId) -> Gc<T> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).create_gc(t, region.0) }
     }
@@ -345,7 +345,7 @@ where
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     /// On OOM, triggers an emergency GC collection and retries once before failing.
     pub fn try_new(t: T) -> Result<Gc<T>, crate::gc::GcAllocError> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe {
@@ -356,7 +356,7 @@ where
 
     /// Fallible allocation in a specified region.
     pub fn try_new_in(t: T, region: SyncRegionId) -> Result<Gc<T>, crate::gc::GcAllocError> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).try_create_gc(t, region.0) }
     }
@@ -574,7 +574,7 @@ where
 {
     /// Allocate a new thread-safe GC-managed interior-mutable cell on the global collector.
     pub fn new(t: T) -> GcCell<T> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe {
             let region = GLOBAL_GC.core.current_region();
@@ -584,7 +584,7 @@ where
 
     /// Allocate a new thread-safe GC-managed interior-mutable cell in the specified region.
     pub fn new_in(t: T, region: SyncRegionId) -> GcCell<T> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).create_gc_cell(t, region.0) }
     }
@@ -592,7 +592,7 @@ where
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     /// On OOM, triggers an emergency GC collection and retries once before failing.
     pub fn try_new(t: T) -> Result<GcCell<T>, crate::gc::GcAllocError> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe {
             let region = GLOBAL_GC.core.current_region();
@@ -602,7 +602,7 @@ where
 
     /// Fallible allocation in a specified region.
     pub fn try_new_in(t: T, region: SyncRegionId) -> Result<GcCell<T>, crate::gc::GcAllocError> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).try_create_gc_cell(t, region.0) }
     }

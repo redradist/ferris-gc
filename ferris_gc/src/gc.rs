@@ -27,7 +27,7 @@ impl LocalRegionId {
     }
 }
 
-use crate::basic_gc_strategy::basic_gc_strategy_start;
+use crate::basic_strategy::basic_strategy_start;
 
 pub mod sync;
 
@@ -414,7 +414,7 @@ where
     /// Allocate a new GC-managed object on the thread-local collector.
     /// Starts the background collection strategy if not already active.
     pub fn new(t: T) -> Gc<T> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 // SAFETY: Single-threaded access via thread_local ensures no aliasing.
@@ -431,7 +431,7 @@ where
 
     /// Allocate a new GC-managed object in the specified region.
     pub fn new_in(t: T, region: LocalRegionId) -> Gc<T> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 // SAFETY: Single-threaded access via thread_local ensures no aliasing.
@@ -446,7 +446,7 @@ where
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     /// On OOM, triggers an emergency GC collection and retries once before failing.
     pub fn try_new(t: T) -> Result<Gc<T>, GcAllocError> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 // SAFETY: Single-threaded access via thread_local ensures no aliasing.
@@ -463,7 +463,7 @@ where
 
     /// Fallible allocation in a specified region.
     pub fn try_new_in(t: T, region: LocalRegionId) -> Result<Gc<T>, GcAllocError> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 // SAFETY: Single-threaded access via thread_local ensures no aliasing.
@@ -709,7 +709,7 @@ where
     /// Allocate a new GC-managed interior-mutable cell on the thread-local collector.
     /// The contained value can be borrowed mutably via `borrow_mut()`.
     pub fn new(t: T) -> GcCell<T> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 // SAFETY: Single-threaded access via thread_local ensures no aliasing.
@@ -726,7 +726,7 @@ where
 
     /// Allocate a new GC-managed interior-mutable cell in the specified region.
     pub fn new_in(t: T, region: LocalRegionId) -> GcCell<T> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 // SAFETY: Single-threaded access via thread_local ensures no aliasing.
@@ -741,7 +741,7 @@ where
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     /// On OOM, triggers an emergency GC collection and retries once before failing.
     pub fn try_new(t: T) -> Result<GcCell<T>, GcAllocError> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 // SAFETY: Single-threaded access via thread_local ensures no aliasing.
@@ -758,7 +758,7 @@ where
 
     /// Fallible allocation in a specified region.
     pub fn try_new_in(t: T, region: LocalRegionId) -> Result<GcCell<T>, GcAllocError> {
-        basic_gc_strategy_start();
+        basic_strategy_start();
         LOCAL_GC_STRATEGY.with(|strategy| {
             if !strategy.borrow().is_active() {
                 // SAFETY: Single-threaded access via thread_local ensures no aliasing.
