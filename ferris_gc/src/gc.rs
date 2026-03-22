@@ -32,14 +32,34 @@ use crate::basic_strategy::basic_strategy_start;
 pub mod sync;
 
 thread_local! {
-    /// Context pointer for reset_root cascade. Set to `&mut GcMaps` during
-    /// collection and create_gc, so that `Gc<T>::reset_root()` can decrement
-    /// child objects' `root_count` without a separate gc_maps borrow.
+    /// Tagged context pointer for reset_root cascade.
+    ///
+    /// Encodes *both* the `GcMaps` pointer and the collecting flag in a single
+    /// thread-local, eliminating one TLS read per node in the cascade hot path.
+    ///
+    /// Encoding (bit 0 of the pointer, which is always free due to alignment):
+    /// - `null`               → no cascade context
+    /// - `ptr` (bit 0 clear)  → allocation-time cascade (only decrement if is_root)
+    /// - `ptr | 1` (bit 0 set)→ collection cascade (always decrement root_count)
     pub(crate) static GC_MAPS_CTX: Cell<*mut GcMaps> = const { Cell::new(std::ptr::null_mut()) };
-    /// When true, Gc::reset_root() always decrements root_count (ignoring is_root).
-    /// Set during collection only; cleared after. During allocation-time cascade,
-    /// this is false so Gc::reset_root() respects is_root to avoid double-counting.
-    pub(crate) static GC_COLLECTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Tag a GcMaps pointer as "collecting" by setting bit 0.
+#[inline(always)]
+fn gc_ctx_tag_collecting(ptr: *mut GcMaps) -> *mut GcMaps {
+    (ptr as usize | 1) as *mut GcMaps
+}
+
+/// Extract the raw GcMaps pointer (strip tag bit).
+#[inline(always)]
+fn gc_ctx_ptr(tagged: *mut GcMaps) -> *mut GcMaps {
+    (tagged as usize & !1usize) as *mut GcMaps
+}
+
+/// Check if the tagged pointer indicates collection mode.
+#[inline(always)]
+fn gc_ctx_is_collecting(tagged: *mut GcMaps) -> bool {
+    (tagged as usize & 1) != 0
 }
 
 pub(crate) trait ThinPtr {
@@ -436,47 +456,36 @@ where
         self.is_root.get()
     }
 
+    #[inline(always)]
     fn reset_root(&self) {
-        let collecting = GC_COLLECTING.with(|c| c.get());
-        if collecting {
-            // During collection: always decrement root_count for each internal reference.
-            // Use root_ref_count as cycle guard: only cascade if not yet visited.
-            let should_cascade = GC_MAPS_CTX.with(|ctx| {
-                let gc_maps = ctx.get();
-                if !gc_maps.is_null() {
-                    unsafe {
-                        if let Some(entry) = (*gc_maps).objects.get_mut(self.object_id) {
-                            entry.root_count = entry.root_count.saturating_sub(1);
-                            // Use root_ref_count as visited flag: 0 = not visited, 1 = visited
-                            let rrc = entry.root_ref_count();
-                            if rrc.get() == 0 {
-                                rrc.set(1); // mark visited
-                                return true; // cascade
-                            }
-                        }
-                    }
-                }
-                false
-            });
-            if should_cascade {
-                unsafe {
+        let tagged = GC_MAPS_CTX.get();
+        if tagged.is_null() {
+            return;
+        }
+        if gc_ctx_is_collecting(tagged) {
+            // Collection mode: always decrement root_count.
+            // get_unchecked_mut — object_id is valid during collection cascade.
+            // root_ref_count as cycle guard: 0 = unvisited, 1 = visited.
+            let gc_maps = gc_ctx_ptr(tagged);
+            unsafe {
+                let entry: &mut ObjectEntry =
+                    &mut *(*gc_maps).objects.get_unchecked_mut(self.object_id);
+                entry.root_count = entry.root_count.saturating_sub(1);
+                let rrc = entry.root_ref_count();
+                if rrc.get() == 0 {
+                    rrc.set(1);
                     (*self.ptr.get()).reset_root();
                 }
             }
         } else if self.is_root.get() {
-            // During allocation: only decrement if this handle was a root (prevents double-count).
+            // Allocation mode: only decrement if this handle was a root.
             self.is_root.set(false);
-            GC_MAPS_CTX.with(|ctx| {
-                let gc_maps = ctx.get();
-                if !gc_maps.is_null() {
-                    unsafe {
-                        if let Some(entry) = (*gc_maps).objects.get_mut(self.object_id) {
-                            entry.root_count = entry.root_count.saturating_sub(1);
-                        }
-                    }
+            let gc_maps = gc_ctx_ptr(tagged);
+            unsafe {
+                if let Some(entry) = (*gc_maps).objects.get_mut(self.object_id) {
+                    entry.root_count = entry.root_count.saturating_sub(1);
                 }
-            });
-            // Cascade into child object's fields.
+            }
             unsafe {
                 (*self.ptr.get()).reset_root();
             }
@@ -673,43 +682,32 @@ where
         self.is_root.get()
     }
 
+    #[inline(always)]
     fn reset_root(&self) {
-        let collecting = GC_COLLECTING.with(|c| c.get());
-        if collecting {
-            // During collection: always decrement root_count for each internal reference.
-            let should_cascade = GC_MAPS_CTX.with(|ctx| {
-                let gc_maps = ctx.get();
-                if !gc_maps.is_null() {
-                    unsafe {
-                        if let Some(entry) = (*gc_maps).objects.get_mut(self.object_id) {
-                            entry.root_count = entry.root_count.saturating_sub(1);
-                            let rrc = entry.root_ref_count();
-                            if rrc.get() == 0 {
-                                rrc.set(1);
-                                return true;
-                            }
-                        }
-                    }
-                }
-                false
-            });
-            if should_cascade {
-                unsafe {
+        let tagged = GC_MAPS_CTX.get();
+        if tagged.is_null() {
+            return;
+        }
+        if gc_ctx_is_collecting(tagged) {
+            let gc_maps = gc_ctx_ptr(tagged);
+            unsafe {
+                let entry: &mut ObjectEntry =
+                    &mut *(*gc_maps).objects.get_unchecked_mut(self.object_id);
+                entry.root_count = entry.root_count.saturating_sub(1);
+                let rrc = entry.root_ref_count();
+                if rrc.get() == 0 {
+                    rrc.set(1);
                     (*self.ptr.get()).borrow().reset_root();
                 }
             }
         } else if self.is_root.get() {
             self.is_root.set(false);
-            GC_MAPS_CTX.with(|ctx| {
-                let gc_maps = ctx.get();
-                if !gc_maps.is_null() {
-                    unsafe {
-                        if let Some(entry) = (*gc_maps).objects.get_mut(self.object_id) {
-                            entry.root_count = entry.root_count.saturating_sub(1);
-                        }
-                    }
+            let gc_maps = gc_ctx_ptr(tagged);
+            unsafe {
+                if let Some(entry) = (*gc_maps).objects.get_mut(self.object_id) {
+                    entry.root_count = entry.root_count.saturating_sub(1);
                 }
-            });
+            }
             unsafe {
                 (*self.ptr.get()).borrow().reset_root();
             }
@@ -1816,10 +1814,9 @@ impl GarbageCollector {
             }
 
             // Phase 2: Cascade reset_root through the object graph.
-            // GC_COLLECTING=true makes Gc::reset_root() always decrement root_count.
+            // Tagged pointer with bit 0 set → collection mode (always decrement root_count).
             // root_ref_count serves as cycle guard (0=unvisited, 1=visited).
-            GC_COLLECTING.with(|c| c.set(true));
-            GC_MAPS_CTX.with(|ctx| ctx.set(gc_maps_raw));
+            GC_MAPS_CTX.set(gc_ctx_tag_collecting(gc_maps_raw));
             match scope {
                 None => {
                     for entry in (*gc_maps_raw).objects.values() {
@@ -1841,8 +1838,7 @@ impl GarbageCollector {
                     }
                 }
             }
-            GC_MAPS_CTX.with(|ctx| ctx.set(std::ptr::null_mut()));
-            GC_COLLECTING.with(|c| c.set(false));
+            GC_MAPS_CTX.set(std::ptr::null_mut());
 
             // Phase 2.5: Re-count roots for sync objects (handle_count == 0).
             // The cascade above flipped is_root flags on GcInternal tracers.
@@ -3729,9 +3725,9 @@ impl LocalGarbageCollector {
             };
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.with(|ctx| ctx.set(gc_maps_raw));
+            GC_MAPS_CTX.set(gc_maps_raw);
             (*gc_ptr).reset_root();
-            GC_MAPS_CTX.with(|ctx| ctx.set(std::ptr::null_mut()));
+            GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.store(
                 self.core.allocation_count.load(Ordering::Relaxed) + 1,
                 Ordering::Relaxed,
@@ -3758,9 +3754,9 @@ impl LocalGarbageCollector {
                 object_id,
             };
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.with(|ctx| ctx.set(gc_maps_raw));
+            GC_MAPS_CTX.set(gc_maps_raw);
             (*gc.ptr.get()).reset_root();
-            GC_MAPS_CTX.with(|ctx| ctx.set(std::ptr::null_mut()));
+            GC_MAPS_CTX.set(std::ptr::null_mut());
             new_gc
         }
     }
@@ -3825,9 +3821,9 @@ impl LocalGarbageCollector {
             };
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.with(|ctx| ctx.set(gc_maps_raw));
+            GC_MAPS_CTX.set(gc_maps_raw);
             (*gc_ptr).reset_root();
-            GC_MAPS_CTX.with(|ctx| ctx.set(std::ptr::null_mut()));
+            GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.store(
                 self.core.allocation_count.load(Ordering::Relaxed) + 1,
                 Ordering::Relaxed,
@@ -3854,9 +3850,9 @@ impl LocalGarbageCollector {
                 object_id,
             };
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.with(|ctx| ctx.set(gc_maps_raw));
+            GC_MAPS_CTX.set(gc_maps_raw);
             (*gc.ptr.get()).reset_root();
-            GC_MAPS_CTX.with(|ctx| ctx.set(std::ptr::null_mut()));
+            GC_MAPS_CTX.set(std::ptr::null_mut());
             new_gc
         }
     }
@@ -3922,9 +3918,9 @@ impl LocalGarbageCollector {
             };
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.with(|ctx| ctx.set(gc_maps_raw));
+            GC_MAPS_CTX.set(gc_maps_raw);
             (*gc_ptr).reset_root();
-            GC_MAPS_CTX.with(|ctx| ctx.set(std::ptr::null_mut()));
+            GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.store(
                 self.core.allocation_count.load(Ordering::Relaxed) + 1,
                 Ordering::Relaxed,
@@ -3999,9 +3995,9 @@ impl LocalGarbageCollector {
             };
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.with(|ctx| ctx.set(gc_maps_raw));
+            GC_MAPS_CTX.set(gc_maps_raw);
             (*gc_ptr).reset_root();
-            GC_MAPS_CTX.with(|ctx| ctx.set(std::ptr::null_mut()));
+            GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.store(
                 self.core.allocation_count.load(Ordering::Relaxed) + 1,
                 Ordering::Relaxed,
@@ -4029,9 +4025,9 @@ impl LocalGarbageCollector {
                 object_id,
             };
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.with(|ctx| ctx.set(gc_maps_raw));
+            GC_MAPS_CTX.set(gc_maps_raw);
             (*weak.ptr).reset_root();
-            GC_MAPS_CTX.with(|ctx| ctx.set(std::ptr::null_mut()));
+            GC_MAPS_CTX.set(std::ptr::null_mut());
             gc
         }
     }
