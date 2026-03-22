@@ -841,6 +841,8 @@ impl GlobalGarbageCollector {
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
+                handle_count: 0,
+                root_count: 0,
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
@@ -930,6 +932,8 @@ impl GlobalGarbageCollector {
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
+                handle_count: 0,
+                root_count: 0,
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
@@ -1030,6 +1034,8 @@ impl GlobalGarbageCollector {
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
+                handle_count: 0,
+                root_count: 0,
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
@@ -1097,6 +1103,8 @@ impl GlobalGarbageCollector {
                     mem: mem_info_internal_ptr.0,
                     layout: mem_info_internal_ptr.1,
                 }),
+                handle_count: 0,
+                root_count: 0,
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
