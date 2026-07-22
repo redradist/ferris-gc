@@ -37,11 +37,16 @@ Both share the same API surface but differ in synchronization:
 | Ref counting | `Cell<usize>` | `AtomicUsize` |
 | Strategy | `LocalStrategy` | `GlobalStrategy` |
 
-Internal type hierarchy per GC: `Gc<T>` → `GcInternal<T>` (ref counting + root flag) → `GcPtr<T>` (data + `GcInfo` metadata). Raw allocations use TLAB bump allocation (thread-local arena blocks) with system allocator fallback.
+Internal type hierarchy differs per GC:
+
+- **Thread-local:** `Gc<T>`/`GcCell<T>` is a single tagged pointer (8B `Cell<NonZeroUsize>`: bit 0 = root flag, bits 1.. = `*const GcPtr<T>`) straight to `GcPtr<T>` (`GcInfo` + `object_id` + data). Handle metadata (`handle_count`/`root_count`) lives in `ObjectEntry`. Both types are `!Send`/`!Sync`.
+- **Sync (global):** `sync::Gc<T>` → `GcInternal<T>` (tracer: root flag + object_id) → `GcPtr<T>`. Tracers are registered in `ObjectEntry.tracers` (`TracerList`).
+
+Raw allocations use TLAB bump allocation (thread-local arena blocks) with system allocator fallback. During a sweep, destructors of all dead objects run before any memory is freed (two-phase dealloc) and a dying-address registry makes interior handle drops no-ops — required for Miri/Stacked Borrows soundness of the tagged-pointer handles.
 
 ### Memory Management
 
-- **TLAB (Thread-Local Allocation Buffer):** Bump allocator for fast allocation. `Gc::new()` allocates `[GcPtr<T> | GcInternal<T> | ObjectEntry]` in a single TLAB bump.
+- **TLAB (Thread-Local Allocation Buffer):** Bump allocator for fast allocation. `Gc::new()` allocates the `GcPtr<T>` and its `ObjectEntry` in a single TLAB bump.
 - **SlotMap:** Custom generation-counted slot map (`slot_map.rs`) stores `ObjectEntryRef` pointers. O(1) insert/remove with cache-friendly iteration. Keys are `ObjectId` (u64: upper 32 = generation, lower 32 = index).
 - **RC-hybrid deallocation:** Objects freed immediately when last tracer is removed (no waiting for GC cycle). GC only handles cyclic references.
 - **Generational collection:** Gen0/Gen1/Gen2 with adaptive threshold scaling (GOGC-style: threshold proportional to live set size when <5% garbage collected).
@@ -87,6 +92,17 @@ Release profile uses `lto = "thin"` for cross-crate devirtualization.
 
 ## Known Issues
 
+- `compact()` / `_compact()` is currently **disabled** — always returns 0 without moving objects (asserted by `compact_is_disabled_returns_zero`). Re-enabling requires a `relocate()` cascade through all Trace impls (derive macro + default_trace) plus pinning of rooted objects, since stack handles cannot be discovered after the GcInternal elimination.
 - Some sync tests are flaky due to shared global GC state (test ordering sensitive). Run individual tests with `cargo test -- <test_name>` if a sync test fails in batch.
 - `tree_bench` with `--strategy=adaptive` may collect live objects during build phase (node count mismatch). Use default `basic` strategy.
 - Benchmark variance is high (2-5x between runs) due to system load, cache effects, and TLAB block reuse patterns.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

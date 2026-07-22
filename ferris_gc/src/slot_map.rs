@@ -17,6 +17,11 @@ pub trait SlotKey: Copy + Eq {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ObjectId(u64);
 
+impl ObjectId {
+    /// Sentinel value used as a placeholder before the real id is assigned.
+    pub const ZERO: ObjectId = ObjectId(0);
+}
+
 impl SlotKey for ObjectId {
     fn from_raw(index: u32, slot_gen: u32) -> Self {
         ObjectId(((slot_gen as u64) << 32) | (index as u64))

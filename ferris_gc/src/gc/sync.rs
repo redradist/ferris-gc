@@ -2079,6 +2079,42 @@ mod tests {
         unsafe { (*GLOBAL_GC).collect() };
     }
 
+    #[test]
+    #[cfg_attr(miri, ignore)] // RefCell in SyncCyclicNode races with background GC thread
+    fn sync_cycle_collection_reports_tracers_collected() {
+        let (_guard, _) = setup();
+        {
+            let a = Gc::new(SyncCyclicNode {
+                next: std::cell::RefCell::new(None),
+            });
+            let b = Gc::new(SyncCyclicNode {
+                next: std::cell::RefCell::new(None),
+            });
+            *a.next.borrow_mut() = Some(b.clone());
+            *b.next.borrow_mut() = Some(a.clone());
+            drop(a);
+            drop(b);
+        }
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
+        let stats = unsafe {
+            (*GLOBAL_GC)
+                .core
+                .collect_generation(crate::generation::Generation::Gen2)
+        };
+        assert!(
+            stats.objects_collected >= 2,
+            "dead 2-cycle must be collected (got {})",
+            stats.objects_collected
+        );
+        // Regression: the sweep stopped counting (and freeing) the GcInternal
+        // tracer allocations that dead cycle members hold on each other.
+        assert!(
+            stats.tracers_collected >= 2,
+            "cycle members' remaining tracers must be counted (got {})",
+            stats.tracers_collected
+        );
+    }
+
     // --- Concurrent marking tests (Strategy 21) ---
 
     #[test]

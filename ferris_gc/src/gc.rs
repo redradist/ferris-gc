@@ -5,7 +5,9 @@ use crate::generation::{
 use crate::slot_map::{ObjectId, SlotMap};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -52,6 +54,7 @@ fn gc_ctx_tag_collecting(ptr: *mut GcMaps) -> *mut GcMaps {
 
 /// Extract the raw GcMaps pointer (strip tag bit).
 #[inline(always)]
+#[allow(dead_code)]
 fn gc_ctx_ptr(tagged: *mut GcMaps) -> *mut GcMaps {
     (tagged as usize & !1usize) as *mut GcMaps
 }
@@ -147,6 +150,10 @@ pub type OptGcCell<T> = Option<GcCell<T>>;
 
 struct GcInfo {
     root_ref_count: Cell<usize>,
+    /// Root count for collection cascade. Stored here (inside GcPtr, TLAB-allocated)
+    /// so that Gc<T>::reset_root() can decrement it directly via self.ptr without
+    /// going through the SlotMap. After cascade, copied back to ObjectEntry.root_count.
+    root_count: Cell<u32>,
 }
 
 impl GcInfo {
@@ -154,6 +161,7 @@ impl GcInfo {
     fn new() -> GcInfo {
         GcInfo {
             root_ref_count: Cell::new(0),
+            root_count: Cell::new(0),
         }
     }
 }
@@ -167,6 +175,7 @@ where
     T: 'static + Sized + Trace,
 {
     info: GcInfo,
+    object_id: ObjectId,
     t: T,
 }
 
@@ -178,6 +187,7 @@ where
     fn new(t: T) -> GcPtr<T> {
         GcPtr {
             info: GcInfo::new(),
+            object_id: ObjectId::ZERO,
             t,
         }
     }
@@ -255,7 +265,13 @@ where
     }
 
     fn reset_root(&self) {
-        self.borrow().t.reset_root();
+        // Conservative skip when the cell is mutably borrowed (a cascade can
+        // run mid-allocation via maybe_collect while a user RefMut is live);
+        // the object then keeps its root state and survives this cycle.
+        // See GcCell::reset_root.
+        if let Ok(borrow) = self.try_borrow() {
+            borrow.t.reset_root();
+        }
     }
 
     fn trace(&self) {
@@ -322,13 +338,66 @@ where
 /// The background strategy thread calls `collect()` periodically. You can
 /// also trigger collection manually via the `LocalGarbageCollector`.
 /// Unreachable cycles are detected and collected.
+/// `Gc<T>` is 8 bytes: a packed `NonZeroUsize` where bit 0 = `is_root` flag
+/// and bits 1.. = `*const GcPtr<T>` (always ≥4-byte aligned, so bit 0 is free).
+/// `Option<Gc<T>>` is 16 bytes: the `Cell` wrapper opts out of the
+/// `NonZeroUsize` niche (see the `size_gc_is_compact` test).
+/// `object_id` is stored inside `GcPtr<T>` on the heap.
+///
+/// `Gc<T>` is `!Send` and `!Sync`: it is bound to the collector of the thread
+/// that allocated it, and dropping or cloning it on another thread would
+/// corrupt both threads' collectors.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ferris_gc::Gc<i32>>();
+/// ```
 pub struct Gc<T>
 where
     T: 'static + Sized + Trace,
 {
-    is_root: Cell<bool>,
-    ptr: Cell<*const GcPtr<T>>,
-    object_id: ObjectId,
+    /// Packed pointer: bit 0 = is_root, bits 1.. = pointer to GcPtr<T>.
+    ptr: Cell<NonZeroUsize>,
+    /// `*const T` keeps `Gc<T>` `!Send`/`!Sync` (thread-local collector).
+    _marker: PhantomData<*const T>,
+}
+
+impl<T> Gc<T>
+where
+    T: 'static + Sized + Trace,
+{
+    #[inline(always)]
+    fn gc_ptr(&self) -> *const GcPtr<T> {
+        (self.ptr.get().get() & !1usize) as *const GcPtr<T>
+    }
+
+    #[inline(always)]
+    fn is_root_flag(&self) -> bool {
+        self.ptr.get().get() & 1 != 0
+    }
+
+    #[inline(always)]
+    fn set_root_flag(&self, root: bool) {
+        let raw = self.ptr.get().get();
+        let new = if root { raw | 1 } else { raw & !1 };
+        // SAFETY: gc_ptr is never null, so new is never 0.
+        self.ptr.set(unsafe { NonZeroUsize::new_unchecked(new) });
+    }
+
+    #[inline(always)]
+    fn object_id(&self) -> ObjectId {
+        unsafe { (*self.gc_ptr()).object_id }
+    }
+
+    #[inline(always)]
+    fn from_parts(gc_ptr: *const GcPtr<T>, is_root: bool) -> Self {
+        let raw = gc_ptr as usize | (is_root as usize);
+        Gc {
+            // SAFETY: gc_ptr is a valid non-null allocation.
+            ptr: Cell::new(unsafe { NonZeroUsize::new_unchecked(raw) }),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T> Deref for Gc<T>
@@ -338,8 +407,8 @@ where
     type Target = GcPtr<T>;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: ptr is valid for the lifetime of this Gc handle.
-        unsafe { &*self.ptr.get() }
+        // SAFETY: packed pointer (with bit 0 masked off) is valid for the lifetime of this Gc.
+        unsafe { &*self.gc_ptr() }
     }
 }
 
@@ -436,14 +505,26 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
-        let object_id = self.object_id;
-        let is_root = self.is_root.get();
+        let is_root = self.is_root_flag();
+        let gc_ptr = self.gc_ptr();
         // SAFETY: Thread-local access ensures single-threaded operation.
         // Re-entrant drops (from RC hybrid dealloc cascading through inner Gc fields)
         // are safe because gc_maps borrows don't overlap: remove_handle_inner finishes
         // its &mut GcMaps borrow before the dealloc triggers nested drops.
+        //
+        // The dying check MUST precede the object_id read: during a sweep
+        // dealloc phase this handle may live inside a dead object and point at
+        // another dead object of the same batch — or at the very object whose
+        // drop_in_place is running. Dereferencing it there is UB (freed memory
+        // or a protected exclusive borrow); the collector already removed those
+        // entries from gc_maps, so the drop is a no-op.
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
-            (*gc.as_ptr()).remove_handle(object_id, is_root);
+            let local = &*gc.as_ptr();
+            if local.core.is_dying(gc_ptr as usize) {
+                return;
+            }
+            let object_id = (*gc_ptr).object_id;
+            local.remove_handle(object_id, is_root);
         });
     }
 }
@@ -453,7 +534,7 @@ where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
-        self.is_root.get()
+        self.is_root_flag()
     }
 
     #[inline(always)]
@@ -462,59 +543,57 @@ where
         if tagged.is_null() {
             return;
         }
-        if gc_ctx_is_collecting(tagged) {
-            // Collection mode: always decrement root_count.
-            // get_unchecked_mut — object_id is valid during collection cascade.
-            // root_ref_count as cycle guard: 0 = unvisited, 1 = visited.
-            let gc_maps = gc_ctx_ptr(tagged);
-            unsafe {
-                let entry: &mut ObjectEntry =
-                    &mut *(*gc_maps).objects.get_unchecked_mut(self.object_id);
-                entry.root_count = entry.root_count.saturating_sub(1);
-                let rrc = entry.root_ref_count();
-                if rrc.get() == 0 {
-                    rrc.set(1);
-                    (*self.ptr.get()).reset_root();
+        unsafe {
+            let gc_ptr = &*self.gc_ptr();
+            if gc_ctx_is_collecting(tagged) {
+                // Collection mode: decrement GcInfo.root_count directly (no SlotMap lookup).
+                // root_ref_count as cycle guard: 0 = unvisited, 1 = visited.
+                let rc = gc_ptr.info.root_count.get();
+                gc_ptr.info.root_count.set(rc.saturating_sub(1));
+                if gc_ptr.info.root_ref_count.get() == 0 {
+                    gc_ptr.info.root_ref_count.set(1);
+                    // Record the visit so discover_roots phase 3 clears this
+                    // guard even when the target is out of collection scope.
+                    (*gc_ctx_ptr(tagged))
+                        .cascade_visited
+                        .push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
+                    gc_ptr.reset_root();
                 }
-            }
-        } else if self.is_root.get() {
-            // Allocation mode: only decrement if this handle was a root.
-            self.is_root.set(false);
-            let gc_maps = gc_ctx_ptr(tagged);
-            unsafe {
-                if let Some(entry) = (*gc_maps).objects.get_mut(self.object_id) {
-                    entry.root_count = entry.root_count.saturating_sub(1);
-                }
-            }
-            unsafe {
-                (*self.ptr.get()).reset_root();
+            } else if self.is_root_flag() {
+                // Allocation mode: just flip is_root and cascade.
+                // ObjectEntry.root_count is recomputed from handle_count in discover_roots.
+                self.set_root_flag(false);
+                gc_ptr.reset_root();
             }
         }
     }
 
     fn trace(&self) {
         unsafe {
-            (*self.ptr.get()).trace();
+            (*self.gc_ptr()).trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
-            (*self.ptr.get()).reset();
+            (*self.gc_ptr()).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        unsafe { (*self.ptr.get()).is_traceable() }
+        unsafe { (*self.gc_ptr()).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        children.push(self.ptr.get() as *const dyn Trace);
+        children.push(self.gc_ptr() as *const dyn Trace);
     }
 
     unsafe fn relocate(&self, old_ptr: *const u8, new_ptr: *const u8) {
-        if self.ptr.get() as *const u8 == old_ptr {
-            self.ptr.set(new_ptr as *const GcPtr<T>);
+        if self.gc_ptr() as *const u8 == old_ptr {
+            // Preserve is_root flag when updating the pointer.
+            let is_root = self.is_root_flag();
+            let raw = new_ptr as usize | (is_root as usize);
+            self.ptr.set(unsafe { NonZeroUsize::new_unchecked(raw) });
         }
     }
 }
@@ -534,13 +613,58 @@ where
 /// discover pointers from old objects to young objects.
 ///
 /// Thread-local only — for a cross-thread variant, use [`sync::GcCell<T>`].
+/// `GcCell<T>` is 8 bytes: packed `NonZeroUsize` (bit 0 = `is_root`,
+/// bits 1.. = `*const RefCell<GcPtr<T>>`). Same layout as `Gc<T>`.
+///
+/// Like [`Gc<T>`], `GcCell<T>` is `!Send` and `!Sync`.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ferris_gc::GcCell<i32>>();
+/// ```
 pub struct GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
-    is_root: Cell<bool>,
-    ptr: Cell<*const RefCell<GcPtr<T>>>,
-    object_id: ObjectId,
+    ptr: Cell<NonZeroUsize>,
+    /// `*const T` keeps `GcCell<T>` `!Send`/`!Sync` (thread-local collector).
+    _marker: PhantomData<*const T>,
+}
+
+impl<T> GcCell<T>
+where
+    T: 'static + Sized + Trace,
+{
+    #[inline(always)]
+    fn refcell_ptr(&self) -> *const RefCell<GcPtr<T>> {
+        (self.ptr.get().get() & !1usize) as *const RefCell<GcPtr<T>>
+    }
+
+    #[inline(always)]
+    fn is_root_flag(&self) -> bool {
+        self.ptr.get().get() & 1 != 0
+    }
+
+    #[inline(always)]
+    fn set_root_flag(&self, root: bool) {
+        let raw = self.ptr.get().get();
+        let new = if root { raw | 1 } else { raw & !1 };
+        self.ptr.set(unsafe { NonZeroUsize::new_unchecked(new) });
+    }
+
+    #[inline(always)]
+    fn object_id(&self) -> ObjectId {
+        unsafe { (*(*self.refcell_ptr()).as_ptr()).object_id }
+    }
+
+    #[inline(always)]
+    fn from_parts(refcell_ptr: *const RefCell<GcPtr<T>>, is_root: bool) -> Self {
+        let raw = refcell_ptr as usize | (is_root as usize);
+        GcCell {
+            ptr: Cell::new(unsafe { NonZeroUsize::new_unchecked(raw) }),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T> Drop for GcCell<T>
@@ -548,14 +672,21 @@ where
     T: Sized + Trace,
 {
     fn drop(&mut self) {
-        let object_id = self.object_id;
-        let is_root = self.is_root.get();
+        let is_root = self.is_root_flag();
+        let refcell_ptr = self.refcell_ptr();
         // SAFETY: Thread-local access ensures single-threaded operation.
         // Re-entrant drops (from RC hybrid dealloc cascading through inner Gc fields)
         // are safe because gc_maps borrows don't overlap: remove_handle_inner finishes
         // its &mut GcMaps borrow before the dealloc triggers nested drops.
+        //
+        // The dying check MUST precede the object_id read — see Gc::drop.
         let _ = LOCAL_GC.try_with(move |gc| unsafe {
-            (*gc.as_ptr()).remove_handle(object_id, is_root);
+            let local = &*gc.as_ptr();
+            if local.core.is_dying(refcell_ptr as usize) {
+                return;
+            }
+            let object_id = (*(*refcell_ptr).as_ptr()).object_id;
+            local.remove_handle(object_id, is_root);
         });
     }
 }
@@ -567,8 +698,8 @@ where
     type Target = RefCell<GcPtr<T>>;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: ptr is valid for the lifetime of this GcCell handle.
-        unsafe { &*self.ptr.get() }
+        // SAFETY: packed pointer (with bit 0 masked off) is valid for the lifetime of this GcCell.
+        unsafe { &*self.refcell_ptr() }
     }
 }
 
@@ -653,14 +784,15 @@ where
     /// Triggers the write barrier so that if this object is in an older generation,
     /// its card is marked dirty in the card table for young-generation collections.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
-        let ptr = self.ptr.get();
+        let refcell_ptr = self.refcell_ptr();
+        let object_id = self.object_id();
         LOCAL_GC.with(|gc| {
             gc.borrow()
                 .core
-                .write_barrier(self.object_id, ptr as *const dyn Trace);
+                .write_barrier(object_id, refcell_ptr as *const dyn Trace);
         });
-        // SAFETY: ptr is valid for the lifetime of this GcCell handle.
-        unsafe { (*ptr).borrow_mut() }
+        // SAFETY: packed pointer (with bit 0 masked off) is valid for the lifetime of this GcCell.
+        unsafe { (*refcell_ptr).borrow_mut() }
     }
 }
 
@@ -679,7 +811,7 @@ where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
-        self.is_root.get()
+        self.is_root_flag()
     }
 
     #[inline(always)]
@@ -688,55 +820,63 @@ where
         if tagged.is_null() {
             return;
         }
-        if gc_ctx_is_collecting(tagged) {
-            let gc_maps = gc_ctx_ptr(tagged);
-            unsafe {
-                let entry: &mut ObjectEntry =
-                    &mut *(*gc_maps).objects.get_unchecked_mut(self.object_id);
-                entry.root_count = entry.root_count.saturating_sub(1);
-                let rrc = entry.root_ref_count();
-                if rrc.get() == 0 {
-                    rrc.set(1);
-                    (*self.ptr.get()).borrow().reset_root();
+        unsafe {
+            // try_borrow, NOT raw as_ptr(): the cascade can run while the user
+            // holds a live RefMut (maybe_collect fires inside Gc::new, and the
+            // allocation-mode cascade runs on every create/clone). Touching the
+            // data through a fresh reference would alias that RefMut — UB under
+            // Stacked Borrows. Skipping is conservative: the target keeps its
+            // root count / root flag and simply survives this cycle.
+            let Ok(borrow) = (*self.refcell_ptr()).try_borrow() else {
+                return;
+            };
+            let gc_ptr: &GcPtr<T> = &borrow;
+            if gc_ctx_is_collecting(tagged) {
+                let rc = gc_ptr.info.root_count.get();
+                gc_ptr.info.root_count.set(rc.saturating_sub(1));
+                if gc_ptr.info.root_ref_count.get() == 0 {
+                    gc_ptr.info.root_ref_count.set(1);
+                    // Record the visit so discover_roots phase 3 clears this
+                    // guard even when the target is out of collection scope.
+                    (*gc_ctx_ptr(tagged))
+                        .cascade_visited
+                        .push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
+                    gc_ptr.t.reset_root();
                 }
-            }
-        } else if self.is_root.get() {
-            self.is_root.set(false);
-            let gc_maps = gc_ctx_ptr(tagged);
-            unsafe {
-                if let Some(entry) = (*gc_maps).objects.get_mut(self.object_id) {
-                    entry.root_count = entry.root_count.saturating_sub(1);
-                }
-            }
-            unsafe {
-                (*self.ptr.get()).borrow().reset_root();
+            } else if self.is_root_flag() {
+                // Allocation mode: just flip is_root and cascade.
+                // ObjectEntry.root_count is recomputed from handle_count in discover_roots.
+                self.set_root_flag(false);
+                gc_ptr.t.reset_root();
             }
         }
     }
 
     fn trace(&self) {
         unsafe {
-            (*self.ptr.get()).borrow().trace();
+            (*self.refcell_ptr()).borrow().trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
-            (*self.ptr.get()).borrow().reset();
+            (*self.refcell_ptr()).borrow().reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
-        unsafe { (*self.ptr.get()).borrow().is_traceable() }
+        unsafe { (*self.refcell_ptr()).borrow().is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        children.push(self.ptr.get() as *const dyn Trace);
+        children.push(self.refcell_ptr() as *const dyn Trace);
     }
 
     unsafe fn relocate(&self, old_ptr: *const u8, new_ptr: *const u8) {
-        if self.ptr.get() as *const u8 == old_ptr {
-            self.ptr.set(new_ptr as *const RefCell<GcPtr<T>>);
+        if self.refcell_ptr() as *const u8 == old_ptr {
+            let is_root = self.is_root_flag();
+            let raw = new_ptr as usize | (is_root as usize);
+            self.ptr.set(unsafe { NonZeroUsize::new_unchecked(raw) });
         }
     }
 }
@@ -840,13 +980,14 @@ where
 {
     /// Create a weak reference to this GC-managed object.
     pub fn downgrade(this: &Gc<T>) -> GcWeak<T> {
+        let object_id = this.object_id();
         LOCAL_GC.with(|gc| {
             let gc_ref = gc.borrow();
-            let alive = gc_ref.core.get_or_create_weak_alive(this.object_id);
+            let alive = gc_ref.core.get_or_create_weak_alive(object_id);
             GcWeak {
                 alive,
-                ptr: this.ptr.get(),
-                object_id: this.object_id,
+                ptr: this.gc_ptr(),
+                object_id,
             }
         })
     }
@@ -1064,6 +1205,23 @@ impl ObjectEntry {
                 as *const Cell<usize>)
         }
     }
+
+    /// Get a reference to GcInfo.root_count via thin pointer + known offset.
+    /// The stored offset points at GcInfo.root_ref_count; root_count's address
+    /// is derived through `offset_of!` so it stays correct regardless of how
+    /// the compiler orders GcInfo's fields (repr(Rust) makes no ordering
+    /// guarantee, and e.g. -Zrandomize-layout would break a hard-coded
+    /// "right after root_ref_count" assumption).
+    /// SAFETY: The ObjectEntry's ptr must be valid.
+    #[inline]
+    unsafe fn gc_info_root_count(&self) -> &Cell<u32> {
+        unsafe {
+            let offset = self.root_ref_count_offset as usize
+                - std::mem::offset_of!(GcInfo, root_ref_count)
+                + std::mem::offset_of!(GcInfo, root_count);
+            &*((self.ptr.get_thin_ptr() + offset) as *const Cell<u32>)
+        }
+    }
 }
 
 // --- Tracer types: still used by sync.rs (global GC), not by thread-local GC. ---
@@ -1236,6 +1394,14 @@ pub(crate) struct GcMaps {
     /// Fast Gen0 object list for O(Gen0) partial collections.
     /// Avoids iterating all objects during Gen0 mark/sweep.
     pub(crate) gen0_ids: Vec<ObjectId>,
+    /// Guard cells set by the phase-2 root-discovery cascade, cleared in
+    /// phase 3. Tracked explicitly because a partial (Gen0/Gen1) cascade can
+    /// cross into out-of-scope old-generation objects that the per-scope
+    /// clearing passes never touch — and `root_ref_count` doubles as the mark
+    /// bit during trace, so a leaked guard makes the mark phase skip the
+    /// object's children and sweep live objects. Buffer is reused across
+    /// collections.
+    pub(crate) cascade_visited: Vec<*const Cell<usize>>,
 }
 
 impl GcMaps {
@@ -1344,6 +1510,16 @@ pub(crate) struct GarbageCollector {
     pub(crate) on_collection: Mutex<Option<Box<dyn Fn(&CollectionStats) + Send + Sync>>>,
     /// Adaptive allocation threshold for maybe_collect.
     pub(crate) alloc_threshold: AtomicUsize,
+    /// Thin addresses of dead objects whose destructors are currently running
+    /// in a sweep dealloc phase. Interior `Gc`/`GcCell` handle drops consult
+    /// this registry (see `is_dying`) so a handle pointing at a dead object of
+    /// the same sweep batch — or at the object being dropped itself — becomes
+    /// a no-op without ever dereferencing that object's memory.
+    pub(crate) dying: Mutex<HashSet<usize>>,
+    /// Fast-path gate for `is_dying`: number of entries in `dying`.
+    /// Zero outside a sweep dealloc phase, so handle drops pay one relaxed
+    /// atomic load in the common case.
+    pub(crate) dying_len: AtomicUsize,
 }
 
 // SAFETY: GcMaps is behind UnsafeCell but protected by gc_maps_lock (Mutex<()>)
@@ -1361,6 +1537,7 @@ impl GarbageCollector {
                 ptr_to_object: HashMap::new(),
                 weak_alive_map: HashMap::new(),
                 gen0_ids: Vec::new(),
+                cascade_visited: Vec::new(),
             }),
             gc_maps_lock: Mutex::new(()),
             allocation_count: AtomicUsize::new(0),
@@ -1376,7 +1553,25 @@ impl GarbageCollector {
             peak_heap_size: AtomicUsize::new(0),
             alloc_threshold: AtomicUsize::new(LOCAL_GC_ALLOC_THRESHOLD),
             on_collection: Mutex::new(None),
+            dying: Mutex::new(HashSet::new()),
+            dying_len: AtomicUsize::new(0),
         }
+    }
+
+    /// Is `addr` (thin pointer of a GC object allocation) part of the sweep
+    /// batch whose destructors are currently running? Handle drops must call
+    /// this BEFORE dereferencing their target: a `true` result means the
+    /// object's entry is already gone from gc_maps and the collector owns all
+    /// remaining bookkeeping, so the drop must do nothing at all.
+    #[inline]
+    pub(crate) fn is_dying(&self, addr: usize) -> bool {
+        if self.dying_len.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        self.dying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&addr)
     }
 
     /// Thread-safe locked access to gc_maps. Used by collection methods
@@ -1494,13 +1689,29 @@ impl GarbageCollector {
         );
     }
 
-    /// Finalize, drop, and deallocate a collected object.
+    /// Finalize and drop a collected object in place. The object's memory is
+    /// NOT freed — call `free_object_entry` afterwards.
     ///
     /// # Safety
     /// The `ObjectEntry` must refer to a valid, initialized object that has been
     /// removed from the GC maps and is no longer reachable.
     #[inline]
-    unsafe fn dealloc_object_entry(entry_ref: ObjectEntryRef) {
+    unsafe fn drop_object_entry(entry_ref: ObjectEntryRef) {
+        let fat_ptr = unsafe { (*entry_ref.0).ptr };
+        // Finalize through vtable (GcPtr<T>::finalize delegates to T::finalize).
+        unsafe { (&*fat_ptr).finalize() };
+        // Drop through vtable drop glue (drops GcPtr<T> which drops T).
+        unsafe { std::ptr::drop_in_place(fat_ptr as *mut dyn Trace) };
+    }
+
+    /// Free the memory of an already-dropped collected object and its
+    /// `ObjectEntry`.
+    ///
+    /// # Safety
+    /// `drop_object_entry` must have run for this entry, and no further access
+    /// to the object or the entry may happen afterwards.
+    #[inline]
+    unsafe fn free_object_entry(entry_ref: ObjectEntryRef) {
         // Read all fields from the TLAB-allocated ObjectEntry before releasing memory.
         let oe_ptr = entry_ref.0;
         let fat_ptr = unsafe { (*oe_ptr).ptr };
@@ -1508,11 +1719,24 @@ impl GarbageCollector {
         let mem = unsafe { std::ptr::read(&(*oe_ptr).mem) };
         let entry_block = unsafe { (*oe_ptr).entry_block };
 
+        // Free tracer allocations still registered on the entry (sync GC:
+        // dead cycle members keep each other's GcInternal tracers, whose
+        // handle Drops were lookup-miss no-ops during the drop phase — nobody
+        // else frees them). drain() also drops the TracerList's own heap
+        // storage (Many variant). Runs in the free phase, strictly after ALL
+        // destructors, so no handle can still read its GcInternal.
+        // Thread-local objects always have an empty list — this is a no-op.
+        for tracer in unsafe { (*oe_ptr).tracers.drain() } {
+            unsafe {
+                Self::dealloc_tracer_mem(
+                    tracer.tracer_ptr.get_thin_ptr() as *mut u8,
+                    tracer.mem,
+                    tracer.layout,
+                )
+            };
+        }
+
         let mem_ptr = fat_ptr.get_thin_ptr() as *mut u8;
-        // Finalize through vtable (GcPtr<T>::finalize delegates to T::finalize).
-        unsafe { (&*fat_ptr).finalize() };
-        // Drop through vtable drop glue (drops GcPtr<T> which drops T).
-        unsafe { std::ptr::drop_in_place(fat_ptr as *mut dyn Trace) };
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
         unsafe { mem.dealloc_mem(mem_ptr, layout) };
         // Free the ObjectEntry memory itself.
@@ -1521,8 +1745,73 @@ impl GarbageCollector {
             unsafe { crate::tlab::TlabBlock::release(entry_block) };
         } else {
             // System-allocated (sync path or TLAB fallback): free via dealloc.
-            // System-allocated: free via dealloc.
             unsafe { dealloc(oe_ptr as *mut u8, Layout::new::<ObjectEntry>()) };
+        }
+    }
+
+    /// Finalize, drop, and deallocate a single collected object (RC-hybrid
+    /// immediate-free path). A lone object freed because its handle count hit
+    /// zero cannot reference itself, so no dying registration is needed:
+    /// its interior handles point at other, still-valid allocations.
+    ///
+    /// # Safety
+    /// The `ObjectEntry` must refer to a valid, initialized object that has been
+    /// removed from the GC maps and is no longer reachable.
+    #[inline]
+    unsafe fn dealloc_object_entry(entry_ref: ObjectEntryRef) {
+        unsafe { Self::drop_object_entry(entry_ref) };
+        unsafe { Self::free_object_entry(entry_ref) };
+    }
+
+    /// Run the destructors of a sweep batch while EVERY dead allocation is
+    /// still valid, with the batch registered in the dying registry. Interior
+    /// `Gc`/`GcCell` handles dropped here check `is_dying` and no-op instead
+    /// of dereferencing a dead (possibly already dropped) object — including
+    /// the self-cycle case where the handle points at the object whose
+    /// `drop_in_place` is currently running. Unregisters the batch before
+    /// returning (memory frees run no user code, so the registry is only
+    /// needed while destructors execute). Registration is add/remove of this
+    /// batch's addresses only, so a nested emergency collection inside a
+    /// finalizer keeps the outer batch registered.
+    ///
+    /// # Safety
+    /// Every entry must be valid, removed from the GC maps, and unreachable.
+    unsafe fn drop_collected(&self, object_deallocs: &[ObjectEntryRef]) {
+        let addrs: Vec<usize> = object_deallocs
+            .iter()
+            .map(|entry| entry.ptr.get_thin_ptr())
+            .collect();
+        {
+            let mut dying = self.dying.lock().unwrap_or_else(|e| e.into_inner());
+            for &addr in &addrs {
+                dying.insert(addr);
+            }
+            self.dying_len.store(dying.len(), Ordering::Relaxed);
+        }
+        for &entry in object_deallocs {
+            // SAFETY: Object has been removed from gc_maps and is unreachable.
+            unsafe { Self::drop_object_entry(entry) };
+        }
+        let mut dying = self.dying.lock().unwrap_or_else(|e| e.into_inner());
+        for &addr in &addrs {
+            dying.remove(&addr);
+        }
+        self.dying_len.store(dying.len(), Ordering::Relaxed);
+    }
+
+    /// Sweep dealloc phase: drop all dead objects first (two-phase, see
+    /// `drop_collected`), then free their memory.
+    ///
+    /// # Safety
+    /// Every entry must be valid, removed from the GC maps, and unreachable.
+    unsafe fn dealloc_collected(&self, object_deallocs: Vec<ObjectEntryRef>) {
+        if object_deallocs.is_empty() {
+            return;
+        }
+        unsafe { self.drop_collected(&object_deallocs) };
+        for entry in object_deallocs {
+            // SAFETY: Object was dropped above; only its memory is freed here.
+            unsafe { Self::free_object_entry(entry) };
         }
     }
 
@@ -1769,10 +2058,10 @@ impl GarbageCollector {
         use_gen0_ids: bool,
     ) {
         unsafe {
-            // Phase 1: Initialize root_count for in-scope objects.
-            // For thread-local GC: root_count = handle_count.
-            // For sync GC (handle_count==0): root_count = tracers.len() (backward compat).
-            // Also clear root_ref_count (used as cycle guard in phase 2).
+            // Phase 1: Initialize root_count + GcInfo.root_count + clear root_ref_count.
+            // For thread-local objects (handle_count > 0): root_count = handle_count.
+            // For sync objects (handle_count == 0): root_count = tracers.len().
+            // Also clear root_ref_count (used as cycle guard in cascade AND mark phase).
             match scope {
                 None => {
                     for (_id, entry) in (*gc_maps_raw).objects.iter_mut() {
@@ -1781,6 +2070,9 @@ impl GarbageCollector {
                         } else {
                             entry.tracers.len() as u32
                         };
+                        if entry.handle_count > 0 {
+                            entry.gc_info_root_count().set(hc);
+                        }
                         entry.root_count = hc;
                         entry.root_ref_count().set(0);
                     }
@@ -1793,6 +2085,9 @@ impl GarbageCollector {
                             } else {
                                 entry.tracers.len() as u32
                             };
+                            if entry.handle_count > 0 {
+                                entry.gc_info_root_count().set(hc);
+                            }
                             entry.root_count = hc;
                             entry.root_ref_count().set(0);
                         }
@@ -1806,6 +2101,9 @@ impl GarbageCollector {
                             } else {
                                 entry.tracers.len() as u32
                             };
+                            if entry.handle_count > 0 {
+                                entry.gc_info_root_count().set(hc);
+                            }
                             entry.root_count = hc;
                             entry.root_ref_count().set(0);
                         }
@@ -1814,25 +2112,43 @@ impl GarbageCollector {
             }
 
             // Phase 2: Cascade reset_root through the object graph.
-            // Tagged pointer with bit 0 set → collection mode (always decrement root_count).
+            // Tagged pointer with bit 0 set → collection mode (always decrement GcInfo.root_count).
             // root_ref_count serves as cycle guard (0=unvisited, 1=visited).
+            // Discard stale entries from a cascade that unwound mid-way (e.g.
+            // a panicking user Trace impl): those pointers may reference
+            // since-freed objects and must never be dereferenced.
+            (*gc_maps_raw).cascade_visited.clear();
+
+            // Each object's fields must be walked EXACTLY once: the guard is
+            // checked-and-set here (outer loop) and in the cascade (handle
+            // reset_root). Without the outer check, an object reached both by
+            // this loop and by a cascade edge had its outgoing edges
+            // decremented twice — a rooted self-referencing object (or a
+            // rooted cycle) lost its stack-root status and was swept alive.
             GC_MAPS_CTX.set(gc_ctx_tag_collecting(gc_maps_raw));
             match scope {
                 None => {
                     for entry in (*gc_maps_raw).objects.values() {
-                        (&*entry.ptr).reset_root();
+                        if entry.root_ref_count().get() == 0 {
+                            entry.root_ref_count().set(1);
+                            (&*entry.ptr).reset_root();
+                        }
                     }
                 }
                 Some(_max_gen) if use_gen0_ids => {
                     for &obj_id in &(*gc_maps_raw).gen0_ids {
                         if let Some(entry) = (*gc_maps_raw).objects.get(obj_id) {
-                            (&*entry.ptr).reset_root();
+                            if entry.root_ref_count().get() == 0 {
+                                entry.root_ref_count().set(1);
+                                (&*entry.ptr).reset_root();
+                            }
                         }
                     }
                 }
                 Some(max_gen) => {
                     for (_id, entry) in (*gc_maps_raw).objects.iter() {
-                        if entry.generation() <= max_gen {
+                        if entry.generation() <= max_gen && entry.root_ref_count().get() == 0 {
+                            entry.root_ref_count().set(1);
                             (&*entry.ptr).reset_root();
                         }
                     }
@@ -1840,13 +2156,14 @@ impl GarbageCollector {
             }
             GC_MAPS_CTX.set(std::ptr::null_mut());
 
-            // Phase 2.5: Re-count roots for sync objects (handle_count == 0).
-            // The cascade above flipped is_root flags on GcInternal tracers.
-            // For sync objects, root_count must reflect how many tracers still have is_root()==true.
+            // Phase 3: Sync root_count from GcInfo back + re-count sync roots + clear cycle guards.
+            // Combined into one pass to avoid 3 extra iterations.
             match scope {
                 None => {
                     for (_id, entry) in (*gc_maps_raw).objects.iter_mut() {
-                        if entry.handle_count == 0 {
+                        if entry.handle_count > 0 {
+                            entry.root_count = entry.gc_info_root_count().get();
+                        } else {
                             let mut roots = 0u32;
                             entry.tracers.for_each_tracer(|t| {
                                 if (&*t).is_root() {
@@ -1855,12 +2172,15 @@ impl GarbageCollector {
                             });
                             entry.root_count = roots;
                         }
+                        entry.root_ref_count().set(0);
                     }
                 }
                 Some(_max_gen) if use_gen0_ids => {
                     for &obj_id in &(*gc_maps_raw).gen0_ids {
                         if let Some(entry) = (*gc_maps_raw).objects.get_mut(obj_id) {
-                            if entry.handle_count == 0 {
+                            if entry.handle_count > 0 {
+                                entry.root_count = entry.gc_info_root_count().get();
+                            } else {
                                 let mut roots = 0u32;
                                 entry.tracers.for_each_tracer(|t| {
                                     if (&*t).is_root() {
@@ -1869,34 +2189,6 @@ impl GarbageCollector {
                                 });
                                 entry.root_count = roots;
                             }
-                        }
-                    }
-                }
-                Some(max_gen) => {
-                    for (_id, entry) in (*gc_maps_raw).objects.iter_mut() {
-                        if entry.generation() <= max_gen && entry.handle_count == 0 {
-                            let mut roots = 0u32;
-                            entry.tracers.for_each_tracer(|t| {
-                                if (&*t).is_root() {
-                                    roots += 1;
-                                }
-                            });
-                            entry.root_count = roots;
-                        }
-                    }
-                }
-            }
-
-            // Phase 3: Clear root_ref_count (cycle guard) so mark phase starts fresh.
-            match scope {
-                None => {
-                    for (_id, entry) in (*gc_maps_raw).objects.iter_mut() {
-                        entry.root_ref_count().set(0);
-                    }
-                }
-                Some(_max_gen) if use_gen0_ids => {
-                    for &obj_id in &(*gc_maps_raw).gen0_ids {
-                        if let Some(entry) = (*gc_maps_raw).objects.get_mut(obj_id) {
                             entry.root_ref_count().set(0);
                         }
                     }
@@ -1904,10 +2196,31 @@ impl GarbageCollector {
                 Some(max_gen) => {
                     for (_id, entry) in (*gc_maps_raw).objects.iter_mut() {
                         if entry.generation() <= max_gen {
+                            if entry.handle_count > 0 {
+                                entry.root_count = entry.gc_info_root_count().get();
+                            } else {
+                                let mut roots = 0u32;
+                                entry.tracers.for_each_tracer(|t| {
+                                    if (&*t).is_root() {
+                                        roots += 1;
+                                    }
+                                });
+                                entry.root_count = roots;
+                            }
                             entry.root_ref_count().set(0);
                         }
                     }
                 }
+            }
+
+            // Clear cascade guards on every object the cascade visited —
+            // including out-of-scope Gen1/Gen2 objects the per-scope passes
+            // above never touch. root_ref_count doubles as the mark bit in
+            // the trace phase, so a leaked guard would make the mark phase
+            // treat the object as already marked, skip its children, and
+            // sweep live young objects reachable only through it.
+            for cell in (*gc_maps_raw).cascade_visited.drain(..) {
+                (*cell).set(0);
             }
         }
     }
@@ -2098,6 +2411,7 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
+                        stats.tracers_collected += entry.tracers.len();
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -2118,11 +2432,10 @@ impl GarbageCollector {
                 self.allocation_count.store(0, Ordering::Relaxed);
             }
 
-            // Dealloc phase: all locks released.
-            for entry in object_deallocs {
-                // SAFETY: Object has been removed from gc_maps and is unreachable.
-                Self::dealloc_object_entry(entry);
-            }
+            // Dealloc phase: all locks released. Two-phase: drop every dead
+            // object first (dying registry active), then free the memory.
+            // SAFETY: Objects have been removed from gc_maps and are unreachable.
+            self.dealloc_collected(object_deallocs);
 
             // Track heap shrinkage
             self.track_dealloc(stats.bytes_freed);
@@ -2160,10 +2473,8 @@ impl GarbageCollector {
                 object_deallocs
             };
             self.allocation_count.store(0, Ordering::Relaxed);
-            for entry in object_deallocs {
-                // SAFETY: Object has been removed from gc_maps and is unreachable.
-                Self::dealloc_object_entry(entry);
-            }
+            // SAFETY: Objects have been removed from gc_maps and are unreachable.
+            self.dealloc_collected(object_deallocs);
         }
     }
 
@@ -2247,6 +2558,7 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
+                        stats.tracers_collected += entry.tracers.len();
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -2288,32 +2600,17 @@ impl GarbageCollector {
                 self.allocation_count.store(0, Ordering::Relaxed);
             }
 
-            // Parallel dealloc phase: all locks released.
-            struct SendObjectDealloc {
-                fat_ptr: *const dyn Trace,
-                mem: GcObjMem,
-                layout: Layout,
-            }
-            unsafe impl Send for SendObjectDealloc {}
-            unsafe impl Sync for SendObjectDealloc {}
-
-            let obj_dealloc_items: Vec<SendObjectDealloc> = object_deallocs
-                .into_iter()
-                .map(|entry| SendObjectDealloc {
-                    fat_ptr: entry.ptr,
-                    mem: entry.mem,
-                    layout: entry.layout.to_layout(),
-                })
-                .collect();
-
-            obj_dealloc_items.into_par_iter().for_each(|item| {
-                let mem_ptr = item.fat_ptr.get_thin_ptr() as *mut u8;
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    unsafe { (&*item.fat_ptr).finalize() };
-                }));
-                unsafe { std::ptr::drop_in_place(item.fat_ptr as *mut dyn Trace) };
-                unsafe { item.mem.dealloc_mem(mem_ptr, item.layout) };
-            });
+            // Dealloc phase runs entirely on the collecting thread. Destructors
+            // must be sequential (interior Gc/GcCell handle drops need THIS
+            // thread's dying registry and thread-local collector), and the
+            // memory frees must be too: objects from one TLAB block share a
+            // NON-ATOMIC TlabBlock::ref_count, so concurrent free_object_entry
+            // calls on rayon workers would be a data race. The parallel win of
+            // this path is the parallel MARK phase, not the sweep. This also
+            // frees the ObjectEntry allocations, which the previous parallel
+            // path leaked.
+            // SAFETY: Objects have been removed from gc_maps and are unreachable.
+            self.dealloc_collected(object_deallocs);
 
             // Track heap shrinkage
             self.track_dealloc(stats.bytes_freed);
@@ -2428,6 +2725,7 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
+                        stats.tracers_collected += entry.tracers.len();
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -2467,32 +2765,12 @@ impl GarbageCollector {
                 self.allocation_count.store(0, Ordering::Relaxed);
             }
 
-            // Parallel dealloc
-            struct SendObjectDealloc {
-                fat_ptr: *const dyn Trace,
-                mem: GcObjMem,
-                layout: Layout,
-            }
-            unsafe impl Send for SendObjectDealloc {}
-            unsafe impl Sync for SendObjectDealloc {}
-
-            let obj_dealloc_items: Vec<SendObjectDealloc> = object_deallocs
-                .into_iter()
-                .map(|entry| SendObjectDealloc {
-                    fat_ptr: entry.ptr,
-                    mem: entry.mem,
-                    layout: entry.layout.to_layout(),
-                })
-                .collect();
-
-            obj_dealloc_items.into_par_iter().for_each(|item| {
-                let mem_ptr = item.fat_ptr.get_thin_ptr() as *mut u8;
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    unsafe { (&*item.fat_ptr).finalize() };
-                }));
-                unsafe { std::ptr::drop_in_place(item.fat_ptr as *mut dyn Trace) };
-                unsafe { item.mem.dealloc_mem(mem_ptr, item.layout) };
-            });
+            // Dealloc phase: fully sequential — see collect_parallel for why
+            // neither destructors nor frees may run on rayon workers
+            // (dying registry / thread-local collector; non-atomic
+            // TlabBlock::ref_count).
+            // SAFETY: Objects have been removed from gc_maps and are unreachable.
+            self.dealloc_collected(object_deallocs);
 
             self.track_dealloc(stats.bytes_freed);
             stats.duration = start.elapsed();
@@ -2680,6 +2958,7 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
+                        stats.tracers_collected += entry.tracers.len();
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -2705,10 +2984,10 @@ impl GarbageCollector {
                 self.allocation_count.store(0, Ordering::Relaxed);
             }
 
-            // Dealloc phase: all locks released.
-            for entry in object_deallocs {
-                Self::dealloc_object_entry(entry);
-            }
+            // Dealloc phase: all locks released. Two-phase: drop every dead
+            // object first (dying registry active), then free the memory.
+            // SAFETY: Objects have been removed from gc_maps and are unreachable.
+            self.dealloc_collected(object_deallocs);
 
             // Track heap shrinkage
             self.track_dealloc(stats.bytes_freed);
@@ -3055,6 +3334,7 @@ impl GarbageCollector {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
+                        stats.tracers_collected += entry.tracers.len();
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -3065,10 +3345,10 @@ impl GarbageCollector {
                 object_deallocs
             };
 
-            // Dealloc phase: all locks released.
-            for entry in object_deallocs {
-                Self::dealloc_object_entry(entry);
-            }
+            // Dealloc phase: all locks released. Two-phase: drop every dead
+            // object first (dying registry active), then free the memory.
+            // SAFETY: Objects have been removed from gc_maps and are unreachable.
+            self.dealloc_collected(object_deallocs);
 
             // Track heap shrinkage
             self.track_dealloc(stats.bytes_freed);
@@ -3195,6 +3475,7 @@ impl GarbageCollector {
                             gc_maps.ptr_to_object.remove(&thin);
                             self.card_table.remove_object(thin, *obj_id);
                             stats.bytes_freed += entry.layout.size();
+                            stats.tracers_collected += entry.tracers.len();
                             if let Some(alive) = gc_maps.weak_alive_map.remove(obj_id) {
                                 alive.store(false, Ordering::Release);
                             }
@@ -3212,10 +3493,10 @@ impl GarbageCollector {
                 object_deallocs
             };
 
-            // Dealloc phase: all locks released.
-            for entry in object_deallocs {
-                Self::dealloc_object_entry(entry);
-            }
+            // Dealloc phase: all locks released. Two-phase: drop every dead
+            // object first (dying registry active), then free the memory.
+            // SAFETY: Objects have been removed from gc_maps and are unreachable.
+            self.dealloc_collected(object_deallocs);
 
             // Track heap shrinkage
             self.track_dealloc(stats.bytes_freed);
@@ -3247,8 +3528,18 @@ impl GarbageCollector {
     /// For thread-local GC this is trivially safe (single-threaded).
     /// For global GC, STW write lock is acquired internally.
     pub unsafe fn compact(&self) -> usize {
-        // TODO: Re-enable compaction after GcInternal removal refactor.
-        // Tracer-based relocation was removed; need object-graph-based relocation.
+        // COMPACTION IS CURRENTLY DISABLED — this intentionally returns 0
+        // without doing any work (asserted by compact_is_disabled_returns_zero).
+        //
+        // The GcInternal elimination made handles direct tagged pointers, so
+        // the tracer registry that used to make EVERY handle reachable for
+        // relocation is gone. Re-enabling requires:
+        //   (a) a relocate() cascade through all Trace impls (derive macro +
+        //       default_trace) to patch interior Gc/GcCell handles, and
+        //   (b) pinning rooted objects — stack handles cannot be discovered,
+        //       so objects with root_count > 0 must not move.
+        // Until then, callers of _compact() get 0 and no objects are moved;
+        // all objects stay valid.
         return 0;
         #[allow(unreachable_code)]
         unsafe {
@@ -3718,11 +4009,10 @@ impl LocalGarbageCollector {
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
 
-            let gc = Gc {
-                is_root: Cell::new(true),
-                ptr: Cell::new(gc_ptr),
-                object_id: obj_id,
-            };
+            // Store object_id in GcPtr so Gc<T> can retrieve it via pointer deref.
+            (*gc_ptr).object_id = obj_id;
+
+            let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
             GC_MAPS_CTX.set(gc_maps_raw);
@@ -3742,20 +4032,17 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let object_id = gc.object_id;
+            let object_id = gc.object_id();
+            let gc_ptr = gc.gc_ptr();
             let gc_maps = self.core.gc_maps_unsync();
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
                 entry.handle_count += 1;
                 entry.root_count += 1;
             }
-            let new_gc = Gc {
-                is_root: Cell::new(true),
-                ptr: Cell::new(gc.ptr.get()),
-                object_id,
-            };
+            let new_gc = Gc::from_parts(gc_ptr, true);
             let gc_maps_raw = gc_maps as *mut GcMaps;
             GC_MAPS_CTX.set(gc_maps_raw);
-            (*gc.ptr.get()).reset_root();
+            (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             new_gc
         }
@@ -3814,11 +4101,10 @@ impl LocalGarbageCollector {
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
 
-            let gc = GcCell {
-                is_root: Cell::new(true),
-                ptr: Cell::new(gc_ptr),
-                object_id: obj_id,
-            };
+            // Store object_id in GcPtr so GcCell<T> can retrieve it via pointer deref.
+            (*(*gc_ptr).as_ptr()).object_id = obj_id;
+
+            let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
             GC_MAPS_CTX.set(gc_maps_raw);
@@ -3838,20 +4124,17 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            let object_id = gc.object_id;
+            let object_id = gc.object_id();
+            let refcell_ptr = gc.refcell_ptr();
             let gc_maps = self.core.gc_maps_unsync();
             if let Some(entry) = gc_maps.objects.get_mut(object_id) {
                 entry.handle_count += 1;
                 entry.root_count += 1;
             }
-            let new_gc = GcCell {
-                is_root: Cell::new(true),
-                ptr: Cell::new(gc.ptr.get()),
-                object_id,
-            };
+            let new_gc = GcCell::from_parts(refcell_ptr, true);
             let gc_maps_raw = gc_maps as *mut GcMaps;
             GC_MAPS_CTX.set(gc_maps_raw);
-            (*gc.ptr.get()).reset_root();
+            (*refcell_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             new_gc
         }
@@ -3911,11 +4194,10 @@ impl LocalGarbageCollector {
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
 
-            let gc = Gc {
-                is_root: Cell::new(true),
-                ptr: Cell::new(gc_ptr),
-                object_id: obj_id,
-            };
+            // Store object_id in GcPtr so Gc<T> can retrieve it via pointer deref.
+            (*gc_ptr).object_id = obj_id;
+
+            let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
             GC_MAPS_CTX.set(gc_maps_raw);
@@ -3988,11 +4270,10 @@ impl LocalGarbageCollector {
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
 
-            let gc = GcCell {
-                is_root: Cell::new(true),
-                ptr: Cell::new(gc_ptr),
-                object_id: obj_id,
-            };
+            // Store object_id in GcPtr so GcCell<T> can retrieve it via pointer deref.
+            (*(*gc_ptr).as_ptr()).object_id = obj_id;
+
+            let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
             GC_MAPS_CTX.set(gc_maps_raw);
@@ -4019,11 +4300,7 @@ impl LocalGarbageCollector {
                 entry.handle_count += 1;
                 entry.root_count += 1;
             }
-            let gc = Gc {
-                is_root: Cell::new(true),
-                ptr: Cell::new(weak.ptr),
-                object_id,
-            };
+            let gc = Gc::from_parts(weak.ptr, true);
             let gc_maps_raw = gc_maps as *mut GcMaps;
             GC_MAPS_CTX.set(gc_maps_raw);
             (*weak.ptr).reset_root();
@@ -4273,6 +4550,9 @@ impl LocalGarbageCollector {
     ///
     /// Returns the number of objects compacted.
     ///
+    /// **Currently disabled**: always returns 0 without moving any objects
+    /// (see `GarbageCollector::compact` for what re-enabling requires).
+    ///
     /// # Safety
     /// Must not be called while any GC references are being dereferenced.
     pub(crate) unsafe fn compact(&self) -> usize {
@@ -4493,6 +4773,14 @@ mod tests {
         // ObjectEntry is now TLAB-allocated (not in SlotMap), so size is less critical.
         // SlotMap stores ObjectEntryRef (8B pointer) instead.
         assert!(size <= 96, "ObjectEntry grew unexpectedly to {size}B");
+    }
+
+    #[test]
+    fn size_gc_is_compact() {
+        assert_eq!(std::mem::size_of::<Gc<i32>>(), 8);
+        assert_eq!(std::mem::size_of::<GcCell<i32>>(), 8);
+        // Option adds discriminant (Cell kills NonZeroUsize niche)
+        assert_eq!(std::mem::size_of::<Option<Gc<i32>>>(), 16);
     }
 
     #[test]
@@ -5655,6 +5943,112 @@ mod tests {
             .unwrap()
             .join();
         assert!(result.is_ok(), "cycle in Vec must not stack overflow");
+    }
+
+    // --- Root-discovery regression tests (branch-review logic bugs) ---
+
+    #[test]
+    fn rooted_self_cycle_survives_collect() {
+        clean_gc_state();
+        let a = Gc::new(CyclicNode {
+            next: std::cell::RefCell::new(None),
+        });
+        *a.next.borrow_mut() = Some(a.clone());
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow_mut().collect();
+        });
+        // The stack handle must keep the self-referencing object alive.
+        // Regression: the phase-2 outer loop walked fields without the
+        // visited guard, so the self edge was decremented twice and the
+        // object lost its root status and was swept while still referenced.
+        let live = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+        assert_eq!(live, 1, "rooted self-cycle must survive collection");
+        assert!(a.next.borrow().is_some());
+        *a.next.borrow_mut() = None; // break the cycle for clean teardown
+    }
+
+    #[test]
+    fn rooted_two_node_cycle_survives_collect() {
+        clean_gc_state();
+        let a = Gc::new(CyclicNode {
+            next: std::cell::RefCell::new(None),
+        });
+        let b = Gc::new(CyclicNode {
+            next: std::cell::RefCell::new(None),
+        });
+        *a.next.borrow_mut() = Some(b.clone());
+        *b.next.borrow_mut() = Some(a.clone());
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow_mut().collect();
+        });
+        // Both stack handles must keep the cycle alive (same double-decrement
+        // regression as rooted_self_cycle_survives_collect, via a 2-cycle).
+        let live = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+        assert_eq!(live, 2, "rooted 2-cycle must survive collection");
+        assert!(a.next.borrow().is_some());
+        assert!(b.next.borrow().is_some());
+        *a.next.borrow_mut() = None; // break the cycle for clean teardown
+    }
+
+    #[test]
+    fn gen0_collect_clears_cascade_guard_on_old_gen() {
+        clean_gc_state();
+        LOCAL_GC.with(|gc| {
+            gc.borrow()
+                .set_promotion_config(crate::generation::PromotionConfig {
+                    gen0_threshold: 1,
+                    gen1_threshold: 5,
+                })
+        });
+        // M survives one full collection -> promoted to Gen1.
+        let m = Gc::new(CyclicNode {
+            next: std::cell::RefCell::new(None),
+        });
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow_mut().collect();
+        });
+        // Chain: R (Gen0, stack handle) -> M (Gen1) -> Y (Gen0, only handle
+        // is M's edge).
+        let y = Gc::new(CyclicNode {
+            next: std::cell::RefCell::new(None),
+        });
+        *m.next.borrow_mut() = Some(y.clone());
+        drop(y);
+        let r = Gc::new(CyclicNode {
+            next: std::cell::RefCell::new(Some(m.clone())),
+        });
+        // Gen0 collection: the phase-2 cascade R -> M sets M's visit guard.
+        // Regression: phase 3 cleared guards only for in-scope (Gen0) objects,
+        // and root_ref_count doubles as the mark bit — with M's guard leaked,
+        // the mark phase skipped M's children and swept live Y.
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow_mut()
+                .collect_generation(crate::generation::Generation::Gen0);
+        });
+        let live = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+        assert_eq!(live, 3, "Y must survive: it is reachable via R -> M -> Y");
+        assert!(m.next.borrow().is_some());
+        // A second Gen0 collection must not lose anything either.
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow_mut()
+                .collect_generation(crate::generation::Generation::Gen0);
+        });
+        let live = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+        assert_eq!(live, 3);
+        let _ = r;
+    }
+
+    #[test]
+    fn compact_is_disabled_returns_zero() {
+        clean_gc_state();
+        let a = Gc::new(42);
+        let compacted = LOCAL_GC.with(|gc| unsafe { gc.borrow().compact() });
+        assert_eq!(
+            compacted, 0,
+            "compaction is documented as disabled; when re-enabling it, \
+             replace this test with real relocation coverage"
+        );
+        assert_eq!(**a, 42);
     }
 
     // --- Concurrent marking tests (Strategy 21) ---
