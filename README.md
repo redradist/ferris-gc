@@ -391,6 +391,65 @@ cargo bench --features _internal                    # Run all benchmarks (includ
 cargo bench --features _internal -- "local/alloc"   # Run only local allocation benchmarks
 ```
 
+## How FerrisGC Differs from Go's GC
+
+FerrisGC and Go both use non-moving mark-and-sweep collectors, but they sit at
+opposite ends of the design space: Go's GC is a runtime service that manages
+every allocation in the program, while FerrisGC is an **opt-in library** —
+only values you wrap in `Gc<T>` are collected, and the rest of your program
+stays under ordinary Rust ownership with zero GC overhead.
+
+| Aspect | FerrisGC | Go GC |
+|---|---|---|
+| Deployment | Library crate; core traits work in `no_std` | Built into the language runtime |
+| Scope | Opt-in: only `Gc<T>` / `sync::Gc<T>` values | Every heap allocation |
+| Heap model | Per-thread heaps (`Gc<T>`) plus an optional shared heap (`sync::Gc<T>`) | One global shared heap |
+| Reclamation | RC-hybrid: an object is freed **immediately** when its last handle drops; tracing runs only to break cycles | Pure tracing: nothing is freed until a GC cycle runs |
+| Generations | Gen0/Gen1/Gen2 with card-table write barriers and configurable promotion | Non-generational |
+| Marking | Stop-the-world by default, with incremental, concurrent and parallel modes | Concurrent and parallel by design |
+| Pause scope | A thread-local collection pauses **only the owning thread** | Short global STW phases stop the whole process |
+| Trigger | Allocation-count threshold with GOGC-style adaptive scaling; pluggable strategies (basic / threshold / adaptive / background / G1) | Heap-growth pacer (`GOGC`) |
+| Compaction | Not yet (currently disabled) | Non-moving as well |
+| Finalizers | `Finalize` runs deterministically right before deallocation (immediately, for acyclic data) | `runtime.SetFinalizer` is non-deterministic and may never run |
+| Freeing behavior | Acyclic data behaves like `Rc<T>`: freed at the last drop | Memory is reclaimed "eventually" |
+
+### Benchmark comparison
+
+Best of 3 runs per benchmark, Apple Silicon (M-series), `N = 100 000`,
+tree depth 18, FerrisGC `basic` strategy vs Go 1.25
+(`benchmarks/run_all.sh`). Wall time in milliseconds, lower is better:
+
+| Benchmark | Go | FerrisGC | FerrisGC / Go | Go max pause | FerrisGC max pause |
+|---|---:|---:|---:|---:|---:|
+| alloc | 1.76 ms | 5.91 ms | 3.4× | 0.024 ms | 1.395 ms |
+| churn | 0.86 ms | 2.37 ms | 2.8× | 0.013 ms | 0.020 ms |
+| tree (2^18 nodes) | 13.52 ms | 60.00 ms | 4.4× | 0.135 ms | 24.978 ms |
+| generational | 1.01 ms | 2.35 ms | 2.3× | 0.017 ms | 0.075 ms |
+| concurrent | 0.41 ms | 56.28 ms | 137× | 0.021 ms | 0.921 ms |
+
+```mermaid
+xychart-beta
+    title "FerrisGC wall time as a multiple of Go (lower is better, 1 = parity)"
+    x-axis [alloc, churn, tree, generational, concurrent]
+    y-axis "x slower than Go" 0 --> 140
+    bar [3.4, 2.8, 4.4, 2.3, 137.1]
+```
+
+**How to read this honestly:**
+
+- On thread-local workloads FerrisGC runs within **2–4.5× of Go** — a
+  runtime-integrated, concurrent collector with a decade of tuning — while
+  giving you immediate reclamation and per-thread pause isolation that Go
+  cannot: a collecting thread never stops the rest of the process.
+- The **concurrent** benchmark exercises the global `sync::Gc<T>` heap, where
+  Go's concurrent collector is in its element and FerrisGC still serializes
+  collection behind a lock — this is the known biggest gap and the top of the
+  optimization roadmap.
+- The **tree** gap is dominated by GC pauses during the build phase (large max
+  pause), not allocation speed; heap pre-sizing hints are a planned fix.
+- Benchmark variance between runs is high (2–5×) — treat these as indicative,
+  and run `benchmarks/run_all.sh` on your own hardware.
+
 ## Fuzzing
 
 ```bash
