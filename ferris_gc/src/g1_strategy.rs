@@ -70,87 +70,20 @@ pub fn g1_local_strategy(
     let config = Arc::new(config);
 
     move |gc: &'static LocalGarbageCollector,
-          is_active: &'static AtomicBool|
+          _is_active: &'static AtomicBool|
           -> Option<JoinHandle<()>> {
-        let config_bg = config.clone();
-        let config_fg = config.clone();
-
-        let bg_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-        let bg_handle_fg = bg_handle.clone();
-
-        // Spawn background Gen2 thread
-        let bg_thread = thread::spawn(move || {
-            while is_active.load(Ordering::Acquire) {
-                thread::sleep(config_bg.poll_interval);
-
-                let current = gc.core.current_heap_size.load(Ordering::Relaxed);
-                let peak = gc.core.peak_heap_size.load(Ordering::Relaxed);
-
-                if peak > 0
-                    && current as f64 > peak as f64 * config_bg.initiating_heap_occupancy_percent
-                {
-                    unsafe {
-                        gc.core.begin_concurrent_collection(Generation::Gen2);
-                    }
-
-                    loop {
-                        if !is_active.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let done = gc
-                            .core
-                            .concurrent_mark_step(config_bg.concurrent_mark_budget);
-                        if done {
-                            break;
-                        }
-                        thread::yield_now();
-                    }
-
-                    unsafe {
-                        gc.core.finish_collection();
-                    }
-                }
-            }
-
-            // Final concurrent Gen2 collection on shutdown
-            unsafe {
-                gc.core.begin_concurrent_collection(Generation::Gen2);
-            }
-            while !gc
-                .core
-                .concurrent_mark_step(config_bg.concurrent_mark_budget)
-            {}
-            unsafe {
-                gc.core.finish_collection();
-            }
-        });
-
-        {
-            let mut handle = bg_handle.lock().unwrap_or_else(|e| e.into_inner());
-            *handle = Some(bg_thread);
-        }
-
-        // Spawn foreground G1 thread — returned as the main strategy handle
-        Some(thread::spawn(move || {
-            while is_active.load(Ordering::Acquire) {
-                thread::sleep(config_fg.poll_interval);
-                let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
-                if allocs >= config_fg.young_gen_threshold {
-                    unsafe {
-                        gc.core.collect_garbage_first(config_fg.pause_target);
-                    }
-                }
-            }
-            // Final G1 collection on shutdown with a generous pause target
-            unsafe {
-                gc.core.collect_garbage_first(Duration::from_secs(10));
-            }
-            // Join the background Gen2 thread before exiting
-            let mut handle = bg_handle_fg.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(h) = handle.take() {
-                let _ = h.join();
-            }
-        }))
+        // A thread-local GC's mutator path accesses `gc_maps` locklessly
+        // (`gc_maps_unsync`) for speed, so collecting it from any thread other
+        // than its owner is a data race on non-atomic Cell/RefCell/TLAB state
+        // and segfaults under load. Concurrent / background collection is only
+        // sound for the thread-safe global GC (`g1_global_strategy`). For a
+        // local GC we fall back to allocation-triggered collection on the
+        // owning thread (`LocalGarbageCollector::maybe_collect`), honoring the
+        // configured young-gen threshold; no collector thread is spawned.
+        gc.core
+            .alloc_threshold
+            .store(config.young_gen_threshold, Ordering::Relaxed);
+        None
     }
 }
 
