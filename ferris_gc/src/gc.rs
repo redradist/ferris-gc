@@ -1,11 +1,12 @@
 use crate::card_table::CardTable;
+use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::generation::{
     CollectionPhase, CollectionStats, GcStats, Generation, MarkColor, PromotionConfig, RegionId,
 };
 use crate::slot_map::{ObjectId, SlotMap};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
@@ -1386,11 +1387,11 @@ impl Iterator for TracerDrain {
 pub(crate) struct GcMaps {
     pub(crate) objects: SlotMap<ObjectId, ObjectEntryRef>,
     /// Maps thin object pointer → ObjectId for trace_children resolution.
-    pub(crate) ptr_to_object: HashMap<usize, ObjectId>,
+    pub(crate) ptr_to_object: FxHashMap<usize, ObjectId>,
     /// Weak-reference alive flags. Only populated for objects that have
     /// weak references — most objects never need this, so keeping it
     /// out of ObjectEntry saves 8B per object on the hot path.
-    pub(crate) weak_alive_map: HashMap<ObjectId, Arc<AtomicBool>>,
+    pub(crate) weak_alive_map: FxHashMap<ObjectId, Arc<AtomicBool>>,
     /// Fast Gen0 object list for O(Gen0) partial collections.
     /// Avoids iterating all objects during Gen0 mark/sweep.
     pub(crate) gen0_ids: Vec<ObjectId>,
@@ -1440,12 +1441,12 @@ impl GcMaps {
 pub(crate) struct IncrementalState {
     pub(crate) phase: CollectionPhase,
     pub(crate) max_gen: Generation,
-    pub(crate) colors: HashMap<ObjectId, MarkColor>,
+    pub(crate) colors: FxHashMap<ObjectId, MarkColor>,
     pub(crate) gray_stack: Vec<ObjectId>,
     /// Snapshot of object graph edges for concurrent marking.
     /// Populated during begin_concurrent_collection so that mark steps
     /// can traverse the graph without following live pointers.
-    pub(crate) edges: HashMap<ObjectId, Vec<ObjectId>>,
+    pub(crate) edges: FxHashMap<ObjectId, Vec<ObjectId>>,
 }
 
 impl IncrementalState {
@@ -1453,9 +1454,9 @@ impl IncrementalState {
         IncrementalState {
             phase: CollectionPhase::Idle,
             max_gen: Generation::Gen0,
-            colors: HashMap::new(),
+            colors: FxHashMap::default(),
             gray_stack: Vec::new(),
-            edges: HashMap::new(),
+            edges: FxHashMap::default(),
         }
     }
 }
@@ -1515,7 +1516,7 @@ pub(crate) struct GarbageCollector {
     /// this registry (see `is_dying`) so a handle pointing at a dead object of
     /// the same sweep batch — or at the object being dropped itself — becomes
     /// a no-op without ever dereferencing that object's memory.
-    pub(crate) dying: Mutex<HashSet<usize>>,
+    pub(crate) dying: Mutex<FxHashSet<usize>>,
     /// Fast-path gate for `is_dying`: number of entries in `dying`.
     /// Zero outside a sweep dealloc phase, so handle drops pay one relaxed
     /// atomic load in the common case.
@@ -1534,8 +1535,8 @@ impl GarbageCollector {
         GarbageCollector {
             gc_maps: UnsafeCell::new(GcMaps {
                 objects: SlotMap::new(),
-                ptr_to_object: HashMap::new(),
-                weak_alive_map: HashMap::new(),
+                ptr_to_object: FxHashMap::default(),
+                weak_alive_map: FxHashMap::default(),
                 gen0_ids: Vec::new(),
                 cascade_visited: Vec::new(),
             }),
@@ -1553,7 +1554,7 @@ impl GarbageCollector {
             peak_heap_size: AtomicUsize::new(0),
             alloc_threshold: AtomicUsize::new(LOCAL_GC_ALLOC_THRESHOLD),
             on_collection: Mutex::new(None),
-            dying: Mutex::new(HashSet::new()),
+            dying: Mutex::new(FxHashSet::default()),
             dying_len: AtomicUsize::new(0),
         }
     }

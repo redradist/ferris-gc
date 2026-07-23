@@ -7,9 +7,9 @@
 //! During collection the GC iterates dirty cards and resolves them back to
 //! [`ObjectId`]s via a reverse map maintained during allocation/deallocation.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::fxhash::FxHashMap;
 use crate::slot_map::ObjectId;
 
 /// Number of low-order address bits covered by a single card.
@@ -56,18 +56,18 @@ fn card_index(addr: usize) -> usize {
 /// cards back to objects quickly.
 pub(crate) struct CardTable {
     /// Card index -> dirty flag.
-    cards: Mutex<HashMap<usize, u8>>,
+    cards: Mutex<FxHashMap<usize, u8>>,
     /// Card index -> set of ObjectIds whose address falls in that card.
     /// Updated during allocation/deallocation, NOT in the write barrier.
-    card_objects: Mutex<HashMap<usize, Vec<ObjectId>>>,
+    card_objects: Mutex<FxHashMap<usize, Vec<ObjectId>>>,
 }
 
 impl CardTable {
     /// Create a new empty card table.
     pub(crate) fn new() -> Self {
         CardTable {
-            cards: Mutex::new(HashMap::new()),
-            card_objects: Mutex::new(HashMap::new()),
+            cards: Mutex::new(FxHashMap::default()),
+            card_objects: Mutex::new(FxHashMap::default()),
         }
     }
 
