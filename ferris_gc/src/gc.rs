@@ -1494,6 +1494,13 @@ pub(crate) struct GarbageCollector {
     pub(crate) card_table: CardTable,
     pub(crate) stw_lock: RwLock<()>,
     pub(crate) incremental: Mutex<IncrementalState>,
+    /// Cheap gate: true between `begin_collection` and `finish_collection` so
+    /// the allocation hot path can skip locking `incremental` unless an
+    /// incremental mark cycle is actually in progress. When set, newly created
+    /// objects must be greyed into the incremental worklist (see
+    /// `note_new_object_during_marking`) so the colors-based sweep in
+    /// `finish_collection` does not reclaim live objects born mid-mark.
+    pub(crate) marking: AtomicBool,
     pub(crate) total_collections: AtomicUsize,
     pub(crate) last_collection: Mutex<Option<CollectionStats>>,
     /// Current region for new allocations.
@@ -1545,6 +1552,7 @@ impl GarbageCollector {
             card_table: CardTable::new(),
             stw_lock: RwLock::new(()),
             incremental: Mutex::new(IncrementalState::new()),
+            marking: AtomicBool::new(false),
             total_collections: AtomicUsize::new(0),
             last_collection: Mutex::new(None),
             current_region: AtomicU32::new(0),
@@ -1904,6 +1912,25 @@ impl GarbageCollector {
                     incr.gray_stack.push(obj_id);
                 }
             }
+        }
+    }
+
+    /// Grey a freshly-allocated object into the incremental worklist when a
+    /// mark cycle is in progress. Without this, an object born mid-mark is
+    /// absent from `colors`, and the colors-based sweep in `finish_collection`
+    /// would reclaim it (and never scan its children — which may include White
+    /// objects reachable only through it). Greying it makes the sweep keep it
+    /// and the drain scan its children. Cheap-gated on `self.marking` so the
+    /// allocation hot path pays nothing outside a mark cycle.
+    #[inline]
+    pub(crate) fn note_new_object_during_marking(&self, obj_id: ObjectId) {
+        if !self.marking.load(Ordering::Acquire) {
+            return;
+        }
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+        if incr.phase == CollectionPhase::Marking {
+            incr.colors.insert(obj_id, MarkColor::Gray);
+            incr.gray_stack.push(obj_id);
         }
     }
 
@@ -2801,6 +2828,9 @@ impl GarbageCollector {
         incr.max_gen = max_gen;
         incr.colors.clear();
         incr.gray_stack.clear();
+        // Gate for the allocation hot path: objects born from here until
+        // finish_collection must be greyed (see note_new_object_during_marking).
+        self.marking.store(true, Ordering::Release);
 
         let gc_maps_raw = &mut *gc_maps as *mut GcMaps;
         unsafe {
@@ -2888,25 +2918,64 @@ impl GarbageCollector {
 
                 max_gen = incr.max_gen;
                 incr.phase = CollectionPhase::Sweeping;
+                // From here the snapshot is final under STW; stop greying new
+                // allocations (there won't be any while the world is stopped).
+                self.marking.store(false, Ordering::Release);
 
-                // Full STW re-mark using trace() instead of trace_children().
-                let gc_maps_raw = &mut *gc_maps as *mut GcMaps;
-                Self::discover_roots(gc_maps_raw, None, false);
+                // Finish marking by draining the worklist to a fixpoint instead
+                // of re-marking the whole heap from scratch. The concurrent mark
+                // steps + the write barrier (which re-greys mutated objects) and
+                // grey-at-birth for objects allocated mid-mark mean `colors`
+                // already reflects everything except the still-grey remainder;
+                // draining it completes the tri-color mark. This is the pause
+                // reduction: work is proportional to the leftover grey set, not
+                // to the live heap.
 
-                // Mark from root objects (root_count > 0).
-                for obj_entry in gc_maps.objects.values() {
-                    if obj_entry.root_count > 0 {
-                        (&*obj_entry.ptr).trace();
+                // For partial collections, old->young references originate from
+                // out-of-scope old objects; seed the worklist from dirty cards so
+                // the young objects they keep alive are marked.
+                if max_gen < Generation::Gen2 {
+                    let dirty_ids = self.card_table.dirty_objects();
+                    for &obj_id in &dirty_ids {
+                        if let Some(color) = incr.colors.get_mut(&obj_id) {
+                            if *color == MarkColor::White {
+                                *color = MarkColor::Gray;
+                                incr.gray_stack.push(obj_id);
+                            }
+                        }
                     }
                 }
 
-                // For partial collections, also trace from dirty card table entries.
-                if max_gen < Generation::Gen2 {
-                    let dirty_ids = self.card_table.dirty_objects();
-                    for obj_id in &dirty_ids {
-                        if let Some(entry) = gc_maps.objects.get(*obj_id) {
-                            (&*entry.ptr).trace();
+                let mut children_buf: Vec<*const dyn Trace> = Vec::new();
+                while let Some(obj_id) = incr.gray_stack.pop() {
+                    children_buf.clear();
+                    if let Some(entry) = gc_maps.objects.get(obj_id) {
+                        // SAFETY: object pointer valid while gc_maps lock held.
+                        (&*entry.ptr).trace_children(&mut children_buf);
+                    }
+                    for &child_ptr in &children_buf {
+                        let thin = child_ptr.get_thin_ptr();
+                        if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin) {
+                            if let Some(color) = incr.colors.get_mut(&child_id) {
+                                if *color == MarkColor::White {
+                                    *color = MarkColor::Gray;
+                                    incr.gray_stack.push(child_id);
+                                }
+                            }
                         }
+                    }
+                    incr.colors.insert(obj_id, MarkColor::Black);
+                }
+
+                // Project the tri-color result onto root_ref_count, the mark bit
+                // the sweep below reads: Black => reachable, White => garbage.
+                // Every in-scope object is present in `colors` (begin_collection
+                // seeds all of them White, and mid-mark allocations are greyed),
+                // so absence can only mean out-of-scope, which the sweep skips.
+                for (id, entry) in gc_maps.objects.iter() {
+                    if entry.generation() <= max_gen {
+                        let live = matches!(incr.colors.get(&id), Some(MarkColor::Black));
+                        entry.root_ref_count().set(usize::from(live));
                     }
                 }
 
@@ -4013,6 +4082,10 @@ impl LocalGarbageCollector {
             // Store object_id in GcPtr so Gc<T> can retrieve it via pointer deref.
             (*gc_ptr).object_id = obj_id;
 
+            // If an incremental mark cycle is in progress, grey this object so
+            // the colors-based sweep in finish_collection keeps it.
+            self.core.note_new_object_during_marking(obj_id);
+
             let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
@@ -4104,6 +4177,10 @@ impl LocalGarbageCollector {
 
             // Store object_id in GcPtr so GcCell<T> can retrieve it via pointer deref.
             (*(*gc_ptr).as_ptr()).object_id = obj_id;
+
+            // If an incremental mark cycle is in progress, grey this object so
+            // the colors-based sweep in finish_collection keeps it.
+            self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
@@ -4198,6 +4275,10 @@ impl LocalGarbageCollector {
             // Store object_id in GcPtr so Gc<T> can retrieve it via pointer deref.
             (*gc_ptr).object_id = obj_id;
 
+            // If an incremental mark cycle is in progress, grey this object so
+            // the colors-based sweep in finish_collection keeps it.
+            self.core.note_new_object_during_marking(obj_id);
+
             let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
@@ -4273,6 +4354,10 @@ impl LocalGarbageCollector {
 
             // Store object_id in GcPtr so GcCell<T> can retrieve it via pointer deref.
             (*(*gc_ptr).as_ptr()).object_id = obj_id;
+
+            // If an incremental mark cycle is in progress, grey this object so
+            // the colors-based sweep in finish_collection keeps it.
+            self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
@@ -6316,6 +6401,41 @@ mod tests {
             baseline,
             "object freed after last handle dropped"
         );
+    }
+
+    #[test]
+    fn object_allocated_during_incremental_mark_survives() {
+        // Regression: the colors-based sweep in finish_collection reclaims any
+        // object not marked Black. An object allocated *after* begin_collection
+        // is absent from the initial `colors` snapshot, so without grey-at-birth
+        // (note_new_object_during_marking) it would be swept while still live.
+        clean_gc_state();
+        let _root: Vec<Gc<i32>> = (0..10).map(|i| Gc::new(i)).collect();
+
+        // Open an incremental mark cycle (phase = Marking) without finishing it.
+        LOCAL_GC.with(|gc| unsafe {
+            gc.borrow()
+                .core
+                .begin_collection(crate::generation::Generation::Gen2);
+        });
+
+        // Allocate DURING the mark cycle. Must be greyed at birth and survive.
+        let born_mid_mark = Gc::new(999i32);
+
+        // Drain + colors-based sweep.
+        let stats = LOCAL_GC.with(|gc| unsafe { gc.borrow().core.finish_collection() });
+
+        // The mid-mark object is still rooted and must not have been collected.
+        assert_eq!(
+            **born_mid_mark, 999,
+            "mid-mark allocation was corrupted/freed"
+        );
+        assert_eq!(
+            stats.objects_collected, 0,
+            "no live object should be collected"
+        );
+        drop(born_mid_mark);
+        drop(_root);
     }
 
     #[test]

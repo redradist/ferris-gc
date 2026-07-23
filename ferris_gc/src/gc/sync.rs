@@ -855,6 +855,7 @@ impl GlobalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
             drop(gc_maps);
+            self.core.note_new_object_during_marking(obj_id);
 
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
@@ -946,6 +947,7 @@ impl GlobalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
             drop(gc_maps);
+            self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
@@ -1048,6 +1050,7 @@ impl GlobalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
             drop(gc_maps);
+            self.core.note_new_object_during_marking(obj_id);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc_ptr,
@@ -1117,6 +1120,7 @@ impl GlobalGarbageCollector {
             // GC thread cannot read uninitialized memory via tracer_ptr.
             std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
             drop(gc_maps);
+            self.core.note_new_object_during_marking(obj_id);
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
                 ptr: gc_ptr,
