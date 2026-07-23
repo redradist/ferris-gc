@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use crate::basic_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_strategy_start};
 use crate::gc::{
-    CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, Trace, TracerInfo,
-    TracerList,
+    CompactLayout, Finalize, GarbageCollector, ObjectEntry, Trace, TracerInfo, TracerList,
 };
 use crate::slot_map::ObjectId;
 
@@ -831,7 +830,7 @@ impl GlobalGarbageCollector {
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
                 as *const Cell<usize> as usize
                 - gc_ptr as usize) as u16;
-            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
+            let entry = ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
@@ -844,10 +843,9 @@ impl GlobalGarbageCollector {
                 handle_count: 0,
                 root_count: 0,
                 root_ref_count_offset,
-                entry_block: std::ptr::null_mut(),
-            }));
+            };
             let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            let obj_id = gc_maps.objects.insert(entry);
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
@@ -920,7 +918,7 @@ impl GlobalGarbageCollector {
                 as *const AtomicUsize as *const Cell<usize>
                 as usize
                 - gc_ptr as usize) as u16;
-            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
+            let entry = ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
@@ -933,10 +931,9 @@ impl GlobalGarbageCollector {
                 handle_count: 0,
                 root_count: 0,
                 root_ref_count_offset,
-                entry_block: std::ptr::null_mut(),
-            }));
+            };
             let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            let obj_id = gc_maps.objects.insert(entry);
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
@@ -1020,7 +1017,7 @@ impl GlobalGarbageCollector {
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
                 as *const Cell<usize> as usize
                 - gc_ptr as usize) as u16;
-            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
+            let entry = ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
@@ -1033,10 +1030,9 @@ impl GlobalGarbageCollector {
                 handle_count: 0,
                 root_count: 0,
                 root_ref_count_offset,
-                entry_block: std::ptr::null_mut(),
-            }));
+            };
             let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            let obj_id = gc_maps.objects.insert(entry);
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());
@@ -1087,7 +1083,7 @@ impl GlobalGarbageCollector {
                 as *const AtomicUsize as *const Cell<usize>
                 as usize
                 - gc_ptr as usize) as u16;
-            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
+            let entry = ObjectEntry {
                 ptr: gc_ptr as *const dyn Trace,
                 mem: mem_info_gc_ptr.0,
                 layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
@@ -1100,10 +1096,9 @@ impl GlobalGarbageCollector {
                 handle_count: 0,
                 root_count: 0,
                 root_ref_count_offset,
-                entry_block: std::ptr::null_mut(),
-            }));
+            };
             let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            let obj_id = gc_maps.objects.insert(entry);
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
             self.core.track_alloc(mem_info_gc_ptr.1.size());

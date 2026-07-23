@@ -1136,31 +1136,11 @@ pub(crate) struct ObjectEntry {
     /// Allows inline mark-bit checks (is_traceable / clear_trace) without
     /// virtual dispatch through `*const dyn Trace`.
     pub(crate) root_ref_count_offset: u16,
-    /// TLAB block that holds this ObjectEntry allocation (null = system-allocated).
-    /// Released when the ObjectEntry is removed from the SlotMap and deallocated.
-    pub(crate) entry_block: *mut crate::tlab::TlabBlock,
 }
 
-/// A pointer to an ObjectEntry allocated in the TLAB (or heap).
-/// Stored in the SlotMap instead of the full ObjectEntry to reduce copy
-/// overhead from 72B to 8B per insert/remove.
-#[derive(Clone, Copy)]
-pub(crate) struct ObjectEntryRef(pub(crate) *mut ObjectEntry);
-
-impl Deref for ObjectEntryRef {
-    type Target = ObjectEntry;
-    #[inline]
-    fn deref(&self) -> &ObjectEntry {
-        unsafe { &*self.0 }
-    }
-}
-
-impl DerefMut for ObjectEntryRef {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut ObjectEntry {
-        unsafe { &mut *self.0 }
-    }
-}
+// Phase B: ObjectEntry is now stored BY VALUE in the objects SlotMap (dense
+// array), so mark/sweep passes iterate it cache-friendly instead of chasing an
+// 8-byte pointer into a scattered TLAB allocation.
 
 impl ObjectEntry {
     #[inline]
@@ -1394,7 +1374,7 @@ impl Iterator for TracerDrain {
 
 /// Unified GC maps. Single Mutex protects all state to simplify locking.
 pub(crate) struct GcMaps {
-    pub(crate) objects: SlotMap<ObjectId, ObjectEntryRef>,
+    pub(crate) objects: SlotMap<ObjectId, ObjectEntry>,
     /// Maps thin object pointer → ObjectId for trace_children resolution.
     pub(crate) ptr_to_object: FxHashMap<usize, ObjectId>,
     /// Weak-reference alive flags. Only populated for objects that have
@@ -1723,8 +1703,8 @@ impl GarbageCollector {
     /// The `ObjectEntry` must refer to a valid, initialized object that has been
     /// removed from the GC maps and is no longer reachable.
     #[inline]
-    unsafe fn drop_object_entry(entry_ref: ObjectEntryRef) {
-        let fat_ptr = unsafe { (*entry_ref.0).ptr };
+    unsafe fn drop_object_entry(entry: &ObjectEntry) {
+        let fat_ptr = entry.ptr;
         // Finalize through vtable (GcPtr<T>::finalize delegates to T::finalize).
         unsafe { (&*fat_ptr).finalize() };
         // Drop through vtable drop glue (drops GcPtr<T> which drops T).
@@ -1738,13 +1718,15 @@ impl GarbageCollector {
     /// `drop_object_entry` must have run for this entry, and no further access
     /// to the object or the entry may happen afterwards.
     #[inline]
-    unsafe fn free_object_entry(entry_ref: ObjectEntryRef) {
-        // Read all fields from the TLAB-allocated ObjectEntry before releasing memory.
-        let oe_ptr = entry_ref.0;
-        let fat_ptr = unsafe { (*oe_ptr).ptr };
-        let layout = unsafe { (*oe_ptr).layout.to_layout() };
-        let mem = unsafe { std::ptr::read(&(*oe_ptr).mem) };
-        let entry_block = unsafe { (*oe_ptr).entry_block };
+    unsafe fn free_object_entry(mut entry: ObjectEntry) {
+        // Phase B: the ObjectEntry now lives BY VALUE in the objects SlotMap, so
+        // this consumes the removed value — only the object's own memory (and any
+        // tracer allocations) are freed. `entry` is dropped at the end of this
+        // function: its `tracers` are drained to Empty and GcObjMem has no Drop,
+        // so that drop is inert (there is no separate ObjectEntry allocation to
+        // release anymore).
+        let fat_ptr = entry.ptr;
+        let layout = entry.layout.to_layout();
 
         // Free tracer allocations still registered on the entry (sync GC:
         // dead cycle members keep each other's GcInternal tracers, whose
@@ -1753,7 +1735,7 @@ impl GarbageCollector {
         // storage (Many variant). Runs in the free phase, strictly after ALL
         // destructors, so no handle can still read its GcInternal.
         // Thread-local objects always have an empty list — this is a no-op.
-        for tracer in unsafe { (*oe_ptr).tracers.drain() } {
+        for tracer in entry.tracers.drain() {
             unsafe {
                 Self::dealloc_tracer_mem(
                     tracer.tracer_ptr.get_thin_ptr() as *mut u8,
@@ -1764,16 +1746,10 @@ impl GarbageCollector {
         }
 
         let mem_ptr = fat_ptr.get_thin_ptr() as *mut u8;
+        // Move `mem` out (GcObjMem has no Drop; the moved-from field is inert).
+        let mem = entry.mem;
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
         unsafe { mem.dealloc_mem(mem_ptr, layout) };
-        // Free the ObjectEntry memory itself.
-        if !entry_block.is_null() {
-            // TLAB-allocated: release the block reference.
-            unsafe { crate::tlab::TlabBlock::release(entry_block) };
-        } else {
-            // System-allocated (sync path or TLAB fallback): free via dealloc.
-            unsafe { dealloc(oe_ptr as *mut u8, Layout::new::<ObjectEntry>()) };
-        }
     }
 
     /// Finalize, drop, and deallocate a single collected object (RC-hybrid
@@ -1785,9 +1761,9 @@ impl GarbageCollector {
     /// The `ObjectEntry` must refer to a valid, initialized object that has been
     /// removed from the GC maps and is no longer reachable.
     #[inline]
-    unsafe fn dealloc_object_entry(entry_ref: ObjectEntryRef) {
-        unsafe { Self::drop_object_entry(entry_ref) };
-        unsafe { Self::free_object_entry(entry_ref) };
+    unsafe fn dealloc_object_entry(entry: ObjectEntry) {
+        unsafe { Self::drop_object_entry(&entry) };
+        unsafe { Self::free_object_entry(entry) };
     }
 
     /// Run the destructors of a sweep batch while EVERY dead allocation is
@@ -1803,7 +1779,7 @@ impl GarbageCollector {
     ///
     /// # Safety
     /// Every entry must be valid, removed from the GC maps, and unreachable.
-    unsafe fn drop_collected(&self, object_deallocs: &[ObjectEntryRef]) {
+    unsafe fn drop_collected(&self, object_deallocs: &[ObjectEntry]) {
         let addrs: Vec<usize> = object_deallocs
             .iter()
             .map(|entry| entry.ptr.get_thin_ptr())
@@ -1815,7 +1791,7 @@ impl GarbageCollector {
             }
             self.dying_len.store(dying.len(), Ordering::Relaxed);
         }
-        for &entry in object_deallocs {
+        for entry in object_deallocs {
             // SAFETY: Object has been removed from gc_maps and is unreachable.
             unsafe { Self::drop_object_entry(entry) };
         }
@@ -1831,7 +1807,7 @@ impl GarbageCollector {
     ///
     /// # Safety
     /// Every entry must be valid, removed from the GC maps, and unreachable.
-    unsafe fn dealloc_collected(&self, object_deallocs: Vec<ObjectEntryRef>) {
+    unsafe fn dealloc_collected(&self, object_deallocs: Vec<ObjectEntry>) {
         if object_deallocs.is_empty() {
             return;
         }
@@ -1989,7 +1965,7 @@ impl GarbageCollector {
         card_table: &CardTable,
         object_id: ObjectId,
         is_root: bool,
-    ) -> Option<ObjectEntryRef> {
+    ) -> Option<ObjectEntry> {
         if let Some(obj_entry) = gc_maps.objects.get_mut(object_id) {
             if is_root {
                 obj_entry.root_count = obj_entry.root_count.saturating_sub(1);
@@ -2029,7 +2005,7 @@ impl GarbageCollector {
         card_table: &CardTable,
         object_id: ObjectId,
         tracer_ptr: *const u8,
-    ) -> (Option<(*mut u8, GcObjMem, Layout)>, Option<ObjectEntryRef>) {
+    ) -> (Option<(*mut u8, GcObjMem, Layout)>, Option<ObjectEntry>) {
         let mut tracer_dealloc = None;
         let mut object_dealloc = None;
 
@@ -2065,7 +2041,7 @@ impl GarbageCollector {
     fn finalize_remove_tracer(
         &self,
         tracer_dealloc: Option<(*mut u8, GcObjMem, Layout)>,
-        object_dealloc: Option<ObjectEntryRef>,
+        object_dealloc: Option<ObjectEntry>,
     ) {
         if let Some((ptr, mem, layout)) = tracer_dealloc {
             unsafe { Self::dealloc_tracer_mem(ptr, mem, layout) };
@@ -4107,52 +4083,26 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            // Double allocation: [GcPtr<T> | ObjectEntry] in one TLAB bump.
-            // When combined, obj_mem is Inline (no separate dealloc for GcPtr),
-            // oe_block holds the TLAB block (releasing it frees both).
-            let (gc_ptr, oe_ptr, obj_mem, obj_layout, oe_block);
-            if let Some((a, b, mem, _combined_layout)) =
-                self.try_alloc_combined_tlab::<GcPtr<T>, ObjectEntry>()
-            {
-                gc_ptr = a;
-                oe_ptr = b;
-                // Extract the TLAB block from the combined mem for entry_block.
-                oe_block = match mem {
-                    GcObjMem::Tlab(block) => block,
-                    _ => std::ptr::null_mut(),
-                };
-                obj_mem = GcObjMem::Inline;
-                obj_layout = Layout::new::<GcPtr<T>>();
-            } else {
-                let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<GcPtr<T>>();
-                gc_ptr = a;
-                obj_mem = mem_a;
-                obj_layout = layout_a;
-                let (c, block) = self.alloc_entry_tlab();
-                oe_ptr = c;
-                oe_block = block;
-            }
+            // Phase B: only the object (GcPtr) is heap-allocated; its ObjectEntry
+            // is stored by value in the objects SlotMap (dense array).
+            let (gc_ptr, (obj_mem, obj_layout)) = self.alloc_mem_tlab::<GcPtr<T>>();
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize>
                 as usize
                 - gc_ptr as usize) as u16;
-            std::ptr::write(
-                oe_ptr,
-                ObjectEntry {
-                    ptr: gc_ptr as *const dyn Trace,
-                    mem: obj_mem,
-                    layout: CompactLayout::from_layout(obj_layout),
-                    gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
-                    handle_count: 1,
-                    root_count: 1,
-                    root_ref_count_offset,
-                    entry_block: oe_block,
-                },
-            );
+            let entry = ObjectEntry {
+                ptr: gc_ptr as *const dyn Trace,
+                mem: obj_mem,
+                layout: CompactLayout::from_layout(obj_layout),
+                gen_survive_region: region.0 & 0xFFFF,
+                tracers: TracerList::Empty,
+                handle_count: 1,
+                root_count: 1,
+                root_ref_count_offset,
+            };
             let gc_maps = self.core.gc_maps_unsync();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            let obj_id = gc_maps.objects.insert(entry);
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
 
@@ -4201,51 +4151,26 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            // Double allocation: [RefCell<GcPtr<T>> | ObjectEntry] in one TLAB bump.
-            // When combined, obj_mem is Inline (no separate dealloc for RefCell<GcPtr>),
-            // oe_block holds the TLAB block (releasing it frees both).
-            let (gc_ptr, oe_ptr, obj_mem, obj_layout, oe_block);
-            if let Some((a, b, mem, _combined_layout)) =
-                self.try_alloc_combined_tlab::<RefCell<GcPtr<T>>, ObjectEntry>()
-            {
-                gc_ptr = a;
-                oe_ptr = b;
-                oe_block = match mem {
-                    GcObjMem::Tlab(block) => block,
-                    _ => std::ptr::null_mut(),
-                };
-                obj_mem = GcObjMem::Inline;
-                obj_layout = Layout::new::<RefCell<GcPtr<T>>>();
-            } else {
-                let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<RefCell<GcPtr<T>>>();
-                gc_ptr = a;
-                obj_mem = mem_a;
-                obj_layout = layout_a;
-                let (c, block) = self.alloc_entry_tlab();
-                oe_ptr = c;
-                oe_block = block;
-            }
+            // Phase B: only the object (RefCell<GcPtr>) is heap-allocated; its
+            // ObjectEntry is stored by value in the objects SlotMap (dense array).
+            let (gc_ptr, (obj_mem, obj_layout)) = self.alloc_mem_tlab::<RefCell<GcPtr<T>>>();
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
                 as *const Cell<usize> as usize
                 - gc_ptr as usize) as u16;
-            std::ptr::write(
-                oe_ptr,
-                ObjectEntry {
-                    ptr: gc_ptr as *const dyn Trace,
-                    mem: obj_mem,
-                    layout: CompactLayout::from_layout(obj_layout),
-                    gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
-                    handle_count: 1,
-                    root_count: 1,
-                    root_ref_count_offset,
-                    entry_block: oe_block,
-                },
-            );
+            let entry = ObjectEntry {
+                ptr: gc_ptr as *const dyn Trace,
+                mem: obj_mem,
+                layout: CompactLayout::from_layout(obj_layout),
+                gen_survive_region: region.0 & 0xFFFF,
+                tracers: TracerList::Empty,
+                handle_count: 1,
+                root_count: 1,
+                root_ref_count_offset,
+            };
             let gc_maps = self.core.gc_maps_unsync();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            let obj_id = gc_maps.objects.insert(entry);
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
 
@@ -4295,51 +4220,26 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            // Double allocation: [GcPtr<T> | ObjectEntry] in one TLAB bump.
-            // When combined, obj_mem is Inline (no separate dealloc for GcPtr),
-            // oe_block holds the TLAB block (releasing it frees both).
-            let (gc_ptr, oe_ptr, obj_mem, obj_layout, oe_block);
-            if let Some((a, b, mem, _combined_layout)) =
-                self.try_alloc_combined_tlab::<GcPtr<T>, ObjectEntry>()
-            {
-                gc_ptr = a;
-                oe_ptr = b;
-                oe_block = match mem {
-                    GcObjMem::Tlab(block) => block,
-                    _ => std::ptr::null_mut(),
-                };
-                obj_mem = GcObjMem::Inline;
-                obj_layout = Layout::new::<GcPtr<T>>();
-            } else {
-                let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<GcPtr<T>>()?;
-                gc_ptr = a;
-                obj_mem = mem_a;
-                obj_layout = layout_a;
-                let (c, block) = self.alloc_entry_tlab();
-                oe_ptr = c;
-                oe_block = block;
-            }
+            // Phase B: only the object (GcPtr) is heap-allocated; its ObjectEntry
+            // is stored by value in the objects SlotMap (dense array).
+            let (gc_ptr, (obj_mem, obj_layout)) = self.try_alloc_mem_tlab::<GcPtr<T>>()?;
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize>
                 as usize
                 - gc_ptr as usize) as u16;
-            std::ptr::write(
-                oe_ptr,
-                ObjectEntry {
-                    ptr: gc_ptr as *const dyn Trace,
-                    mem: obj_mem,
-                    layout: CompactLayout::from_layout(obj_layout),
-                    gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
-                    handle_count: 1,
-                    root_count: 1,
-                    root_ref_count_offset,
-                    entry_block: oe_block,
-                },
-            );
+            let entry = ObjectEntry {
+                ptr: gc_ptr as *const dyn Trace,
+                mem: obj_mem,
+                layout: CompactLayout::from_layout(obj_layout),
+                gen_survive_region: region.0 & 0xFFFF,
+                tracers: TracerList::Empty,
+                handle_count: 1,
+                root_count: 1,
+                root_ref_count_offset,
+            };
             let gc_maps = self.core.gc_maps_unsync();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            let obj_id = gc_maps.objects.insert(entry);
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
 
@@ -4372,51 +4272,26 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            // Double allocation: [RefCell<GcPtr<T>> | ObjectEntry] in one TLAB bump.
-            // When combined, obj_mem is Inline (no separate dealloc for RefCell<GcPtr>),
-            // oe_block holds the TLAB block (releasing it frees both).
-            let (gc_ptr, oe_ptr, obj_mem, obj_layout, oe_block);
-            if let Some((a, b, mem, _combined_layout)) =
-                self.try_alloc_combined_tlab::<RefCell<GcPtr<T>>, ObjectEntry>()
-            {
-                gc_ptr = a;
-                oe_ptr = b;
-                oe_block = match mem {
-                    GcObjMem::Tlab(block) => block,
-                    _ => std::ptr::null_mut(),
-                };
-                obj_mem = GcObjMem::Inline;
-                obj_layout = Layout::new::<RefCell<GcPtr<T>>>();
-            } else {
-                let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<RefCell<GcPtr<T>>>()?;
-                gc_ptr = a;
-                obj_mem = mem_a;
-                obj_layout = layout_a;
-                let (c, block) = self.alloc_entry_tlab();
-                oe_ptr = c;
-                oe_block = block;
-            }
+            // Phase B: only the object (RefCell<GcPtr>) is heap-allocated; its
+            // ObjectEntry is stored by value in the objects SlotMap (dense array).
+            let (gc_ptr, (obj_mem, obj_layout)) = self.try_alloc_mem_tlab::<RefCell<GcPtr<T>>>()?;
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
                 as *const Cell<usize> as usize
                 - gc_ptr as usize) as u16;
-            std::ptr::write(
-                oe_ptr,
-                ObjectEntry {
-                    ptr: gc_ptr as *const dyn Trace,
-                    mem: obj_mem,
-                    layout: CompactLayout::from_layout(obj_layout),
-                    gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
-                    handle_count: 1,
-                    root_count: 1,
-                    root_ref_count_offset,
-                    entry_block: oe_block,
-                },
-            );
+            let entry = ObjectEntry {
+                ptr: gc_ptr as *const dyn Trace,
+                mem: obj_mem,
+                layout: CompactLayout::from_layout(obj_layout),
+                gen_survive_region: region.0 & 0xFFFF,
+                tracers: TracerList::Empty,
+                handle_count: 1,
+                root_count: 1,
+                root_ref_count_offset,
+            };
             let gc_maps = self.core.gc_maps_unsync();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            let obj_id = gc_maps.objects.insert(entry);
             gc_maps.gen0_ids.push(obj_id);
             self.core.track_alloc(obj_layout.size());
 
@@ -4921,8 +4796,8 @@ mod tests {
             "handle_count + root_count: {}B",
             2 * std::mem::size_of::<u32>()
         );
-        // ObjectEntry is now TLAB-allocated (not in SlotMap), so size is less critical.
-        // SlotMap stores ObjectEntryRef (8B pointer) instead.
+        // Phase B: ObjectEntry is stored BY VALUE in the objects SlotMap, so its
+        // size directly affects the dense array's footprint and per-entry copy cost.
         assert!(size <= 96, "ObjectEntry grew unexpectedly to {size}B");
     }
 
