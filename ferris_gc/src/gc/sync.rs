@@ -864,10 +864,7 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.store(
-                self.core.allocation_count.load(Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
     }
@@ -956,10 +953,7 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.store(
-                self.core.allocation_count.load(Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             gc
         }
     }
@@ -1058,10 +1052,7 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.store(
-                self.core.allocation_count.load(Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
         }
     }
@@ -1128,10 +1119,7 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.store(
-                self.core.allocation_count.load(Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             Ok(gc)
         }
     }

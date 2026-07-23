@@ -1697,22 +1697,23 @@ impl GarbageCollector {
     /// Track heap growth after an allocation.
     #[inline]
     fn track_alloc(&self, size: usize) {
-        let new_size = self.current_heap_size.load(Ordering::Relaxed) + size;
-        self.current_heap_size.store(new_size, Ordering::Relaxed);
-        if new_size > self.peak_heap_size.load(Ordering::Relaxed) {
-            self.peak_heap_size.store(new_size, Ordering::Relaxed);
-        }
+        // Atomic RMW so concurrent allocators (sync GC) don't lose updates —
+        // these counters feed the strategy triggers. fetch_add returns the old
+        // value; fetch_max keeps the high-water mark.
+        let new_size = self.current_heap_size.fetch_add(size, Ordering::Relaxed) + size;
+        self.peak_heap_size.fetch_max(new_size, Ordering::Relaxed);
     }
 
     /// Track heap shrinkage after a deallocation.
     #[inline]
     fn track_dealloc(&self, size: usize) {
-        self.current_heap_size.store(
-            self.current_heap_size
-                .load(Ordering::Relaxed)
-                .saturating_sub(size),
-            Ordering::Relaxed,
-        );
+        // Saturating atomic subtract (never underflow if a dealloc is tracked
+        // without a matching alloc).
+        let _ = self
+            .current_heap_size
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(size))
+            });
     }
 
     /// Finalize and drop a collected object in place. The object's memory is
@@ -4168,10 +4169,7 @@ impl LocalGarbageCollector {
             GC_MAPS_CTX.set(gc_maps_raw);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
-            self.core.allocation_count.store(
-                self.core.allocation_count.load(Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             self.maybe_collect();
             gc
         }
@@ -4264,10 +4262,7 @@ impl LocalGarbageCollector {
             GC_MAPS_CTX.set(gc_maps_raw);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
-            self.core.allocation_count.store(
-                self.core.allocation_count.load(Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             self.maybe_collect();
             gc
         }
@@ -4361,10 +4356,7 @@ impl LocalGarbageCollector {
             GC_MAPS_CTX.set(gc_maps_raw);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
-            self.core.allocation_count.store(
-                self.core.allocation_count.load(Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             self.maybe_collect();
             Ok(gc)
         }
@@ -4441,10 +4433,7 @@ impl LocalGarbageCollector {
             GC_MAPS_CTX.set(gc_maps_raw);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
-            self.core.allocation_count.store(
-                self.core.allocation_count.load(Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
             self.maybe_collect();
             Ok(gc)
         }

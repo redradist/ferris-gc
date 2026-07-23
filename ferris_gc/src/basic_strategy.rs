@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub static BASIC_STRATEGY_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// Polling interval for the basic strategy background thread, in milliseconds.
-/// Set this **before** the first allocation to change the default (500ms).
+/// Set this **before** the first allocation to change the default (50ms).
 /// Used by `#[ferris_gc_main(poll_interval_ms = ...)]`.
 pub static BASIC_POLL_INTERVAL_MS: AtomicU64 = AtomicU64::new(50);
 
