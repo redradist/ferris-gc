@@ -30,4 +30,5 @@ name = "concurrent_bench"
 path = "src/bin/concurrent_bench.rs"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
