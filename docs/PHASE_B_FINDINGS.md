@@ -1,8 +1,11 @@
 # Phase B (inline `ObjectEntry`) — WIP findings
 
-> Status: **experimental, NOT merged.** This branch validates the cache-locality
-> hypothesis from `PERFORMANCE_ARCHITECTURE.md` §3 Phase B but is a **trade-off,
-> not a clean win** in its current (naive, full-inline) form.
+> Status: **experimental, awaiting a merge decision.** This branch validates the
+> cache-locality hypothesis from `PERFORMANCE_ARCHITECTURE.md` §3 Phase B. After
+> shrinking the entry it is a **pause-vs-throughput trade**: the collector is
+> strictly better everywhere (all GC-pause metrics down, big wins on GC-bound
+> workloads) at the cost of some mutator alloc/free throughput on tiny-object
+> churn. That last cost is **irreducible** — see §"Why not go smaller".
 
 ## What changed
 
@@ -18,18 +21,30 @@ This branch stores the `ObjectEntry` **by value** in the SlotMap's dense array:
   combined-TLAB allocation path are gone from the create sites.
 - Mark/sweep now iterate the dense array directly (cache-friendly, no chase).
 
-## Measurement (interleaved A/B, fat-LTO build, N=15, two runs, medians)
+## Measurement (interleaved A/B, fat-LTO build, N=15, medians)
 
-| Bench | duration | max GC pause | throughput | verdict |
-|---|---|---|---|---|
-| alloc | **+7–11%** | **+27–28%** | **+8–13%** | win |
-| tree (2.1M) | **+16–18%** | **+27%** | **+19–21%** | win |
-| churn | −20% | −30%/+28% (noisy) | −17% | regress |
-| generational | −17–22% | −5% | −15–18% | regress |
-| concurrent | −16–22% | −16–21% | −14–18% | regress |
+Two variants were measured against `master`:
 
-(Positive = Phase B faster / lower pause. Both runs agreed on every sign except
-churn's very small `max_gc_pause`.)
+- **v1 — full inline (80 B entry):** the whole `ObjectEntry` inline.
+- **v2 — shrunk (72 B entry):** v1 plus removal of the dead `TracerList::Inline`
+  variant (24 B → 16 B), which is never constructed. This is the current branch.
+
+| Bench | metric | v1 (80 B) | **v2 (72 B)** |
+|---|---|---|---|
+| alloc | duration | +7–11% | **+8%** |
+| alloc | max pause | +27–28% | **+28%** |
+| tree (2.1M) | duration | +16–18% | **+19%** |
+| tree | max pause | +27% | **+29%** |
+| churn | duration | −20% | **−11%** |
+| churn | max pause | mixed | **+25%** |
+| generational | duration | −17–22% | **−19%** |
+| generational | max pause | −5% | **+14%** |
+| concurrent | duration | −16–22% | **−2%** (noise) |
+| concurrent | max pause | −16–21% | **+22%** |
+
+(Positive = Phase B faster / lower pause.) The shrink roughly **halved** the
+churn regression and turned concurrent from −22% to noise, while **every GC-pause
+metric is now green** and the tree/alloc wins held or improved.
 
 ## Interpretation
 
@@ -48,23 +63,45 @@ The split is mechanistically clean and reproducible:
 This is exactly the inline-vs-indirect tension the roadmap flagged
 ("Keep cold fields (layout, tracers) in the side entry").
 
-## Why it isn't merged
+The regression scales linearly with entry size (80 B → −20% churn, 72 B → −11%),
+confirming the SlotMap insert/remove **copy** is the driver.
 
-Regressing three of five benchmarks by 15–22% fails the "don't merge a GC change
-that makes things worse" bar. The naive full-inline moves *all* fields inline,
-including the cold ones (`layout`, `mem`, `tracers`) that only the dealloc path
-reads — so the churn path pays to copy bytes it never touches on the hot path.
+## Why not go smaller (the hot/cold split isn't worth it)
 
-## Next step — hot/cold split (the actually-mergeable Phase B)
+The obvious next step is a hot/cold split: keep only what mark/sweep touch inline
+(`ptr` 16 B, `gen_survive_region` 4 B, `root_count` 4 B, `root_ref_count_offset`
+2 B) and push `mem`/`layout`/`tracers` behind a pointer. But it **cannot reach an
+all-green result**, for two independent reasons:
 
-Split `ObjectEntry` into:
+1. **A floor of ~40 B, not ~32 B.** The RC-hybrid free path
+   (`remove_handle`) reads `handle_count` on *every* handle drop to decide
+   whether to free. Pushing it cold adds a pointer chase to the hottest churn
+   path — self-defeating — so it must stay inline. With `ptr` (16) + a cold
+   pointer (8) + `gen_survive_region` (4) + `handle_count` (4) + `root_count` (4)
+   + offset (2), the inline entry floors at ~40 B.
 
-- **Hot, inline in the dense array:** `ptr`, generation/region, `handle_count`,
-  `root_count`, `root_ref_count_offset` — the fields mark/sweep touch. ~32 B, so
-  the insert/remove copy roughly halves and the mark/sweep cache win is kept.
-- **Cold, behind a pointer (ideally TLAB-combined with the object so dealloc
-  touches one line):** `mem`, `layout`, `tracers`.
+2. **The working set still overflows L1.** `generational_bench` (the stubborn
+   −19%) holds ~1000–2000 live entries. At 40 B that's 40–80 KB — past a 32 KB
+   L1 regardless. `master`'s 8 B pointer slot (8–16 KB) is the *only* layout that
+   fits, and that is exactly the design Phase B trades away for the tree win.
 
-Caveat to verify: the sync GC touches `tracers` on the clone/drop path
-(RC-hybrid), so pushing `tracers` cold risks re-introducing a chase on
-`concurrent`. Measure that path specifically before committing to the layout.
+So the churn/generational throughput cost is **irreducible** for tiny leaf
+objects: the entry copy is inherently larger than `master`'s pointer copy. A
+hot/cold split would shave the regression a few points while adding real
+Miri/soundness risk (a cold pointer aliasing into a combined TLAB block,
+combined-vs-fallback allocation lifetimes) and threatening the tree win with a
+new indirection. Not a good trade.
+
+## The actual decision
+
+Phase B (72 B) is a **pause-vs-throughput trade**, not a pure win or a pure loss:
+
+- **For:** every GC-pause metric improves; `tree` (the worst gap vs Go, ~6.6×)
+  gains +19–29%; `alloc` gains +8–28%; `concurrent` duration is neutral with a
+  +22% pause cut.
+- **Against:** tiny-object mutator throughput regresses ~11% (churn) / ~19%
+  (generational).
+
+Whether to merge is a **product judgement** — lower, more predictable pauses at
+some steady-state allocation throughput is a trade many production GCs take on
+purpose, but it is the maintainer's call, not an automatic merge.

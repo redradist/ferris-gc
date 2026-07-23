@@ -1223,11 +1223,13 @@ pub(crate) struct TracerInfo {
     pub(crate) layout: Layout,
 }
 
-/// Inline-optimized tracer list: stores the first tracer pointer inline (16B),
-/// boxing full TracerInfo only for non-inline or clone tracers.
+/// Tracer list for the sync (global) GC. Thread-local GC never registers a
+/// tracer, so this is always `Empty` there. Boxing the payloads keeps the
+/// inline enum at 8B (a single tag+pointer), which matters because an
+/// `ObjectEntry` — carrying this field — is stored by value in the objects
+/// SlotMap and copied on every insert/remove.
 #[allow(dead_code)]
 pub(crate) enum TracerList {
-    Inline(*const dyn Trace),
     One(Box<TracerInfo>),
     #[allow(clippy::box_collection)]
     Many(Box<Vec<TracerInfo>>),
@@ -1242,21 +1244,8 @@ impl TracerList {
     }
 
     #[inline]
-    pub(crate) fn new_inline(ptr: *const dyn Trace) -> Self {
-        TracerList::Inline(ptr)
-    }
-
-    #[inline]
     pub(crate) fn push(&mut self, t: TracerInfo) {
         *self = match std::mem::replace(self, TracerList::Empty) {
-            TracerList::Inline(ptr) => {
-                let first = TracerInfo {
-                    tracer_ptr: ptr,
-                    mem: GcObjMem::Inline,
-                    layout: Layout::new::<()>(),
-                };
-                TracerList::Many(Box::new(vec![first, t]))
-            }
             TracerList::One(first) => TracerList::Many(Box::new(vec![*first, t])),
             TracerList::Many(mut v) => {
                 v.push(t);
@@ -1269,7 +1258,7 @@ impl TracerList {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         match self {
-            TracerList::Inline(_) | TracerList::One(_) => 1,
+            TracerList::One(_) => 1,
             TracerList::Many(v) => v.len(),
             TracerList::Empty => 0,
         }
@@ -1284,7 +1273,6 @@ impl TracerList {
     #[inline]
     pub(crate) fn for_each_tracer<F: FnMut(*const dyn Trace)>(&self, mut f: F) {
         match self {
-            TracerList::Inline(ptr) => f(*ptr),
             TracerList::One(t) => f(t.tracer_ptr),
             TracerList::Many(v) => {
                 for t in v.iter() {
@@ -1298,19 +1286,6 @@ impl TracerList {
     #[inline]
     pub(crate) fn remove_by_ptr(&mut self, ptr: *const u8) -> Option<TracerInfo> {
         match self {
-            TracerList::Inline(t) => {
-                if (*t as *const u8) == ptr {
-                    let t = *t;
-                    *self = TracerList::Empty;
-                    Some(TracerInfo {
-                        tracer_ptr: t,
-                        mem: GcObjMem::Inline,
-                        layout: Layout::new::<()>(),
-                    })
-                } else {
-                    None
-                }
-            }
             TracerList::One(t) => {
                 if (t.tracer_ptr as *const u8) == ptr {
                     if let TracerList::One(t) = std::mem::replace(self, TracerList::Empty) {
@@ -1343,11 +1318,6 @@ impl TracerList {
 
     pub(crate) fn drain(&mut self) -> TracerDrain {
         match std::mem::replace(self, TracerList::Empty) {
-            TracerList::Inline(ptr) => TracerDrain::One(Some(TracerInfo {
-                tracer_ptr: ptr,
-                mem: GcObjMem::Inline,
-                layout: Layout::new::<()>(),
-            })),
             TracerList::One(t) => TracerDrain::One(Some(*t)),
             TracerList::Many(v) => TracerDrain::Many(v.into_iter()),
             TracerList::Empty => TracerDrain::One(None),
