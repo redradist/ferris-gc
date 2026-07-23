@@ -34,6 +34,8 @@ mod default_trace;
 #[cfg(feature = "std")]
 pub mod ephemeron;
 #[cfg(feature = "std")]
+pub(crate) mod fxhash;
+#[cfg(feature = "std")]
 mod g1_strategy;
 #[cfg(feature = "std")]
 mod gc;
