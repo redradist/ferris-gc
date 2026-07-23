@@ -115,6 +115,15 @@ pub trait Trace: Finalize {
     fn is_traceable(&self) -> bool;
     /// Non-recursive child discovery for incremental tri-color marking.
     /// Pushes immediate GC-managed children (object pointers) onto `children`.
+    ///
+    /// **Every type with GC-managed children MUST implement this.** The
+    /// incremental and concurrent collectors (background/g1 strategies, on-thread
+    /// incremental collection) traverse the object graph through `trace_children`
+    /// — *not* through `trace()`. The default below reports "no children", so a
+    /// hand-written `Trace` impl that owns `Gc`/`GcCell` fields but forgets
+    /// `trace_children` will have those children treated as unreachable and
+    /// **swept while still live** (use-after-free). `#[derive(Trace)]` generates
+    /// it correctly; only hand-written impls are at risk.
     fn trace_children(&self, _children: &mut Vec<*const dyn Trace>) {}
     /// Unconditionally clear mark-phase state without cascading.
     /// Used after sweep to reset surviving objects for the next collection cycle.
@@ -1501,6 +1510,13 @@ pub(crate) struct GarbageCollector {
     /// `note_new_object_during_marking`) so the colors-based sweep in
     /// `finish_collection` does not reclaim live objects born mid-mark.
     pub(crate) marking: AtomicBool,
+    /// When non-zero, the thread-local collector runs **on-thread incremental**
+    /// Gen2 collection instead of a stop-the-world Gen0 collect: each allocation
+    /// past the threshold advances the mark by this many objects (one bounded
+    /// `mark_step`), so pauses stay short without a background collector thread
+    /// racing the lockless mutator. Set by the local background/g1 strategies;
+    /// zero (the default) keeps the classic full-collect behavior.
+    pub(crate) local_incremental_budget: AtomicUsize,
     pub(crate) total_collections: AtomicUsize,
     pub(crate) last_collection: Mutex<Option<CollectionStats>>,
     /// Current region for new allocations.
@@ -1553,6 +1569,7 @@ impl GarbageCollector {
             stw_lock: RwLock::new(()),
             incremental: Mutex::new(IncrementalState::new()),
             marking: AtomicBool::new(false),
+            local_incremental_budget: AtomicUsize::new(0),
             total_collections: AtomicUsize::new(0),
             last_collection: Mutex::new(None),
             current_region: AtomicU32::new(0),
@@ -1922,6 +1939,15 @@ impl GarbageCollector {
     /// objects reachable only through it). Greying it makes the sweep keep it
     /// and the drain scan its children. Cheap-gated on `self.marking` so the
     /// allocation hot path pays nothing outside a mark cycle.
+    /// Current phase of the incremental collector (`Idle`/`Marking`/`Sweeping`).
+    #[inline]
+    pub(crate) fn incremental_phase(&self) -> CollectionPhase {
+        self.incremental
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .phase
+    }
+
     #[inline]
     pub(crate) fn note_new_object_during_marking(&self, obj_id: ObjectId) {
         if !self.marking.load(Ordering::Acquire) {
@@ -2261,6 +2287,22 @@ impl GarbageCollector {
     pub unsafe fn collect_generation(&self, max_gen: Generation) -> CollectionStats {
         unsafe {
             let start = std::time::Instant::now();
+
+            // A full collection recomputes reachability from scratch, so any
+            // in-flight on-thread incremental mark is stale — discard it and
+            // clear the `marking` gate so grey-at-birth stops feeding a dead
+            // cycle. (Only relevant when incremental mode is active.)
+            if self.local_incremental_budget.load(Ordering::Relaxed) > 0 {
+                let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+                if incr.phase != CollectionPhase::Idle {
+                    incr.phase = CollectionPhase::Idle;
+                    incr.colors.clear();
+                    incr.gray_stack.clear();
+                }
+                drop(incr);
+                self.marking.store(false, Ordering::Release);
+            }
+
             let mut stats = CollectionStats {
                 generation: max_gen,
                 objects_scanned: 0,
@@ -4002,25 +4044,59 @@ impl LocalGarbageCollector {
     /// (down to 1K) to reclaim memory promptly.
     #[inline]
     unsafe fn maybe_collect(&self) {
+        // On-thread incremental mode (set by the local background/g1 strategies):
+        // advance a Gen2 mark by one bounded step per allocation instead of a
+        // full STW collect. Runs on the owning thread, so the lockless mutator is
+        // never raced; pauses stay short because each step marks <= `budget`
+        // objects. Correctness of interleaving with allocation relies on
+        // grey-at-birth (note_new_object_during_marking) + the write barrier.
+        let budget = self.core.local_incremental_budget.load(Ordering::Relaxed);
+        if budget > 0 {
+            match self.core.incremental_phase() {
+                CollectionPhase::Idle => {
+                    let count = self.core.allocation_count.load(Ordering::Relaxed);
+                    let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
+                    if count >= threshold {
+                        unsafe { self.core.begin_collection(Generation::Gen2) };
+                    }
+                }
+                CollectionPhase::Marking => {
+                    let done = unsafe { self.core.mark_step(budget) };
+                    if done {
+                        let stats = unsafe { self.core.finish_collection() };
+                        self.core.allocation_count.store(0, Ordering::Relaxed);
+                        self.adapt_alloc_threshold(&stats);
+                    }
+                }
+                CollectionPhase::Sweeping => {}
+            }
+            return;
+        }
+
+        // Classic full-collect path.
         let count = self.core.allocation_count.load(Ordering::Relaxed);
         let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
         if count >= threshold {
             let stats = unsafe { self.core.collect_generation(Generation::Gen0) };
-            // Adapt threshold based on collection efficiency
-            if stats.objects_scanned > 0 {
-                let collected_ratio = stats.objects_collected as f64 / stats.objects_scanned as f64;
-                if collected_ratio < 0.05 {
-                    // Almost no garbage — scale threshold to live set size.
-                    // Similar to Go's GOGC=100%: don't collect again until we've
-                    // allocated as many objects as are currently alive.
-                    let new = stats.objects_scanned.max(threshold * 2);
-                    self.core.alloc_threshold.store(new, Ordering::Relaxed);
-                } else if collected_ratio > 0.25 {
-                    // More than 25% garbage — shrink threshold to collect sooner
-                    let new = (threshold / 2).max(LOCAL_GC_ALLOC_THRESHOLD);
-                    self.core.alloc_threshold.store(new, Ordering::Relaxed);
-                }
-            }
+            self.adapt_alloc_threshold(&stats);
+        }
+    }
+
+    /// GOGC-style adaptive threshold: grow when almost nothing was collected
+    /// (don't re-collect until the live set has roughly doubled), shrink when a
+    /// lot was garbage (collect sooner).
+    fn adapt_alloc_threshold(&self, stats: &CollectionStats) {
+        if stats.objects_scanned == 0 {
+            return;
+        }
+        let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
+        let collected_ratio = stats.objects_collected as f64 / stats.objects_scanned as f64;
+        if collected_ratio < 0.05 {
+            let new = stats.objects_scanned.max(threshold * 2);
+            self.core.alloc_threshold.store(new, Ordering::Relaxed);
+        } else if collected_ratio > 0.25 {
+            let new = (threshold / 2).max(LOCAL_GC_ALLOC_THRESHOLD);
+            self.core.alloc_threshold.store(new, Ordering::Relaxed);
         }
     }
 
@@ -6401,6 +6477,65 @@ mod tests {
             baseline,
             "object freed after last handle dropped"
         );
+    }
+
+    #[test]
+    fn on_thread_incremental_preserves_live_linked_structure() {
+        // On-thread incremental Gen2 collection (local background/g1 strategies)
+        // advances a bounded mark step per allocation, interleaved with mutation.
+        // A live linked structure built while collection is in progress must
+        // survive: this exercises grey-at-birth + the colors-based drain across
+        // many begin/mark_step/finish cycles. Regression for the class of bug
+        // where interleaved incremental marking freed live nodes (which also
+        // required VecNode to implement trace_children — the incremental
+        // collector traverses via trace_children, not trace()).
+        clean_gc_state();
+        LOCAL_GC.with(|gc| {
+            let g = gc.borrow();
+            // Aggressive incremental: collect early and step in tiny batches so
+            // many cycles interleave with the build below.
+            g.core.alloc_threshold.store(16, Ordering::Relaxed);
+            g.core.local_incremental_budget.store(4, Ordering::Relaxed);
+        });
+
+        // Build a chain of 200 nodes bottom-up; the head keeps the whole chain
+        // reachable. Interleave throwaway allocations to drive collection.
+        const CHAIN: usize = 200;
+        let mut head = Gc::new(VecNode {
+            children: std::cell::RefCell::new(Vec::new()),
+        });
+        for _ in 0..CHAIN {
+            for _ in 0..8 {
+                // Garbage that should be reclaimed, driving mark steps/finishes.
+                let _g = Gc::new(VecNode {
+                    children: std::cell::RefCell::new(Vec::new()),
+                });
+            }
+            let parent = Gc::new(VecNode {
+                children: std::cell::RefCell::new(vec![head]),
+            });
+            head = parent;
+        }
+
+        // Traverse the chain from the head — a freed live node would UAF/segfault
+        // or shorten the count.
+        fn depth(n: &Gc<VecNode>) -> usize {
+            let kids = n.children.borrow();
+            1 + kids.iter().map(depth).sum::<usize>()
+        }
+        assert_eq!(
+            depth(&head),
+            CHAIN + 1,
+            "live linked structure lost nodes under on-thread incremental collection"
+        );
+
+        LOCAL_GC.with(|gc| {
+            gc.borrow()
+                .core
+                .local_incremental_budget
+                .store(0, Ordering::Relaxed);
+        });
+        drop(head);
     }
 
     #[test]
