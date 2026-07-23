@@ -27,6 +27,10 @@ impl Trace for TreeNode {
         if let Some(ref gc) = self.right { gc.reset(); }
     }
     fn is_traceable(&self) -> bool { false }
+    fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
+        if let Some(ref gc) = self.left { gc.trace_children(children); }
+        if let Some(ref gc) = self.right { gc.trace_children(children); }
+    }
 }
 
 impl Finalize for TreeNode {
