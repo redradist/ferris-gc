@@ -2158,6 +2158,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sync_concurrent_preserves_live_graph() {
+        // The sync concurrent collector marks via an edge snapshot built with
+        // trace_children (begin_concurrent_collection). A live *graph* (not just
+        // leaf objects) must survive a full begin -> mark_step* -> finish cycle.
+        // Regression: a type with GC children but no trace_children would have
+        // its children swept (see Trace::trace_children docs).
+        use crate::gc::{Finalize, Trace};
+        struct Node {
+            next: Option<Gc<Node>>,
+        }
+        impl Trace for Node {
+            fn is_root(&self) -> bool {
+                false
+            }
+            fn reset_root(&self) {
+                if let Some(n) = &self.next {
+                    n.reset_root();
+                }
+            }
+            fn trace(&self) {
+                if let Some(n) = &self.next {
+                    n.trace();
+                }
+            }
+            fn reset(&self) {
+                if let Some(n) = &self.next {
+                    n.reset();
+                }
+            }
+            fn is_traceable(&self) -> bool {
+                false
+            }
+            fn trace_children(&self, c: &mut Vec<*const dyn Trace>) {
+                if let Some(n) = &self.next {
+                    n.trace_children(c);
+                }
+            }
+        }
+        impl Finalize for Node {
+            fn finalize(&self) {}
+        }
+
+        let (_guard, _) = setup();
+        // Build an immutable chain of 50 nodes; the head keeps all reachable.
+        let mut head = Gc::new(Node { next: None });
+        for _ in 0..50 {
+            head = Gc::new(Node { next: Some(head) });
+        }
+        // Full concurrent cycle with a tiny step budget (many mark steps).
+        let stats =
+            // SAFETY: GLOBAL_GC is initialized once via lazy_static, valid for 'static.
+            unsafe { (*GLOBAL_GC).collect_concurrent(crate::generation::Generation::Gen2, 4) };
+        assert_eq!(
+            stats.objects_collected, 0,
+            "concurrent collection must not free the live chain"
+        );
+        fn len(n: &Gc<Node>) -> usize {
+            1 + n.next.as_ref().map(len).unwrap_or(0)
+        }
+        assert_eq!(len(&head), 51, "live graph lost nodes under concurrent GC");
+    }
+
     // --- Region-based collection tests (Strategy 22) ---
 
     #[test]
