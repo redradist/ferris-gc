@@ -1,14 +1,13 @@
 use std::marker::PhantomData;
 
 /// Trait for slot-map key types with generation-counted u64 encoding.
+/// Upper 32 bits = generation, lower 32 bits = index.
 ///
-/// Layout: `[slot_generation:32 | shard:6 | index:26]`.
-///
-/// The shard tag is carved out of the *index*, never out of the generation:
-/// narrowing the generation would shrink the ABA-reuse window (a stale key
-/// silently aliasing a recycled slot), whereas exhausting a shard's index space
-/// is deterministic and asserted. Total capacity is unchanged (64 shards x
-/// 67.1M slots = the old 32-bit index space).
+/// The `shard` accessors are used only by `crate::sharded_map` (the global
+/// collector). There the top `SHARD_BITS` of the index carry the owning shard,
+/// and the sharded map itself guarantees a shard never hands out an index that
+/// would reach those bits. The thread-local collector uses a plain `SlotMap`, so
+/// its keys keep the full 32-bit index space and pay no masking.
 pub trait SlotKey: Copy + Eq {
     fn from_raw(index: u32, ver: u32) -> Self;
     fn index(self) -> u32;
@@ -36,25 +35,21 @@ impl ObjectId {
     pub const ZERO: ObjectId = ObjectId(0);
 }
 
-/// Bits of the 32-bit index reserved for the shard tag.
+/// Bits of the index reserved for the shard tag in **sharded** keys.
 pub const SHARD_BITS: u32 = 6;
-/// Bits left for the per-shard slot index.
+/// Bits left for the per-shard slot index in sharded keys.
 pub const INDEX_BITS: u32 = 32 - SHARD_BITS;
-/// Maximum slots one shard may hold (67,108,864).
+/// Maximum slots one shard of a sharded map may hold (67,108,864). Total
+/// sharded capacity (64 x 67.1M) equals the plain 32-bit index space.
 pub const MAX_SLOTS_PER_SHARD: u32 = 1 << INDEX_BITS;
-const INDEX_MASK: u64 = (1u64 << INDEX_BITS) - 1;
 const SHARD_MASK: u64 = ((1u64 << SHARD_BITS) - 1) << INDEX_BITS;
 
 impl SlotKey for ObjectId {
     fn from_raw(index: u32, slot_gen: u32) -> Self {
-        assert!(
-            index < MAX_SLOTS_PER_SHARD,
-            "object shard exhausted: slot index {index} >= {MAX_SLOTS_PER_SHARD}"
-        );
         ObjectId(((slot_gen as u64) << 32) | (index as u64))
     }
     fn index(self) -> u32 {
-        (self.0 & INDEX_MASK) as u32
+        self.0 as u32
     }
     fn slot_generation(self) -> u32 {
         (self.0 >> 32) as u32

@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crate::basic_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_strategy_start};
 use crate::gc::{
-    CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, Trace, TracerInfo,
-    TracerList,
+    CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, SyncObjects, Trace,
+    TracerInfo, TracerList,
 };
 use crate::slot_map::ObjectId;
 
@@ -802,7 +802,7 @@ where
 /// Internally delegates to `GarbageCollector` which protects all state
 /// with Mutex, RwLock, and atomic operations.
 pub struct GlobalGarbageCollector {
-    pub(crate) core: GarbageCollector,
+    pub(crate) core: GarbageCollector<SyncObjects>,
 }
 
 // SAFETY: Delegates to GarbageCollector which protects all state with Mutex/atomics.

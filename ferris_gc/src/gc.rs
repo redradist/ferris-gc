@@ -4,7 +4,7 @@ use crate::generation::{
     CollectionPhase, CollectionStats, GcStats, Generation, MarkColor, PromotionConfig, RegionId,
 };
 use crate::sharded_map::ShardedSlotMap;
-use crate::slot_map::ObjectId;
+use crate::slot_map::{ObjectId, SlotMap};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
@@ -38,32 +38,39 @@ pub mod sync;
 thread_local! {
     /// Tagged context pointer for reset_root cascade.
     ///
-    /// Encodes *both* the `GcMaps` pointer and the collecting flag in a single
-    /// thread-local, eliminating one TLS read per node in the cascade hot path.
+    /// Encodes *both* a pointer to the active collector's `cascade_visited`
+    /// buffer and the collecting flag in a single thread-local, eliminating one
+    /// TLS read per node in the cascade hot path. It points at the buffer, not at
+    /// `GcMaps`, because that buffer is the only state the cascade touches - so
+    /// the context does not depend on which object-map type a collector uses.
     ///
     /// Encoding (bit 0 of the pointer, which is always free due to alignment):
     /// - `null`               → no cascade context
     /// - `ptr` (bit 0 clear)  → allocation-time cascade (only decrement if is_root)
     /// - `ptr | 1` (bit 0 set)→ collection cascade (always decrement root_count)
-    pub(crate) static GC_MAPS_CTX: Cell<*mut GcMaps> = const { Cell::new(std::ptr::null_mut()) };
+    pub(crate) static GC_MAPS_CTX: Cell<*mut CascadeVisited> = const { Cell::new(std::ptr::null_mut()) };
 }
 
-/// Tag a GcMaps pointer as "collecting" by setting bit 0.
+/// Buffer of cascade guard cells set during root discovery (see
+/// `GcMaps::cascade_visited`).
+pub(crate) type CascadeVisited = Vec<*const Cell<usize>>;
+
+/// Tag a cascade-context pointer as "collecting" by setting bit 0.
 #[inline(always)]
-fn gc_ctx_tag_collecting(ptr: *mut GcMaps) -> *mut GcMaps {
-    (ptr as usize | 1) as *mut GcMaps
+fn gc_ctx_tag_collecting(ptr: *mut CascadeVisited) -> *mut CascadeVisited {
+    (ptr as usize | 1) as *mut CascadeVisited
 }
 
 /// Extract the raw GcMaps pointer (strip tag bit).
 #[inline(always)]
 #[allow(dead_code)]
-fn gc_ctx_ptr(tagged: *mut GcMaps) -> *mut GcMaps {
-    (tagged as usize & !1usize) as *mut GcMaps
+fn gc_ctx_ptr(tagged: *mut CascadeVisited) -> *mut CascadeVisited {
+    (tagged as usize & !1usize) as *mut CascadeVisited
 }
 
 /// Check if the tagged pointer indicates collection mode.
 #[inline(always)]
-fn gc_ctx_is_collecting(tagged: *mut GcMaps) -> bool {
+fn gc_ctx_is_collecting(tagged: *mut CascadeVisited) -> bool {
     (tagged as usize & 1) != 0
 }
 
@@ -565,9 +572,7 @@ where
                     gc_ptr.info.root_ref_count.set(1);
                     // Record the visit so discover_roots phase 3 clears this
                     // guard even when the target is out of collection scope.
-                    (*gc_ctx_ptr(tagged))
-                        .cascade_visited
-                        .push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
+                    (*gc_ctx_ptr(tagged)).push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
                     gc_ptr.reset_root();
                 }
             } else if self.is_root_flag() {
@@ -849,9 +854,7 @@ where
                     gc_ptr.info.root_ref_count.set(1);
                     // Record the visit so discover_roots phase 3 clears this
                     // guard even when the target is out of collection scope.
-                    (*gc_ctx_ptr(tagged))
-                        .cascade_visited
-                        .push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
+                    (*gc_ctx_ptr(tagged)).push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
                     gc_ptr.t.reset_root();
                 }
             } else if self.is_root_flag() {
@@ -1394,8 +1397,87 @@ impl Iterator for TracerDrain {
 }
 
 /// Unified GC maps. Single Mutex protects all state to simplify locking.
-pub(crate) struct GcMaps {
-    pub(crate) objects: ShardedSlotMap<ObjectId, ObjectEntryRef>,
+/// Object-map storage a collector is generic over. The thread-local collector
+/// uses a plain [`SlotMap`]; the global collector uses a thread-affine
+/// [`ShardedSlotMap`] so concurrent allocation does not serialize. Static
+/// dispatch keeps the thread-local path free of any sharding cost (key
+/// decoding, tag masking, the shard indirection) and keeps its full 32-bit
+/// index space.
+pub(crate) trait ObjectMap: Sized {
+    /// Whether per-object work may run under a single shard lock while other
+    /// shards are being mutated. When false, `lock_gc_maps` skips shard locks.
+    const SHARDED: bool;
+    fn with_shards(n: usize) -> Self;
+    fn get(&self, k: ObjectId) -> Option<&ObjectEntryRef>;
+    fn get_mut(&mut self, k: ObjectId) -> Option<&mut ObjectEntryRef>;
+    fn remove(&mut self, k: ObjectId) -> Option<ObjectEntryRef>;
+    /// # Safety
+    /// `k` must refer to a valid, currently occupied slot.
+    unsafe fn remove_unchecked(&mut self, k: ObjectId) -> ObjectEntryRef;
+    fn len(&self) -> usize;
+    fn iter(&self) -> impl Iterator<Item = (ObjectId, &ObjectEntryRef)>;
+    fn iter_mut(&mut self) -> impl Iterator<Item = (ObjectId, &mut ObjectEntryRef)>;
+    fn values(&self) -> impl Iterator<Item = &ObjectEntryRef>;
+    fn drain(&mut self) -> Vec<(ObjectId, ObjectEntryRef)>;
+}
+
+/// Object map of the thread-local collector.
+pub(crate) type LocalObjects = SlotMap<ObjectId, ObjectEntryRef>;
+/// Object map of the global collector.
+pub(crate) type SyncObjects = ShardedSlotMap<ObjectId, ObjectEntryRef>;
+
+macro_rules! forward_object_map {
+    ($ty:ty, $sharded:expr, $new:expr) => {
+        impl ObjectMap for $ty {
+            const SHARDED: bool = $sharded;
+            #[inline]
+            fn with_shards(n: usize) -> Self {
+                ($new)(n)
+            }
+            #[inline]
+            fn get(&self, k: ObjectId) -> Option<&ObjectEntryRef> {
+                <$ty>::get(self, k)
+            }
+            #[inline]
+            fn get_mut(&mut self, k: ObjectId) -> Option<&mut ObjectEntryRef> {
+                <$ty>::get_mut(self, k)
+            }
+            #[inline]
+            fn remove(&mut self, k: ObjectId) -> Option<ObjectEntryRef> {
+                <$ty>::remove(self, k)
+            }
+            #[inline(always)]
+            unsafe fn remove_unchecked(&mut self, k: ObjectId) -> ObjectEntryRef {
+                unsafe { <$ty>::remove_unchecked(self, k) }
+            }
+            #[inline]
+            fn len(&self) -> usize {
+                <$ty>::len(self)
+            }
+            #[inline]
+            fn iter(&self) -> impl Iterator<Item = (ObjectId, &ObjectEntryRef)> {
+                <$ty>::iter(self)
+            }
+            #[inline]
+            fn iter_mut(&mut self) -> impl Iterator<Item = (ObjectId, &mut ObjectEntryRef)> {
+                <$ty>::iter_mut(self)
+            }
+            #[inline]
+            fn values(&self) -> impl Iterator<Item = &ObjectEntryRef> {
+                <$ty>::values(self)
+            }
+            #[inline]
+            fn drain(&mut self) -> Vec<(ObjectId, ObjectEntryRef)> {
+                <$ty>::drain(self)
+            }
+        }
+    };
+}
+forward_object_map!(LocalObjects, false, |_n: usize| SlotMap::new());
+forward_object_map!(SyncObjects, true, ShardedSlotMap::with_shards);
+
+pub(crate) struct GcMaps<O: ObjectMap = LocalObjects> {
+    pub(crate) objects: O,
     /// Maps thin object pointer → ObjectId for trace_children resolution.
     pub(crate) ptr_to_object: FxHashMap<usize, ObjectId>,
     /// Weak-reference alive flags. Only populated for objects that have
@@ -1412,10 +1494,10 @@ pub(crate) struct GcMaps {
     /// bit during trace, so a leaked guard makes the mark phase skip the
     /// object's children and sweep live objects. Buffer is reused across
     /// collections.
-    pub(crate) cascade_visited: Vec<*const Cell<usize>>,
+    pub(crate) cascade_visited: CascadeVisited,
 }
 
-impl GcMaps {
+impl<O: ObjectMap> GcMaps<O> {
     /// Total number of handles across all objects.
     #[cfg(test)]
     fn total_tracers(&self) -> usize {
@@ -1474,20 +1556,22 @@ impl IncrementalState {
 /// RAII guard for accessing GcMaps. Optionally holds a MutexGuard when
 /// thread-safe access is needed (GlobalGarbageCollector, background strategies).
 /// For thread-local access, the lock field is None and access is zero-cost.
-pub(crate) struct GcMapsGuard<'a> {
-    maps: &'a mut GcMaps,
-    _locks: Vec<std::sync::MutexGuard<'a, ()>>,
+pub(crate) struct GcMapsGuard<'a, O: ObjectMap = LocalObjects> {
+    maps: &'a mut GcMaps<O>,
+    _global: std::sync::MutexGuard<'a, ()>,
+    /// Shard guards; empty (no allocation) for an unsharded map.
+    _shards: Vec<std::sync::MutexGuard<'a, ()>>,
 }
 
-impl<'a> Deref for GcMapsGuard<'a> {
-    type Target = GcMaps;
-    fn deref(&self) -> &GcMaps {
+impl<'a, O: ObjectMap> Deref for GcMapsGuard<'a, O> {
+    type Target = GcMaps<O>;
+    fn deref(&self) -> &GcMaps<O> {
         self.maps
     }
 }
 
-impl<'a> DerefMut for GcMapsGuard<'a> {
-    fn deref_mut(&mut self) -> &mut GcMaps {
+impl<'a, O: ObjectMap> DerefMut for GcMapsGuard<'a, O> {
+    fn deref_mut(&mut self) -> &mut GcMaps<O> {
         self.maps
     }
 }
@@ -1495,8 +1579,8 @@ impl<'a> DerefMut for GcMapsGuard<'a> {
 /// Shared GC bookkeeping used by both LocalGarbageCollector and GlobalGarbageCollector.
 /// gc_maps is behind UnsafeCell for zero-cost thread-local access; gc_maps_lock
 /// provides Mutex protection when cross-thread access is needed.
-pub(crate) struct GarbageCollector {
-    pub(crate) gc_maps: UnsafeCell<GcMaps>,
+pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
+    pub(crate) gc_maps: UnsafeCell<GcMaps<O>>,
     /// Mutex for thread-safe gc_maps access (used by GlobalGC and background strategies).
     pub(crate) gc_maps_lock: Mutex<()>,
     /// One lock per object shard. Per-object work (allocate, clone a handle,
@@ -1562,22 +1646,22 @@ pub(crate) struct GarbageCollector {
 // SAFETY: GcMaps is behind UnsafeCell but protected by gc_maps_lock (Mutex<()>)
 // for cross-thread access. Thread-local access bypasses the lock (single-threaded
 // guarantee from thread_local!). All other mutable state is behind Mutex or atomics.
-unsafe impl Sync for GarbageCollector {}
-unsafe impl Send for GarbageCollector {}
+unsafe impl<O: ObjectMap> Sync for GarbageCollector<O> {}
+unsafe impl<O: ObjectMap> Send for GarbageCollector<O> {}
 
 #[allow(dead_code)]
-impl GarbageCollector {
+impl<O: ObjectMap> GarbageCollector<O> {
     /// Thread-local collector: a single shard (one owning thread).
-    pub(crate) fn new() -> GarbageCollector {
+    pub(crate) fn new() -> Self {
         Self::with_shards(1)
     }
 
     /// Collector whose object map is split into `shards` thread-affine shards.
     /// Used by the global GC so concurrent allocation does not serialize.
-    pub(crate) fn with_shards(shards: usize) -> GarbageCollector {
+    pub(crate) fn with_shards(shards: usize) -> Self {
         GarbageCollector {
             gc_maps: UnsafeCell::new(GcMaps {
-                objects: ShardedSlotMap::with_shards(shards),
+                objects: O::with_shards(shards),
                 ptr_to_object: FxHashMap::default(),
                 weak_alive_map: FxHashMap::default(),
                 gen0_ids: Vec::new(),
@@ -1627,21 +1711,26 @@ impl GarbageCollector {
 
     /// Thread-safe locked access to gc_maps. Used by collection methods
     /// and GlobalGarbageCollector. Acquires gc_maps_lock Mutex.
-    pub(crate) fn lock_gc_maps(&self) -> GcMapsGuard<'_> {
+    pub(crate) fn lock_gc_maps(&self) -> GcMapsGuard<'_, O> {
         let global = self.gc_maps_lock.lock().unwrap_or_else(|e| e.into_inner());
-        // Acquire every shard lock, in index order, so this guard also excludes
-        // the shard-scoped per-object paths.
-        let mut locks = Vec::with_capacity(self.shard_locks.len() + 1);
-        locks.push(global);
-        for l in self.shard_locks.iter() {
-            locks.push(l.lock().unwrap_or_else(|e| e.into_inner()));
+        // For a sharded map, acquire every shard lock in index order so this
+        // guard also excludes the shard-scoped per-object paths. An unsharded
+        // map has no such paths, so it takes only the global lock (and the
+        // empty Vec does not allocate).
+        let mut shards = Vec::new();
+        if O::SHARDED {
+            shards.reserve_exact(self.shard_locks.len());
+            for l in self.shard_locks.iter() {
+                shards.push(l.lock().unwrap_or_else(|e| e.into_inner()));
+            }
         }
-        // SAFETY: the global lock plus every shard lock give exclusive access to
-        // all of gc_maps across threads.
+        // SAFETY: the global lock (plus every shard lock when sharded) gives
+        // exclusive access to all of gc_maps across threads.
         let maps = unsafe { &mut *self.gc_maps.get() };
         GcMapsGuard {
             maps,
-            _locks: locks,
+            _global: global,
+            _shards: shards,
         }
     }
 
@@ -1655,7 +1744,7 @@ impl GarbageCollector {
     /// unsharded maps (`ptr_to_object`, `weak_alive_map`, `gen0_ids`) and other
     /// shards require `lock_gc_maps`.
     #[inline]
-    pub(crate) unsafe fn with_own_shard<R>(&self, f: impl FnOnce(&mut GcMaps, usize) -> R) -> R {
+    pub(crate) unsafe fn with_own_shard<R>(&self, f: impl FnOnce(&mut GcMaps<O>, usize) -> R) -> R {
         let shard = crate::sharded_map::current_thread_shard(self.shard_locks.len());
         let _g = self.shard_locks[shard]
             .lock()
@@ -1676,7 +1765,7 @@ impl GarbageCollector {
     pub(crate) unsafe fn with_shard_of<R>(
         &self,
         id: ObjectId,
-        f: impl FnOnce(&mut GcMaps) -> R,
+        f: impl FnOnce(&mut GcMaps<O>) -> R,
     ) -> R {
         use crate::slot_map::SlotKey;
         let shard = id.shard().min(self.shard_locks.len() - 1);
@@ -1695,7 +1784,7 @@ impl GarbageCollector {
     /// context with no background collection thread accessing gc_maps).
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    pub(crate) unsafe fn gc_maps_unsync(&self) -> &mut GcMaps {
+    pub(crate) unsafe fn gc_maps_unsync(&self) -> &mut GcMaps<O> {
         unsafe { &mut *self.gc_maps.get() }
     }
 
@@ -2067,7 +2156,7 @@ impl GarbageCollector {
 
     #[inline]
     fn remove_handle_inner(
-        gc_maps: &mut GcMaps,
+        gc_maps: &mut GcMaps<O>,
         card_table: &CardTable,
         object_id: ObjectId,
         is_root: bool,
@@ -2125,7 +2214,7 @@ impl GarbageCollector {
 
     #[inline]
     fn remove_tracer_inner(
-        gc_maps: &mut GcMaps,
+        gc_maps: &mut GcMaps<O>,
         card_table: &CardTable,
         object_id: ObjectId,
         tracer_ptr: *const u8,
@@ -2205,10 +2294,10 @@ impl GarbageCollector {
     /// `use_gen0_ids`: if true, use gen0_ids for O(Gen0) iteration.
     ///
     /// # Safety
-    /// `gc_maps_raw` must be a valid mutable pointer to GcMaps. No other references
-    /// to GcMaps may exist while this function runs.
+    /// `gc_maps_raw` must be a valid mutable pointer to GcMaps<O>. No other references
+    /// to GcMaps<O> may exist while this function runs.
     unsafe fn discover_roots(
-        gc_maps_raw: *mut GcMaps,
+        gc_maps_raw: *mut GcMaps<O>,
         scope: Option<Generation>,
         use_gen0_ids: bool,
     ) {
@@ -2280,7 +2369,9 @@ impl GarbageCollector {
             // this loop and by a cascade edge had its outgoing edges
             // decremented twice — a rooted self-referencing object (or a
             // rooted cycle) lost its stack-root status and was swept alive.
-            GC_MAPS_CTX.set(gc_ctx_tag_collecting(gc_maps_raw));
+            GC_MAPS_CTX.set(gc_ctx_tag_collecting(
+                &raw mut (*gc_maps_raw).cascade_visited,
+            ));
             match scope {
                 None => {
                     for entry in (*gc_maps_raw).objects.values() {
@@ -2421,7 +2512,7 @@ impl GarbageCollector {
 
                 let use_gen0_ids =
                     max_gen == Generation::Gen0 && gc_maps.gen0_ids.len() <= gc_maps.objects.len();
-                let gc_maps_raw = &mut *gc_maps as *mut GcMaps;
+                let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
                 let scope = if max_gen >= Generation::Gen2 {
                     None
                 } else {
@@ -2675,7 +2766,7 @@ impl GarbageCollector {
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
                 let mut gc_maps = self.lock_gc_maps();
 
-                let gc_maps_raw = &mut *gc_maps as *mut GcMaps;
+                let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
                 let scope = if max_gen >= Generation::Gen2 {
                     None
                 } else {
@@ -2833,7 +2924,7 @@ impl GarbageCollector {
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
                 let mut gc_maps = self.lock_gc_maps();
 
-                let gc_maps_raw = &mut *gc_maps as *mut GcMaps;
+                let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
                 let scope = if max_gen >= Generation::Gen2 {
                     None
                 } else {
@@ -2975,7 +3066,7 @@ impl GarbageCollector {
         // finish_collection must be greyed (see note_new_object_during_marking).
         self.marking.store(true, Ordering::Release);
 
-        let gc_maps_raw = &mut *gc_maps as *mut GcMaps;
+        let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
         unsafe {
             Self::discover_roots(gc_maps_raw, None, false);
         }
@@ -3265,7 +3356,7 @@ impl GarbageCollector {
 
             children_buf.clear();
             if let Some(entry) = gc_maps.objects.get(obj_id) {
-                // SAFETY: entry.ptr is valid for the lifetime of the GcMaps lock.
+                // SAFETY: entry.ptr is valid for the lifetime of the GcMaps<O> lock.
                 unsafe {
                     (&*entry.ptr).trace_children(&mut children_buf);
                 }
@@ -3329,7 +3420,7 @@ impl GarbageCollector {
         incr.gray_stack.clear();
         incr.edges.clear();
 
-        let gc_maps_raw = &mut *gc_maps as *mut GcMaps;
+        let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
         unsafe {
             Self::discover_roots(gc_maps_raw, None, false);
         }
@@ -3504,7 +3595,7 @@ impl GarbageCollector {
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
                 let mut gc_maps = self.lock_gc_maps();
 
-                let gc_maps_raw = &mut *gc_maps as *mut GcMaps;
+                let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
                 Self::discover_roots(gc_maps_raw, None, false);
 
                 // Mark phase: trace from root objects (root_count > 0).
@@ -3624,7 +3715,7 @@ impl GarbageCollector {
                 let mut gc_maps = self.lock_gc_maps();
 
                 // ---- Mark phase (same as collect_generation Gen2) ----
-                let gc_maps_raw = &mut *gc_maps as *mut GcMaps;
+                let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
                 Self::discover_roots(gc_maps_raw, None, false);
 
                 // Mark from root objects (root_count > 0).
@@ -4266,7 +4357,7 @@ impl LocalGarbageCollector {
             let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(gc_maps_raw);
+            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
@@ -4289,7 +4380,7 @@ impl LocalGarbageCollector {
             }
             let new_gc = Gc::from_parts(gc_ptr, true);
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(gc_maps_raw);
+            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             new_gc
@@ -4359,7 +4450,7 @@ impl LocalGarbageCollector {
             let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(gc_maps_raw);
+            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
@@ -4382,7 +4473,7 @@ impl LocalGarbageCollector {
             }
             let new_gc = GcCell::from_parts(refcell_ptr, true);
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(gc_maps_raw);
+            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*refcell_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             new_gc
@@ -4453,7 +4544,7 @@ impl LocalGarbageCollector {
             let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(gc_maps_raw);
+            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
@@ -4530,7 +4621,7 @@ impl LocalGarbageCollector {
             let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(gc_maps_raw);
+            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
@@ -4553,7 +4644,7 @@ impl LocalGarbageCollector {
             }
             let gc = Gc::from_parts(weak.ptr, true);
             let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(gc_maps_raw);
+            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*weak.ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             gc
