@@ -2297,4 +2297,99 @@ mod tests {
         assert_eq!(after, baseline, "object should survive when clone exists");
         assert_eq!(**b, 99);
     }
+
+    // --- Sharded object map (thread-affine shards) ---
+
+    fn live_objects() -> usize {
+        (*GLOBAL_GC).core.lock_gc_maps().objects.len()
+    }
+
+    #[test]
+    fn sharded_allocations_from_threads_use_distinct_shards_and_free() {
+        use crate::slot_map::SlotKey;
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let per_thread: Vec<Vec<Gc<u64>>> = (0..4u64)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    (0..64u64)
+                        .map(|i| Gc::new(t * 1000 + i))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        // Each allocating thread owns its own shard - that affinity is what
+        // removes the contention.
+        let shards: std::collections::HashSet<usize> =
+            per_thread.iter().map(|v| v[0].object_id.shard()).collect();
+        assert_eq!(
+            shards.len(),
+            4,
+            "each allocating thread must own a distinct shard"
+        );
+        for v in &per_thread {
+            let s = v[0].object_id.shard();
+            assert!(v.iter().all(|g| g.object_id.shard() == s));
+        }
+        // Every object is registered and addressable through its tagged id.
+        assert_eq!(live_objects(), before + 256);
+        for (t, v) in per_thread.iter().enumerate() {
+            for (i, g) in v.iter().enumerate() {
+                assert_eq!(***g, t as u64 * 1000 + i as u64);
+            }
+        }
+        // Clone a handle whose object lives in another thread's shard, then drop
+        // everything on this thread: cross-shard RC-hybrid frees must land.
+        let extra = per_thread[2][5].clone();
+        drop(per_thread);
+        assert_eq!(live_objects(), before + 1);
+        assert_eq!(**extra, 2005);
+        drop(extra);
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn sharded_drop_on_foreign_thread_frees_immediately() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let v: Vec<Gc<u64>> = (0..32u64).map(Gc::new).collect();
+        assert_eq!(live_objects(), before + 32);
+        // Dropped on a thread that owns a different shard.
+        std::thread::spawn(move || drop(v)).join().unwrap();
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn weak_refs_route_drops_through_full_lock_and_then_recover() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let strong = Gc::new(7u64);
+        let weak = Gc::downgrade(&strong);
+        assert!(
+            (*GLOBAL_GC)
+                .core
+                .weak_alive_len
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0,
+            "creating a weak ref must move drops off the shard-scoped fast path"
+        );
+        assert_eq!(**weak.upgrade().expect("object is alive"), 7);
+        drop(strong);
+        assert!(
+            weak.upgrade().is_none(),
+            "weak must not upgrade a freed object"
+        );
+        assert_eq!(live_objects(), before);
+        // The slow drop re-synced the hint, so later drops are fast again.
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .weak_alive_len
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
 }
