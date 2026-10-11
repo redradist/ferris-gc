@@ -1830,12 +1830,21 @@ impl<O: ObjectMap> GarbageCollector<O> {
     #[inline]
     fn track_dealloc(&self, size: usize) {
         // Saturating atomic subtract (never underflow if a dealloc is tracked
-        // without a matching alloc).
-        let _ = self
-            .current_heap_size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(size))
-            });
+        // without a matching alloc). An explicit CAS loop rather than
+        // `fetch_update`, which current stable deprecates in favour of
+        // `try_update` - not available on the MSRV (1.85).
+        let mut cur = self.current_heap_size.load(Ordering::Relaxed);
+        loop {
+            match self.current_heap_size.compare_exchange_weak(
+                cur,
+                cur.saturating_sub(size),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// Finalize and drop a collected object in place. The object's memory is
