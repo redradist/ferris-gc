@@ -3,7 +3,8 @@ use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::generation::{
     CollectionPhase, CollectionStats, GcStats, Generation, MarkColor, PromotionConfig, RegionId,
 };
-use crate::slot_map::{ObjectId, SlotMap};
+use crate::sharded_map::ShardedSlotMap;
+use crate::slot_map::ObjectId;
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
@@ -1394,7 +1395,7 @@ impl Iterator for TracerDrain {
 
 /// Unified GC maps. Single Mutex protects all state to simplify locking.
 pub(crate) struct GcMaps {
-    pub(crate) objects: SlotMap<ObjectId, ObjectEntryRef>,
+    pub(crate) objects: ShardedSlotMap<ObjectId, ObjectEntryRef>,
     /// Maps thin object pointer → ObjectId for trace_children resolution.
     pub(crate) ptr_to_object: FxHashMap<usize, ObjectId>,
     /// Weak-reference alive flags. Only populated for objects that have
@@ -1554,10 +1555,17 @@ unsafe impl Send for GarbageCollector {}
 
 #[allow(dead_code)]
 impl GarbageCollector {
+    /// Thread-local collector: a single shard (one owning thread).
     pub(crate) fn new() -> GarbageCollector {
+        Self::with_shards(1)
+    }
+
+    /// Collector whose object map is split into `shards` thread-affine shards.
+    /// Used by the global GC so concurrent allocation does not serialize.
+    pub(crate) fn with_shards(shards: usize) -> GarbageCollector {
         GarbageCollector {
             gc_maps: UnsafeCell::new(GcMaps {
-                objects: SlotMap::new(),
+                objects: ShardedSlotMap::with_shards(shards),
                 ptr_to_object: FxHashMap::default(),
                 weak_alive_map: FxHashMap::default(),
                 gen0_ids: Vec::new(),

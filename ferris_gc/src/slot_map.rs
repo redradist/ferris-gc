@@ -1,11 +1,25 @@
 use std::marker::PhantomData;
 
 /// Trait for slot-map key types with generation-counted u64 encoding.
-/// Upper 32 bits = generation, lower 32 bits = index.
+///
+/// Layout: `[slot_generation:32 | shard:6 | index:26]`.
+///
+/// The shard tag is carved out of the *index*, never out of the generation:
+/// narrowing the generation would shrink the ABA-reuse window (a stale key
+/// silently aliasing a recycled slot), whereas exhausting a shard's index space
+/// is deterministic and asserted. Total capacity is unchanged (64 shards x
+/// 67.1M slots = the old 32-bit index space).
 pub trait SlotKey: Copy + Eq {
     fn from_raw(index: u32, ver: u32) -> Self;
     fn index(self) -> u32;
     fn slot_generation(self) -> u32;
+
+    /// Index of the shard owning this key (see `crate::sharded_map`).
+    fn shard(self) -> usize;
+    /// Same key tagged with `shard`.
+    fn with_shard(self, shard: usize) -> Self;
+    /// Same key with the shard tag cleared, as the owning shard stores it.
+    fn strip_shard(self) -> Self;
 
     #[allow(dead_code)]
     fn raw(self) -> u64 {
@@ -22,15 +36,37 @@ impl ObjectId {
     pub const ZERO: ObjectId = ObjectId(0);
 }
 
+/// Bits of the 32-bit index reserved for the shard tag.
+pub const SHARD_BITS: u32 = 6;
+/// Bits left for the per-shard slot index.
+pub const INDEX_BITS: u32 = 32 - SHARD_BITS;
+/// Maximum slots one shard may hold (67,108,864).
+pub const MAX_SLOTS_PER_SHARD: u32 = 1 << INDEX_BITS;
+const INDEX_MASK: u64 = (1u64 << INDEX_BITS) - 1;
+const SHARD_MASK: u64 = ((1u64 << SHARD_BITS) - 1) << INDEX_BITS;
+
 impl SlotKey for ObjectId {
     fn from_raw(index: u32, slot_gen: u32) -> Self {
+        assert!(
+            index < MAX_SLOTS_PER_SHARD,
+            "object shard exhausted: slot index {index} >= {MAX_SLOTS_PER_SHARD}"
+        );
         ObjectId(((slot_gen as u64) << 32) | (index as u64))
     }
     fn index(self) -> u32 {
-        self.0 as u32
+        (self.0 & INDEX_MASK) as u32
     }
     fn slot_generation(self) -> u32 {
         (self.0 >> 32) as u32
+    }
+    fn shard(self) -> usize {
+        ((self.0 & SHARD_MASK) >> INDEX_BITS) as usize
+    }
+    fn with_shard(self, shard: usize) -> Self {
+        ObjectId((self.0 & !SHARD_MASK) | (((shard as u64) << INDEX_BITS) & SHARD_MASK))
+    }
+    fn strip_shard(self) -> Self {
+        ObjectId(self.0 & !SHARD_MASK)
     }
 }
 
@@ -264,6 +300,7 @@ impl<K: SlotKey, V> SlotMap<K, V> {
     }
 
     /// Iterate over all occupied values.
+    #[allow(dead_code)]
     pub fn values(&self) -> impl Iterator<Item = &V> {
         self.slots.iter().filter_map(|slot| match &slot.value {
             SlotValue::Occupied(v) => Some(v),
