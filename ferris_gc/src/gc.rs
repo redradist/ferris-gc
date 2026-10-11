@@ -1476,7 +1476,7 @@ impl IncrementalState {
 /// For thread-local access, the lock field is None and access is zero-cost.
 pub(crate) struct GcMapsGuard<'a> {
     maps: &'a mut GcMaps,
-    _lock: Option<std::sync::MutexGuard<'a, ()>>,
+    _locks: Vec<std::sync::MutexGuard<'a, ()>>,
 }
 
 impl<'a> Deref for GcMapsGuard<'a> {
@@ -1499,6 +1499,18 @@ pub(crate) struct GarbageCollector {
     pub(crate) gc_maps: UnsafeCell<GcMaps>,
     /// Mutex for thread-safe gc_maps access (used by GlobalGC and background strategies).
     pub(crate) gc_maps_lock: Mutex<()>,
+    /// One lock per object shard. Per-object work (allocate, clone a handle,
+    /// RC-hybrid drop) takes only the relevant shard's lock; anything needing a
+    /// consistent view of the whole map takes `gc_maps_lock` and then **every**
+    /// shard lock in index order. That single fixed order (global, then shard
+    /// 0..n) is the only one used, so the two paths cannot deadlock.
+    pub(crate) shard_locks: Box<[Mutex<()>]>,
+    /// Entry count of `weak_alive_map`, readable without any lock. While it is
+    /// zero the weak map is definitely empty, so per-object hot paths can stay
+    /// shard-scoped. Only written under the full-map lock (raised on weak
+    /// insert, re-synced on the slow drop path); a stale non-zero costs a slower
+    /// path, never correctness.
+    pub(crate) weak_alive_len: AtomicUsize,
     /// Allocation counter for adaptive collection triggering.
     pub(crate) allocation_count: AtomicUsize,
     pub(crate) card_table: CardTable,
@@ -1572,6 +1584,11 @@ impl GarbageCollector {
                 cascade_visited: Vec::new(),
             }),
             gc_maps_lock: Mutex::new(()),
+            shard_locks: (0..shards.clamp(1, crate::sharded_map::MAX_SHARDS))
+                .map(|_| Mutex::new(()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            weak_alive_len: AtomicUsize::new(0),
             allocation_count: AtomicUsize::new(0),
             card_table: CardTable::new(),
             stw_lock: RwLock::new(()),
@@ -1611,13 +1628,64 @@ impl GarbageCollector {
     /// Thread-safe locked access to gc_maps. Used by collection methods
     /// and GlobalGarbageCollector. Acquires gc_maps_lock Mutex.
     pub(crate) fn lock_gc_maps(&self) -> GcMapsGuard<'_> {
-        let lock = self.gc_maps_lock.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: MutexGuard ensures exclusive access across threads.
+        let global = self.gc_maps_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Acquire every shard lock, in index order, so this guard also excludes
+        // the shard-scoped per-object paths.
+        let mut locks = Vec::with_capacity(self.shard_locks.len() + 1);
+        locks.push(global);
+        for l in self.shard_locks.iter() {
+            locks.push(l.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        // SAFETY: the global lock plus every shard lock give exclusive access to
+        // all of gc_maps across threads.
         let maps = unsafe { &mut *self.gc_maps.get() };
         GcMapsGuard {
             maps,
-            _lock: Some(lock),
+            _locks: locks,
         }
+    }
+
+    /// Run `f` with exclusive access to **only the calling thread's shard**.
+    /// The allocation fast path: each thread owns a distinct shard, so this
+    /// lock is uncontended and concurrent allocation scales instead of
+    /// serializing on one global mutex.
+    ///
+    /// # Safety
+    /// `f` may touch only `objects` entries of the shard index it is given. The
+    /// unsharded maps (`ptr_to_object`, `weak_alive_map`, `gen0_ids`) and other
+    /// shards require `lock_gc_maps`.
+    #[inline]
+    pub(crate) unsafe fn with_own_shard<R>(&self, f: impl FnOnce(&mut GcMaps, usize) -> R) -> R {
+        let shard = crate::sharded_map::current_thread_shard(self.shard_locks.len());
+        let _g = self.shard_locks[shard]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the shard lock excludes every other user of this shard
+        // (lock_gc_maps takes it too); the contract confines `f` to it.
+        let maps = unsafe { &mut *self.gc_maps.get() };
+        f(maps, shard)
+    }
+
+    /// Run `f` with exclusive access to **only the shard owning `id`**. Used by
+    /// the per-object hot paths (handle clone, RC-hybrid drop) so they do not
+    /// pay for the full-map lock, which must acquire every shard.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::with_own_shard`], for `id`'s shard.
+    #[inline]
+    pub(crate) unsafe fn with_shard_of<R>(
+        &self,
+        id: ObjectId,
+        f: impl FnOnce(&mut GcMaps) -> R,
+    ) -> R {
+        use crate::slot_map::SlotKey;
+        let shard = id.shard().min(self.shard_locks.len() - 1);
+        let _g = self.shard_locks[shard]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: as in with_own_shard.
+        let maps = unsafe { &mut *self.gc_maps.get() };
+        f(maps)
     }
 
     /// Unsynchronized zero-cost access to gc_maps for single-threaded use.
@@ -1905,11 +1973,17 @@ impl GarbageCollector {
     pub(crate) fn get_or_create_weak_alive(&self, obj_id: ObjectId) -> Arc<AtomicBool> {
         let mut gc_maps = self.lock_gc_maps();
         if gc_maps.objects.get(obj_id).is_some() {
-            return gc_maps
+            let alive = gc_maps
                 .weak_alive_map
                 .entry(obj_id)
                 .or_insert_with(|| Arc::new(AtomicBool::new(true)))
                 .clone();
+            // Raised under the full lock, before any shard-scoped drop of this
+            // object can observe it: from here on drops take the full lock and
+            // flip this flag.
+            self.weak_alive_len
+                .store(gc_maps.weak_alive_map.len(), Ordering::Release);
+            return alive;
         }
         Arc::new(AtomicBool::new(false))
     }
@@ -2024,9 +2098,27 @@ impl GarbageCollector {
     // --- Tracer-based removal: used by sync.rs (global GC) only. ---
 
     pub(crate) unsafe fn remove_tracer(&self, object_id: ObjectId, tracer_ptr: *const u8) {
-        let (tracer_dealloc, object_dealloc) = {
+        let (tracer_dealloc, object_dealloc) = if self.weak_alive_len.load(Ordering::Acquire) == 0 {
+            // Fast path: the RC-hybrid drop path, as hot as allocation. With no
+            // weak refs anywhere, remove_tracer_inner touches only this object's
+            // shard (CardTable synchronizes itself), so take just that shard's
+            // lock. Keeping this on the full-map lock made concurrent workloads
+            // ~18x slower once that lock had to acquire every shard.
+            unsafe {
+                self.with_shard_of(object_id, |maps| {
+                    Self::remove_tracer_inner(maps, &self.card_table, object_id, tracer_ptr)
+                })
+            }
+        } else {
             let mut gc_maps = self.lock_gc_maps();
-            Self::remove_tracer_inner(&mut gc_maps, &self.card_table, object_id, tracer_ptr)
+            let r =
+                Self::remove_tracer_inner(&mut gc_maps, &self.card_table, object_id, tracer_ptr);
+            // Re-sync the hint while every shard is held (no shard-scoped drop
+            // can be mid-flight), so a program that used weak refs only briefly
+            // returns to the fast path once they are gone.
+            self.weak_alive_len
+                .store(gc_maps.weak_alive_map.len(), Ordering::Release);
+            r
         };
         Self::finalize_remove_tracer(self, tracer_dealloc, object_dealloc);
     }

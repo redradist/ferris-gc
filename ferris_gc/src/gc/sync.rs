@@ -813,7 +813,7 @@ unsafe impl Send for GlobalGarbageCollector {}
 impl GlobalGarbageCollector {
     fn new() -> GlobalGarbageCollector {
         GlobalGarbageCollector {
-            core: GarbageCollector::new(),
+            core: GarbageCollector::with_shards(crate::sharded_map::MAX_SHARDS),
         }
     }
 
@@ -846,15 +846,18 @@ impl GlobalGarbageCollector {
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
-            let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            // Shard-scoped registration: insert into this thread's own shard so
+            // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
+            let obj_id = self.core.with_own_shard(|maps, shard| {
+                let obj_id = maps.objects.insert_in(shard, ObjectEntryRef(oe_ptr));
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
+                obj_id
+            });
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
-            drop(gc_maps);
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = Gc {
@@ -879,19 +882,21 @@ impl GlobalGarbageCollector {
             // SAFETY: internal_ptr is valid; the source Gc handle is alive during clone.
             let object_id = (*gc.internal_ptr).object_id;
 
-            let mut gc_maps = self.core.lock_gc_maps();
-            // RC hybrid: push tracer for the cloned object
-            if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.tracers.push(TracerInfo {
-                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                });
-            }
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, object_id));
-            drop(gc_maps);
+            // Shard-scoped: the cloned object's tracer list lives in that
+            // object's own shard, so the full-map lock is not needed.
+            self.core.with_shard_of(object_id, |maps| {
+                // RC hybrid: push tracer for the cloned object
+                if let Some(entry) = maps.objects.get_mut(object_id) {
+                    entry.tracers.push(TracerInfo {
+                        tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                        mem: mem_info_internal_ptr.0,
+                        layout: mem_info_internal_ptr.1,
+                    });
+                }
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, object_id));
+            });
 
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
@@ -935,15 +940,18 @@ impl GlobalGarbageCollector {
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
-            let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            // Shard-scoped registration: insert into this thread's own shard so
+            // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
+            let obj_id = self.core.with_own_shard(|maps, shard| {
+                let obj_id = maps.objects.insert_in(shard, ObjectEntryRef(oe_ptr));
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
+                obj_id
+            });
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
-            drop(gc_maps);
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell {
@@ -968,19 +976,21 @@ impl GlobalGarbageCollector {
             // SAFETY: internal_ptr is valid; the source GcCell handle is alive during clone.
             let object_id = (*gc.internal_ptr).object_id;
 
-            let mut gc_maps = self.core.lock_gc_maps();
-            // RC hybrid: push tracer for the cloned object
-            if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.tracers.push(TracerInfo {
-                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                    mem: mem_info.0,
-                    layout: mem_info.1,
-                });
-            }
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr, object_id));
-            drop(gc_maps);
+            // Shard-scoped: the cloned object's tracer list lives in that
+            // object's own shard, so the full-map lock is not needed.
+            self.core.with_shard_of(object_id, |maps| {
+                // RC hybrid: push tracer for the cloned object
+                if let Some(entry) = maps.objects.get_mut(object_id) {
+                    entry.tracers.push(TracerInfo {
+                        tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                        mem: mem_info.0,
+                        layout: mem_info.1,
+                    });
+                }
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr, object_id));
+            });
             let gc = GcCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
@@ -1035,15 +1045,18 @@ impl GlobalGarbageCollector {
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
-            let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            // Shard-scoped registration: insert into this thread's own shard so
+            // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
+            let obj_id = self.core.with_own_shard(|maps, shard| {
+                let obj_id = maps.objects.insert_in(shard, ObjectEntryRef(oe_ptr));
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
+                obj_id
+            });
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
-            drop(gc_maps);
             self.core.note_new_object_during_marking(obj_id);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
@@ -1102,15 +1115,18 @@ impl GlobalGarbageCollector {
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
-            let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            // Shard-scoped registration: insert into this thread's own shard so
+            // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
+            let obj_id = self.core.with_own_shard(|maps, shard| {
+                let obj_id = maps.objects.insert_in(shard, ObjectEntryRef(oe_ptr));
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
+                obj_id
+            });
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
-            drop(gc_maps);
             self.core.note_new_object_during_marking(obj_id);
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
