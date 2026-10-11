@@ -1430,19 +1430,19 @@ macro_rules! forward_object_map {
     ($ty:ty, $sharded:expr, $new:expr) => {
         impl ObjectMap for $ty {
             const SHARDED: bool = $sharded;
-            #[inline]
+            #[inline(always)]
             fn with_shards(n: usize) -> Self {
                 ($new)(n)
             }
-            #[inline]
+            #[inline(always)]
             fn get(&self, k: ObjectId) -> Option<&ObjectEntryRef> {
                 <$ty>::get(self, k)
             }
-            #[inline]
+            #[inline(always)]
             fn get_mut(&mut self, k: ObjectId) -> Option<&mut ObjectEntryRef> {
                 <$ty>::get_mut(self, k)
             }
-            #[inline]
+            #[inline(always)]
             fn remove(&mut self, k: ObjectId) -> Option<ObjectEntryRef> {
                 <$ty>::remove(self, k)
             }
@@ -1450,23 +1450,23 @@ macro_rules! forward_object_map {
             unsafe fn remove_unchecked(&mut self, k: ObjectId) -> ObjectEntryRef {
                 unsafe { <$ty>::remove_unchecked(self, k) }
             }
-            #[inline]
+            #[inline(always)]
             fn len(&self) -> usize {
                 <$ty>::len(self)
             }
-            #[inline]
+            #[inline(always)]
             fn iter(&self) -> impl Iterator<Item = (ObjectId, &ObjectEntryRef)> {
                 <$ty>::iter(self)
             }
-            #[inline]
+            #[inline(always)]
             fn iter_mut(&mut self) -> impl Iterator<Item = (ObjectId, &mut ObjectEntryRef)> {
                 <$ty>::iter_mut(self)
             }
-            #[inline]
+            #[inline(always)]
             fn values(&self) -> impl Iterator<Item = &ObjectEntryRef> {
                 <$ty>::values(self)
             }
-            #[inline]
+            #[inline(always)]
             fn drain(&mut self) -> Vec<(ObjectId, ObjectEntryRef)> {
                 <$ty>::drain(self)
             }
@@ -1902,7 +1902,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
     /// # Safety
     /// `drop_object_entry` must have run for this entry, and no further access
     /// to the object or the entry may happen afterwards.
-    #[inline]
+    // Forced for the same reason as create_gc: the RC-hybrid drop path.
+    #[inline(always)]
     unsafe fn free_object_entry(entry_ref: ObjectEntryRef) {
         // Read all fields from the TLAB-allocated ObjectEntry before releasing memory.
         let oe_ptr = entry_ref.0;
@@ -4236,32 +4237,13 @@ impl LocalGarbageCollector {
     /// (down to 1K) to reclaim memory promptly.
     #[inline]
     unsafe fn maybe_collect(&self) {
-        // On-thread incremental mode (set by the local background/g1 strategies):
-        // advance a Gen2 mark by one bounded step per allocation instead of a
-        // full STW collect. Runs on the owning thread, so the lockless mutator is
-        // never raced; pauses stay short because each step marks <= `budget`
-        // objects. Correctness of interleaving with allocation relies on
-        // grey-at-birth (note_new_object_during_marking) + the write barrier.
+        // Only the cheap trigger checks stay inline. Every collection entry
+        // point is kept out of line: inlining the collector into the allocation
+        // fast path bloated it enough that LLVM stopped inlining Gc::new into its
+        // callers (measured +4-6% instructions on alloc/churn).
         let budget = self.core.local_incremental_budget.load(Ordering::Relaxed);
         if budget > 0 {
-            match self.core.incremental_phase() {
-                CollectionPhase::Idle => {
-                    let count = self.core.allocation_count.load(Ordering::Relaxed);
-                    let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
-                    if count >= threshold {
-                        unsafe { self.core.begin_collection(Generation::Gen2) };
-                    }
-                }
-                CollectionPhase::Marking => {
-                    let done = unsafe { self.core.mark_step(budget) };
-                    if done {
-                        let stats = unsafe { self.core.finish_collection() };
-                        self.core.allocation_count.store(0, Ordering::Relaxed);
-                        self.adapt_alloc_threshold(&stats);
-                    }
-                }
-                CollectionPhase::Sweeping => {}
-            }
+            unsafe { self.step_incremental(budget) };
             return;
         }
 
@@ -4269,9 +4251,43 @@ impl LocalGarbageCollector {
         let count = self.core.allocation_count.load(Ordering::Relaxed);
         let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
         if count >= threshold {
-            let stats = unsafe { self.core.collect_generation(Generation::Gen0) };
-            self.adapt_alloc_threshold(&stats);
+            unsafe { self.collect_gen0_and_adapt() };
         }
+    }
+
+    /// On-thread incremental mode (set by the local background/g1 strategies):
+    /// advance a Gen2 mark by one bounded step per allocation instead of a
+    /// full STW collect. Runs on the owning thread, so the lockless mutator is
+    /// never raced; pauses stay short because each step marks <= `budget`
+    /// objects. Correctness of interleaving with allocation relies on
+    /// grey-at-birth (note_new_object_during_marking) + the write barrier.
+    #[inline(never)]
+    unsafe fn step_incremental(&self, budget: usize) {
+        match self.core.incremental_phase() {
+            CollectionPhase::Idle => {
+                let count = self.core.allocation_count.load(Ordering::Relaxed);
+                let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
+                if count >= threshold {
+                    unsafe { self.core.begin_collection(Generation::Gen2) };
+                }
+            }
+            CollectionPhase::Marking => {
+                let done = unsafe { self.core.mark_step(budget) };
+                if done {
+                    let stats = unsafe { self.core.finish_collection() };
+                    self.core.allocation_count.store(0, Ordering::Relaxed);
+                    self.adapt_alloc_threshold(&stats);
+                }
+            }
+            CollectionPhase::Sweeping => {}
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn collect_gen0_and_adapt(&self) {
+        let stats = unsafe { self.core.collect_generation(Generation::Gen0) };
+        self.adapt_alloc_threshold(&stats);
     }
 
     /// GOGC-style adaptive threshold: grow when almost nothing was collected
@@ -4292,7 +4308,10 @@ impl LocalGarbageCollector {
         }
     }
 
-    #[inline]
+    // Forced: master's LLVM inlined this into Gc::new; once GarbageCollector
+    // became generic (two monomorphizations) it stopped, costing ~11% of
+    // churn instructions in call overhead.
+    #[inline(always)]
     unsafe fn create_gc<T>(&mut self, t: T, region: RegionId) -> Gc<T>
     where
         T: Sized + Trace,
