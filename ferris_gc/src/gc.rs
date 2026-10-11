@@ -1588,7 +1588,7 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     /// consistent view of the whole map takes `gc_maps_lock` and then **every**
     /// shard lock in index order. That single fixed order (global, then shard
     /// 0..n) is the only one used, so the two paths cannot deadlock.
-    pub(crate) shard_locks: Box<[Mutex<()>]>,
+    pub(crate) shard_locks: Box<[crate::sharded_map::CachePadded<Mutex<()>>]>,
     /// Entry count of `weak_alive_map`, readable without any lock. While it is
     /// zero the weak map is definitely empty, so per-object hot paths can stay
     /// shard-scoped. Only written under the full-map lock (raised on weak
@@ -1669,7 +1669,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
             }),
             gc_maps_lock: Mutex::new(()),
             shard_locks: (0..shards.clamp(1, crate::sharded_map::MAX_SHARDS))
-                .map(|_| Mutex::new(()))
+                .map(|_| crate::sharded_map::CachePadded(Mutex::new(())))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             weak_alive_len: AtomicUsize::new(0),

@@ -26,6 +26,32 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Maximum shards, matching the shard bits reserved in a key's index.
+/// Aligns `T` to its own 128-byte slot so that per-thread state written on the
+/// hot path never shares a cache line with another thread's.
+///
+/// Sharding by thread separates the data *logically*, but adjacent shards (and
+/// their 8-byte `Mutex<()>` locks - eight to a line) still shared cache lines,
+/// so every lock/insert bounced the line between cores: four threads allocated
+/// no faster than two. 128 rather than 64 because Intel's adjacent-line
+/// prefetcher pulls lines in pairs.
+#[repr(align(128))]
+pub(crate) struct CachePadded<T>(pub(crate) T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 pub(crate) const MAX_SHARDS: usize = 1 << crate::slot_map::SHARD_BITS;
 
 /// Hands each thread a stable, distinct ordinal. Threads keep it for life,
@@ -76,8 +102,8 @@ fn shard_exhausted() -> ! {
 /// they are only called under `lock_gc_maps`. Concurrent per-shard work goes
 /// through [`Self::shard_ptr`] under that shard's lock.
 pub(crate) struct ShardedSlotMap<K: SlotKey, V> {
-    first: UnsafeCell<SlotMap<K, V>>,
-    rest: Box<[UnsafeCell<SlotMap<K, V>>]>,
+    first: CachePadded<UnsafeCell<SlotMap<K, V>>>,
+    rest: Box<[CachePadded<UnsafeCell<SlotMap<K, V>>>]>,
 }
 
 impl<K: SlotKey, V> ShardedSlotMap<K, V> {
@@ -85,10 +111,10 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     pub(crate) fn with_shards(n: usize) -> Self {
         let n = n.clamp(1, MAX_SHARDS);
         let rest = (1..n)
-            .map(|_| UnsafeCell::new(SlotMap::new()))
+            .map(|_| CachePadded(UnsafeCell::new(SlotMap::new())))
             .collect::<Vec<_>>();
         ShardedSlotMap {
-            first: UnsafeCell::new(SlotMap::new()),
+            first: CachePadded(UnsafeCell::new(SlotMap::new())),
             rest: rest.into_boxed_slice(),
         }
     }
@@ -102,9 +128,9 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     #[inline]
     fn cell(&self, s: usize) -> Option<&UnsafeCell<SlotMap<K, V>>> {
         if s == 0 {
-            Some(&self.first)
+            Some(&self.first.0)
         } else {
-            self.rest.get(s - 1)
+            self.rest.get(s - 1).map(|p| &p.0)
         }
     }
 
@@ -119,7 +145,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     pub(crate) fn shard_ptr(&self, s: usize) -> *mut SlotMap<K, V> {
         match self.cell(s) {
             Some(c) => c.get(),
-            None => self.first.get(),
+            None => self.first.0.get(),
         }
     }
 
@@ -146,7 +172,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         if s == 0 {
             Some(self.first.get_mut())
         } else {
-            self.rest.get_mut(s - 1).map(UnsafeCell::get_mut)
+            self.rest.get_mut(s - 1).map(|p| p.0.get_mut())
         }
     }
 
@@ -193,7 +219,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         let m = if s == 0 {
             self.first.get_mut()
         } else {
-            unsafe { self.rest.get_unchecked_mut(s - 1).get_mut() }
+            unsafe { self.rest.get_unchecked_mut(s - 1).0.get_mut() }
         };
         unsafe { m.remove_unchecked(key.strip_shard()) }
     }
@@ -244,7 +270,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     pub(crate) fn clear(&mut self) {
         self.first.get_mut().clear();
         for s in self.rest.iter_mut() {
-            s.get_mut().clear();
+            s.0.get_mut().clear();
         }
     }
 
@@ -252,7 +278,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         let mut out = self.first.get_mut().drain();
         for (i, s) in self.rest.iter_mut().enumerate() {
             out.extend(
-                s.get_mut()
+                s.0.get_mut()
                     .drain()
                     .into_iter()
                     .map(|(k, v)| (k.with_shard(i + 1), v)),
@@ -288,7 +314,7 @@ impl<'a, K: SlotKey, V> Iterator for Iter<'a, K, V> {
 
 /// Mutable iterator over every occupied entry of a [`ShardedSlotMap`].
 pub(crate) struct IterMut<'a, K: SlotKey, V> {
-    rest: &'a mut [UnsafeCell<SlotMap<K, V>>],
+    rest: &'a mut [CachePadded<UnsafeCell<SlotMap<K, V>>>],
     shard: usize,
     cur: Option<crate::slot_map::IterMut<'a, K, V>>,
 }
@@ -308,7 +334,7 @@ impl<'a, K: SlotKey, V> Iterator for IterMut<'a, K, V> {
                         [] => self.cur = None,
                         [head, tail @ ..] => {
                             self.shard += 1;
-                            self.cur = Some(head.get_mut().iter_mut());
+                            self.cur = Some(head.0.get_mut().iter_mut());
                             self.rest = tail;
                         }
                     }
