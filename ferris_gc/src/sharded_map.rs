@@ -81,6 +81,9 @@ fn shard_exhausted() -> ! {
     )
 }
 
+/// One shard: its own `SlotMap`, behind its own cell, on its own cache line.
+type Shard<K, V> = CachePadded<UnsafeCell<SlotMap<K, V>>>;
+
 /// A `SlotMap` split into per-thread shards, exposing a `SlotMap`-compatible
 /// surface so collector code iterates it unchanged.
 ///
@@ -102,8 +105,8 @@ fn shard_exhausted() -> ! {
 /// they are only called under `lock_gc_maps`. Concurrent per-shard work goes
 /// through [`Self::shard_ptr`] under that shard's lock.
 pub(crate) struct ShardedSlotMap<K: SlotKey, V> {
-    first: CachePadded<UnsafeCell<SlotMap<K, V>>>,
-    rest: Box<[CachePadded<UnsafeCell<SlotMap<K, V>>>]>,
+    first: Shard<K, V>,
+    rest: Box<[Shard<K, V>]>,
 }
 
 impl<K: SlotKey, V> ShardedSlotMap<K, V> {
@@ -314,7 +317,7 @@ impl<'a, K: SlotKey, V> Iterator for Iter<'a, K, V> {
 
 /// Mutable iterator over every occupied entry of a [`ShardedSlotMap`].
 pub(crate) struct IterMut<'a, K: SlotKey, V> {
-    rest: &'a mut [CachePadded<UnsafeCell<SlotMap<K, V>>>],
+    rest: &'a mut [Shard<K, V>],
     shard: usize,
     cur: Option<crate::slot_map::IterMut<'a, K, V>>,
 }
