@@ -23,7 +23,7 @@
 
 use crate::slot_map::{SlotKey, SlotMap};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Stop-the-world lock split per thread.
@@ -80,6 +80,116 @@ impl StwLock {
             _first: first,
             _rest: rest,
         })
+    }
+}
+
+/// Counter interface a collector is generic over (see `gc::ObjectMap`): the
+/// thread-local collector uses [`SingleCounter`] - a plain atomic, exactly the
+/// old code - and the global collector uses [`ShardedCounter`]. Dispatch is
+/// static, so the thread-local allocation path pays nothing for sharding
+/// (routing it through a runtime-checked sharded counter cost ~24 extra
+/// instructions per allocation).
+pub(crate) trait Counter: Send + Sync {
+    /// True when the value of the calling thread's slot is the exact total.
+    const SINGLE: bool;
+    fn with_shards(n: usize) -> Self;
+    /// Add `n`; returns the calling thread's slot value afterwards (the exact
+    /// total when [`Self::SINGLE`]).
+    fn add(&self, n: usize) -> isize;
+    fn sub(&self, n: usize);
+    fn load(&self, order: Ordering) -> usize;
+    fn store(&self, v: usize, order: Ordering);
+}
+
+/// A plain atomic counter (the thread-local collector).
+pub(crate) struct SingleCounter(AtomicUsize);
+
+impl Counter for SingleCounter {
+    const SINGLE: bool = true;
+    #[inline]
+    fn with_shards(_n: usize) -> Self {
+        SingleCounter(AtomicUsize::new(0))
+    }
+    #[inline]
+    fn add(&self, n: usize) -> isize {
+        (self.0.fetch_add(n, Ordering::Relaxed) + n) as isize
+    }
+    /// Saturating: never underflows when a release is tracked without a
+    /// matching add.
+    #[inline]
+    fn sub(&self, n: usize) {
+        let mut cur = self.0.load(Ordering::Relaxed);
+        loop {
+            match self.0.compare_exchange_weak(
+                cur,
+                cur.saturating_sub(n),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+    #[inline]
+    fn load(&self, order: Ordering) -> usize {
+        self.0.load(order)
+    }
+    #[inline]
+    fn store(&self, v: usize, order: Ordering) {
+        self.0.store(v, order)
+    }
+}
+
+/// A counter split per thread, so the hot path writes only its own cache line
+/// (the global collector).
+///
+/// The sync collector bumped `allocation_count` and `current_heap_size` on
+/// every allocation and drop; as single atomics those lines bounced between
+/// cores just like the old shared reader count. Each thread now updates its own
+/// padded shard and readers sum the shards.
+///
+/// Shards are signed: an object allocated on one thread and freed on another
+/// moves one shard down and another up; only the sum is meaningful, and it is
+/// clamped at zero when read.
+pub(crate) struct ShardedCounter {
+    shards: Box<[CachePadded<AtomicIsize>]>,
+}
+
+impl Counter for ShardedCounter {
+    const SINGLE: bool = false;
+    fn with_shards(n: usize) -> Self {
+        let n = n.clamp(1, MAX_SHARDS);
+        ShardedCounter {
+            shards: (0..n)
+                .map(|_| CachePadded(AtomicIsize::new(0)))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+    #[inline]
+    fn add(&self, n: usize) -> isize {
+        let mine = &self.shards[current_thread_shard(self.shards.len())];
+        mine.fetch_add(n as isize, Ordering::Relaxed) + n as isize
+    }
+    /// A shard may go negative; the clamp happens on read.
+    #[inline]
+    fn sub(&self, n: usize) {
+        let mine = &self.shards[current_thread_shard(self.shards.len())];
+        mine.fetch_sub(n as isize, Ordering::Relaxed);
+    }
+    /// Sum of all shards, clamped at zero (shards are read `Relaxed`).
+    #[inline]
+    fn load(&self, _order: Ordering) -> usize {
+        let sum: isize = self.shards.iter().map(|s| s.load(Ordering::Relaxed)).sum();
+        sum.max(0) as usize
+    }
+    /// Reset the total to `v` (shard 0 holds it, the rest are zeroed).
+    fn store(&self, v: usize, _order: Ordering) {
+        self.shards[0].store(v as isize, Ordering::Relaxed);
+        for s in self.shards[1..].iter() {
+            s.store(0, Ordering::Relaxed);
+        }
     }
 }
 

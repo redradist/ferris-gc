@@ -1,3 +1,4 @@
+use crate::sharded_map::Counter;
 use std::cell::{Cell, RefCell};
 use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
@@ -867,7 +868,7 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.core.allocation_count.add(1);
             gc
         }
     }
@@ -961,7 +962,7 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.core.allocation_count.add(1);
             gc
         }
     }
@@ -1065,7 +1066,7 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.core.allocation_count.add(1);
             Ok(gc)
         }
     }
@@ -1135,7 +1136,7 @@ impl GlobalGarbageCollector {
             };
             // SAFETY: internal_ptr and ptr were just written above and are valid.
             (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.core.allocation_count.add(1);
             Ok(gc)
         }
     }

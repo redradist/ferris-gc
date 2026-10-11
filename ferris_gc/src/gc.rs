@@ -3,7 +3,7 @@ use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::generation::{
     CollectionPhase, CollectionStats, GcStats, Generation, MarkColor, PromotionConfig, RegionId,
 };
-use crate::sharded_map::ShardedSlotMap;
+use crate::sharded_map::{Counter, ShardedSlotMap};
 use crate::slot_map::{ObjectId, SlotMap};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -1397,6 +1397,10 @@ impl Iterator for TracerDrain {
 }
 
 /// Unified GC maps. Single Mutex protects all state to simplify locking.
+/// Sharded heap-size counters sample the peak each time a thread's shard
+/// crosses a multiple of `1 << PEAK_SAMPLE_SHIFT` bytes (64 KiB).
+const PEAK_SAMPLE_SHIFT: u32 = 16;
+
 /// Object-map storage a collector is generic over. The thread-local collector
 /// uses a plain [`SlotMap`]; the global collector uses a thread-affine
 /// [`ShardedSlotMap`] so concurrent allocation does not serialize. Static
@@ -1407,6 +1411,8 @@ pub(crate) trait ObjectMap: Sized {
     /// Whether per-object work may run under a single shard lock while other
     /// shards are being mutated. When false, `lock_gc_maps` skips shard locks.
     const SHARDED: bool;
+    /// Counter type for the allocation / heap-size statistics.
+    type Counter: Counter;
     fn with_shards(n: usize) -> Self;
     fn get(&self, k: ObjectId) -> Option<&ObjectEntryRef>;
     fn get_mut(&mut self, k: ObjectId) -> Option<&mut ObjectEntryRef>;
@@ -1427,9 +1433,10 @@ pub(crate) type LocalObjects = SlotMap<ObjectId, ObjectEntryRef>;
 pub(crate) type SyncObjects = ShardedSlotMap<ObjectId, ObjectEntryRef>;
 
 macro_rules! forward_object_map {
-    ($ty:ty, $sharded:expr, $new:expr) => {
+    ($ty:ty, $sharded:expr, $counter:ty, $new:expr) => {
         impl ObjectMap for $ty {
             const SHARDED: bool = $sharded;
+            type Counter = $counter;
             #[inline(always)]
             fn with_shards(n: usize) -> Self {
                 ($new)(n)
@@ -1473,8 +1480,18 @@ macro_rules! forward_object_map {
         }
     };
 }
-forward_object_map!(LocalObjects, false, |_n: usize| SlotMap::new());
-forward_object_map!(SyncObjects, true, ShardedSlotMap::with_shards);
+forward_object_map!(
+    LocalObjects,
+    false,
+    crate::sharded_map::SingleCounter,
+    |_n: usize| SlotMap::new()
+);
+forward_object_map!(
+    SyncObjects,
+    true,
+    crate::sharded_map::ShardedCounter,
+    ShardedSlotMap::with_shards
+);
 
 pub(crate) struct GcMaps<O: ObjectMap = LocalObjects> {
     pub(crate) objects: O,
@@ -1596,7 +1613,7 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     /// path, never correctness.
     pub(crate) weak_alive_len: AtomicUsize,
     /// Allocation counter for adaptive collection triggering.
-    pub(crate) allocation_count: AtomicUsize,
+    pub(crate) allocation_count: O::Counter,
     pub(crate) card_table: CardTable,
     pub(crate) stw_lock: crate::sharded_map::StwLock,
     pub(crate) incremental: Mutex<IncrementalState>,
@@ -1623,7 +1640,7 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     /// Configurable promotion thresholds per generation.
     pub(crate) promotion_config: Mutex<PromotionConfig>,
     /// Current total heap size in bytes.
-    pub(crate) current_heap_size: AtomicUsize,
+    pub(crate) current_heap_size: O::Counter,
     /// High-water mark of heap usage in bytes.
     pub(crate) peak_heap_size: AtomicUsize,
     /// Optional callback invoked after each collection cycle.
@@ -1673,7 +1690,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             weak_alive_len: AtomicUsize::new(0),
-            allocation_count: AtomicUsize::new(0),
+            allocation_count: <O::Counter as Counter>::with_shards(shards),
             card_table: CardTable::new(),
             stw_lock: crate::sharded_map::StwLock::with_shards(shards),
             incremental: Mutex::new(IncrementalState::new()),
@@ -1684,7 +1701,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
             current_region: AtomicU32::new(0),
             next_region_id: AtomicU32::new(1),
             promotion_config: Mutex::new(PromotionConfig::default()),
-            current_heap_size: AtomicUsize::new(0),
+            current_heap_size: <O::Counter as Counter>::with_shards(shards),
             peak_heap_size: AtomicUsize::new(0),
             alloc_threshold: AtomicUsize::new(LOCAL_GC_ALLOC_THRESHOLD),
             on_collection: Mutex::new(None),
@@ -1793,7 +1810,12 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
             allocation_count: self.allocation_count.load(Ordering::Relaxed),
-            peak_heap_size: self.peak_heap_size.load(Ordering::Relaxed),
+            // The sync collector samples its peak (see track_alloc); never
+            // report it below the live heap.
+            peak_heap_size: self
+                .peak_heap_size
+                .load(Ordering::Relaxed)
+                .max(self.current_heap_size.load(Ordering::Relaxed)),
         }
     }
 
@@ -1819,32 +1841,30 @@ impl<O: ObjectMap> GarbageCollector<O> {
     /// Track heap growth after an allocation.
     #[inline]
     fn track_alloc(&self, size: usize) {
-        // Atomic RMW so concurrent allocators (sync GC) don't lose updates —
-        // these counters feed the strategy triggers. fetch_add returns the old
-        // value; fetch_max keeps the high-water mark.
-        let new_size = self.current_heap_size.fetch_add(size, Ordering::Relaxed) + size;
-        self.peak_heap_size.fetch_max(new_size, Ordering::Relaxed);
+        let shard_now = self.current_heap_size.add(size);
+        if <O::Counter as Counter>::SINGLE {
+            // One shard: its value is the exact total, so the peak is exact.
+            self.peak_heap_size
+                .fetch_max(shard_now.max(0) as usize, Ordering::Relaxed);
+        } else if (shard_now - size as isize) >> PEAK_SAMPLE_SHIFT != shard_now >> PEAK_SAMPLE_SHIFT
+        {
+            // Sharded: an exact peak of the *sum* would need a shared write per
+            // allocation - the contention this avoids. Sample it whenever this
+            // thread's shard crosses a 64 KiB boundary, so the recorded peak is
+            // within ~64 KiB per thread of the true one.
+            self.peak_heap_size.fetch_max(
+                self.current_heap_size.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
     }
 
     /// Track heap shrinkage after a deallocation.
     #[inline]
     fn track_dealloc(&self, size: usize) {
-        // Saturating atomic subtract (never underflow if a dealloc is tracked
-        // without a matching alloc). An explicit CAS loop rather than
-        // `fetch_update`, which current stable deprecates in favour of
-        // `try_update` - not available on the MSRV (1.85).
-        let mut cur = self.current_heap_size.load(Ordering::Relaxed);
-        loop {
-            match self.current_heap_size.compare_exchange_weak(
-                cur,
-                cur.saturating_sub(size),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => cur = actual,
-            }
-        }
+        // Saturating for the single-shard (thread-local) counter; see
+        // ShardedCounter::sub.
+        self.current_heap_size.sub(size);
     }
 
     /// Finalize and drop a collected object in place. The object's memory is
@@ -4428,7 +4448,7 @@ impl LocalGarbageCollector {
             GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
-            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.core.allocation_count.add(1);
             self.maybe_collect();
             gc
         }
@@ -4521,7 +4541,7 @@ impl LocalGarbageCollector {
             GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
-            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.core.allocation_count.add(1);
             self.maybe_collect();
             gc
         }
@@ -4615,7 +4635,7 @@ impl LocalGarbageCollector {
             GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
-            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.core.allocation_count.add(1);
             self.maybe_collect();
             Ok(gc)
         }
@@ -4692,7 +4712,7 @@ impl LocalGarbageCollector {
             GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
-            self.core.allocation_count.fetch_add(1, Ordering::Relaxed);
+            self.core.allocation_count.add(1);
             self.maybe_collect();
             Ok(gc)
         }
@@ -5157,6 +5177,7 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use crate::gc::{Gc, GcCell, LOCAL_GC};
+    use crate::sharded_map::Counter;
     use crate::{Finalize, Trace};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
