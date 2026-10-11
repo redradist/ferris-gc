@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use crate::basic_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_strategy_start};
 use crate::gc::{
-    CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, Trace, TracerInfo,
-    TracerList,
+    CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, SyncObjects, Trace,
+    TracerInfo, TracerList,
 };
-use crate::slot_map::ObjectId;
+use crate::slot_map::{ObjectId, SlotKey};
 
 /// Convenience alias for an optional thread-safe GC pointer.
 pub type OptGc<T> = Option<Gc<T>>;
@@ -802,7 +802,7 @@ where
 /// Internally delegates to `GarbageCollector` which protects all state
 /// with Mutex, RwLock, and atomic operations.
 pub struct GlobalGarbageCollector {
-    pub(crate) core: GarbageCollector,
+    pub(crate) core: GarbageCollector<SyncObjects>,
 }
 
 // SAFETY: Delegates to GarbageCollector which protects all state with Mutex/atomics.
@@ -813,7 +813,7 @@ unsafe impl Send for GlobalGarbageCollector {}
 impl GlobalGarbageCollector {
     fn new() -> GlobalGarbageCollector {
         GlobalGarbageCollector {
-            core: GarbageCollector::new(),
+            core: GarbageCollector::with_shards(crate::sharded_map::MAX_SHARDS),
         }
     }
 
@@ -846,15 +846,18 @@ impl GlobalGarbageCollector {
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
-            let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            // Shard-scoped registration: insert into this thread's own shard so
+            // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
+            let obj_id = self.core.with_own_shard(|shard_map, shard| {
+                let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
+                obj_id
+            });
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
-            drop(gc_maps);
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = Gc {
@@ -879,19 +882,21 @@ impl GlobalGarbageCollector {
             // SAFETY: internal_ptr is valid; the source Gc handle is alive during clone.
             let object_id = (*gc.internal_ptr).object_id;
 
-            let mut gc_maps = self.core.lock_gc_maps();
-            // RC hybrid: push tracer for the cloned object
-            if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.tracers.push(TracerInfo {
-                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                });
-            }
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, object_id));
-            drop(gc_maps);
+            // Shard-scoped: the cloned object's tracer list lives in that
+            // object's own shard, so the full-map lock is not needed.
+            self.core.with_shard_of(object_id, |shard_map| {
+                // RC hybrid: push tracer for the cloned object
+                if let Some(entry) = shard_map.get_mut(object_id.strip_shard()) {
+                    entry.tracers.push(TracerInfo {
+                        tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                        mem: mem_info_internal_ptr.0,
+                        layout: mem_info_internal_ptr.1,
+                    });
+                }
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, object_id));
+            });
 
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
@@ -935,15 +940,18 @@ impl GlobalGarbageCollector {
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
-            let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            // Shard-scoped registration: insert into this thread's own shard so
+            // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
+            let obj_id = self.core.with_own_shard(|shard_map, shard| {
+                let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
+                obj_id
+            });
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
-            drop(gc_maps);
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell {
@@ -968,19 +976,21 @@ impl GlobalGarbageCollector {
             // SAFETY: internal_ptr is valid; the source GcCell handle is alive during clone.
             let object_id = (*gc.internal_ptr).object_id;
 
-            let mut gc_maps = self.core.lock_gc_maps();
-            // RC hybrid: push tracer for the cloned object
-            if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.tracers.push(TracerInfo {
-                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                    mem: mem_info.0,
-                    layout: mem_info.1,
-                });
-            }
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr, object_id));
-            drop(gc_maps);
+            // Shard-scoped: the cloned object's tracer list lives in that
+            // object's own shard, so the full-map lock is not needed.
+            self.core.with_shard_of(object_id, |shard_map| {
+                // RC hybrid: push tracer for the cloned object
+                if let Some(entry) = shard_map.get_mut(object_id.strip_shard()) {
+                    entry.tracers.push(TracerInfo {
+                        tracer_ptr: gc_inter_ptr as *const dyn Trace,
+                        mem: mem_info.0,
+                        layout: mem_info.1,
+                    });
+                }
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr, object_id));
+            });
             let gc = GcCell {
                 internal_ptr: gc_inter_ptr,
                 ptr: gc.ptr,
@@ -1035,15 +1045,18 @@ impl GlobalGarbageCollector {
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
-            let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            // Shard-scoped registration: insert into this thread's own shard so
+            // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
+            let obj_id = self.core.with_own_shard(|shard_map, shard| {
+                let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
+                obj_id
+            });
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
-            drop(gc_maps);
             self.core.note_new_object_during_marking(obj_id);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
@@ -1102,15 +1115,18 @@ impl GlobalGarbageCollector {
                 root_ref_count_offset,
                 entry_block: std::ptr::null_mut(),
             }));
-            let mut gc_maps = self.core.lock_gc_maps();
-            let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
+            // Shard-scoped registration: insert into this thread's own shard so
+            // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
             // (during marking/promotion), not on the allocation hot path.
+            let obj_id = self.core.with_own_shard(|shard_map, shard| {
+                let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
+                // Initialize tracer memory BEFORE releasing the shard lock, so a
+                // collector cannot read uninitialized memory via tracer_ptr.
+                std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
+                obj_id
+            });
             self.core.track_alloc(mem_info_gc_ptr.1.size());
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
-            drop(gc_maps);
             self.core.note_new_object_during_marking(obj_id);
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
@@ -2280,5 +2296,100 @@ mod tests {
         let after = (*GLOBAL_GC).core.lock_gc_maps().objects.len();
         assert_eq!(after, baseline, "object should survive when clone exists");
         assert_eq!(**b, 99);
+    }
+
+    // --- Sharded object map (thread-affine shards) ---
+
+    fn live_objects() -> usize {
+        (*GLOBAL_GC).core.lock_gc_maps().objects.len()
+    }
+
+    #[test]
+    fn sharded_allocations_from_threads_use_distinct_shards_and_free() {
+        use crate::slot_map::SlotKey;
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let per_thread: Vec<Vec<Gc<u64>>> = (0..4u64)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    (0..64u64)
+                        .map(|i| Gc::new(t * 1000 + i))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        // Each allocating thread owns its own shard - that affinity is what
+        // removes the contention.
+        let shards: std::collections::HashSet<usize> =
+            per_thread.iter().map(|v| v[0].object_id.shard()).collect();
+        assert_eq!(
+            shards.len(),
+            4,
+            "each allocating thread must own a distinct shard"
+        );
+        for v in &per_thread {
+            let s = v[0].object_id.shard();
+            assert!(v.iter().all(|g| g.object_id.shard() == s));
+        }
+        // Every object is registered and addressable through its tagged id.
+        assert_eq!(live_objects(), before + 256);
+        for (t, v) in per_thread.iter().enumerate() {
+            for (i, g) in v.iter().enumerate() {
+                assert_eq!(***g, t as u64 * 1000 + i as u64);
+            }
+        }
+        // Clone a handle whose object lives in another thread's shard, then drop
+        // everything on this thread: cross-shard RC-hybrid frees must land.
+        let extra = per_thread[2][5].clone();
+        drop(per_thread);
+        assert_eq!(live_objects(), before + 1);
+        assert_eq!(**extra, 2005);
+        drop(extra);
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn sharded_drop_on_foreign_thread_frees_immediately() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let v: Vec<Gc<u64>> = (0..32u64).map(Gc::new).collect();
+        assert_eq!(live_objects(), before + 32);
+        // Dropped on a thread that owns a different shard.
+        std::thread::spawn(move || drop(v)).join().unwrap();
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn weak_refs_route_drops_through_full_lock_and_then_recover() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let strong = Gc::new(7u64);
+        let weak = Gc::downgrade(&strong);
+        assert!(
+            (*GLOBAL_GC)
+                .core
+                .weak_alive_len
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0,
+            "creating a weak ref must move drops off the shard-scoped fast path"
+        );
+        assert_eq!(**weak.upgrade().expect("object is alive"), 7);
+        drop(strong);
+        assert!(
+            weak.upgrade().is_none(),
+            "weak must not upgrade a freed object"
+        );
+        assert_eq!(live_objects(), before);
+        // The slow drop re-synced the hint, so later drops are fast again.
+        assert_eq!(
+            (*GLOBAL_GC)
+                .core
+                .weak_alive_len
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
     }
 }
