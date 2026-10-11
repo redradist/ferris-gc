@@ -12,9 +12,9 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -1598,7 +1598,7 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     /// Allocation counter for adaptive collection triggering.
     pub(crate) allocation_count: AtomicUsize,
     pub(crate) card_table: CardTable,
-    pub(crate) stw_lock: RwLock<()>,
+    pub(crate) stw_lock: crate::sharded_map::StwLock,
     pub(crate) incremental: Mutex<IncrementalState>,
     /// Cheap gate: true between `begin_collection` and `finish_collection` so
     /// the allocation hot path can skip locking `incremental` unless an
@@ -1675,7 +1675,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
             weak_alive_len: AtomicUsize::new(0),
             allocation_count: AtomicUsize::new(0),
             card_table: CardTable::new(),
-            stw_lock: RwLock::new(()),
+            stw_lock: crate::sharded_map::StwLock::with_shards(shards),
             incremental: Mutex::new(IncrementalState::new()),
             marking: AtomicBool::new(false),
             local_incremental_budget: AtomicUsize::new(0),

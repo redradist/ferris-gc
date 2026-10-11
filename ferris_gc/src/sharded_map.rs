@@ -24,6 +24,64 @@
 use crate::slot_map::{SlotKey, SlotMap};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Stop-the-world lock split per thread.
+///
+/// Every sync mutator operation (allocate, clone, `GcCell::borrow_mut`, weak
+/// upgrade) takes a *read* lock so a collection cannot run underneath it. With
+/// one `RwLock` that read is still an atomic write to a shared reader count, so
+/// the line bounced between cores on every allocation. Here each thread
+/// read-locks only **its own** padded `RwLock` (same index as its object
+/// shard), and a collection write-locks **all** of them in index order.
+///
+/// Semantics are unchanged: a writer still excludes every reader, and readers
+/// still never exclude each other. Lock order is always "STW lock(s) first,
+/// then object shard lock(s)", writers always in index order, so it adds no
+/// deadlock. `read`/`write` return `LockResult` like `RwLock`, so callers keep
+/// their `.unwrap_or_else(|e| e.into_inner())`.
+pub(crate) struct StwLock {
+    shards: Box<[CachePadded<RwLock<()>>]>,
+}
+
+/// Write guard holding every shard of a [`StwLock`]. The first guard is kept
+/// inline so a single-shard (thread-local) collector never allocates.
+pub(crate) struct StwWriteGuard<'a> {
+    _first: RwLockWriteGuard<'a, ()>,
+    _rest: Vec<RwLockWriteGuard<'a, ()>>,
+}
+
+impl StwLock {
+    pub(crate) fn with_shards(n: usize) -> Self {
+        let n = n.clamp(1, MAX_SHARDS);
+        StwLock {
+            shards: (0..n)
+                .map(|_| CachePadded(RwLock::new(())))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    /// Read-lock the calling thread's shard.
+    #[inline]
+    pub(crate) fn read(&self) -> LockResult<RwLockReadGuard<'_, ()>> {
+        self.shards[current_thread_shard(self.shards.len())].read()
+    }
+
+    /// Write-lock every shard, in index order. Poisoning is ignored, as every
+    /// caller already does with `.unwrap_or_else(|e| e.into_inner())`.
+    pub(crate) fn write(&self) -> LockResult<StwWriteGuard<'_>> {
+        let first = self.shards[0].write().unwrap_or_else(|e| e.into_inner());
+        let rest = self.shards[1..]
+            .iter()
+            .map(|l| l.write().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        Ok(StwWriteGuard {
+            _first: first,
+            _rest: rest,
+        })
+    }
+}
 
 /// Maximum shards, matching the shard bits reserved in a key's index.
 /// Aligns `T` to its own 128-byte slot so that per-thread state written on the
