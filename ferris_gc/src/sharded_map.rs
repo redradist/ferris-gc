@@ -22,6 +22,7 @@
 //! `SlotMap` (see `gc::ObjectMap`), so it pays nothing for sharding.
 
 use crate::slot_map::{SlotKey, SlotMap};
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Maximum shards, matching the shard bits reserved in a key's index.
@@ -57,20 +58,37 @@ fn shard_exhausted() -> ! {
 /// A `SlotMap` split into per-thread shards, exposing a `SlotMap`-compatible
 /// surface so collector code iterates it unchanged.
 ///
-/// Shard 0 is stored **inline**; only shards 1.. live behind a `Box`, so the
-/// thread owning shard 0 pays no extra dependent load.
+/// Each shard lives in its own `UnsafeCell`. That is what makes concurrent
+/// per-shard mutation sound: a thread working on its shard obtains `&mut` to
+/// **that shard only** (via [`Self::shard_ptr`]), never to the map or to the
+/// enclosing `GcMaps`. Two threads each holding `&mut GcMaps` - even while
+/// touching disjoint shards - is undefined behaviour (Miri reports the
+/// reference retags as a data race), so the shard-scoped paths must reach their
+/// shard through a shared reference plus this per-shard cell.
+///
+/// Shard 0 is stored inline; only shards 1.. live behind a `Box`, so the thread
+/// owning shard 0 pays no extra dependent load.
+///
+/// # Concurrency contract
+/// `&mut self` methods need exclusive access to the whole map (the global
+/// collector's `lock_gc_maps`, which holds every shard lock). `&self` readers
+/// (`get`, `iter`, `values`, `len`) need the same exclusion of shard writers:
+/// they are only called under `lock_gc_maps`. Concurrent per-shard work goes
+/// through [`Self::shard_ptr`] under that shard's lock.
 pub(crate) struct ShardedSlotMap<K: SlotKey, V> {
-    first: SlotMap<K, V>,
-    rest: Box<[SlotMap<K, V>]>,
+    first: UnsafeCell<SlotMap<K, V>>,
+    rest: Box<[UnsafeCell<SlotMap<K, V>>]>,
 }
 
 impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     /// Create a map with `n` shards (clamped to `1..=MAX_SHARDS`).
     pub(crate) fn with_shards(n: usize) -> Self {
         let n = n.clamp(1, MAX_SHARDS);
-        let rest = (1..n).map(|_| SlotMap::new()).collect::<Vec<_>>();
+        let rest = (1..n)
+            .map(|_| UnsafeCell::new(SlotMap::new()))
+            .collect::<Vec<_>>();
         ShardedSlotMap {
-            first: SlotMap::new(),
+            first: UnsafeCell::new(SlotMap::new()),
             rest: rest.into_boxed_slice(),
         }
     }
@@ -80,8 +98,9 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         1 + self.rest.len()
     }
 
+    /// Cell of shard `s`, or `None` if out of range.
     #[inline]
-    fn shard_ref(&self, s: usize) -> Option<&SlotMap<K, V>> {
+    fn cell(&self, s: usize) -> Option<&UnsafeCell<SlotMap<K, V>>> {
         if s == 0 {
             Some(&self.first)
         } else {
@@ -89,60 +108,79 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         }
     }
 
+    /// Raw pointer to shard `s` (clamped into range), for shard-scoped work
+    /// through a **shared** reference to the map.
+    ///
+    /// # Safety
+    /// Dereferencing it mutably requires holding that shard's lock and no
+    /// concurrent `&mut self` / `&self`-reader use of the map (both happen only
+    /// under the full lock, which also holds this shard's lock).
     #[inline]
-    fn shard_mut(&mut self, s: usize) -> Option<&mut SlotMap<K, V>> {
-        if s == 0 {
-            Some(&mut self.first)
-        } else {
-            self.rest.get_mut(s - 1)
+    pub(crate) fn shard_ptr(&self, s: usize) -> *mut SlotMap<K, V> {
+        match self.cell(s) {
+            Some(c) => c.get(),
+            None => self.first.get(),
         }
     }
 
-    /// Insert into `shard`, returning a key tagged with that shard index.
+    /// Turn a key produced by shard `shard`'s own `SlotMap` into a map-wide
+    /// key by tagging it with the shard index.
     ///
     /// A shard's slot index must stay below `MAX_SLOTS_PER_SHARD`, or it would
-    /// spill into the tag bits and alias another shard's key. That is checked
+    /// spill into the tag bits and alias another shard's key; that is checked
     /// here, deterministically, rather than left to wrap silently.
     #[inline]
-    pub(crate) fn insert_in(&mut self, shard: usize, value: V) -> K {
-        let key = match self.shard_mut(shard) {
-            // Shard 0 keys carry a zero tag, so no re-tag is needed.
-            Some(m) if shard != 0 => m.insert(value),
-            _ => self.first.insert(value),
-        };
-        if key.index() >= crate::slot_map::MAX_SLOTS_PER_SHARD {
+    pub(crate) fn tag_key(raw: K, shard: usize) -> K {
+        if raw.index() >= crate::slot_map::MAX_SLOTS_PER_SHARD {
             shard_exhausted();
         }
-        if shard != 0 && shard < self.shard_count() {
-            key.with_shard(shard)
+        if shard == 0 {
+            raw
         } else {
-            key
+            raw.with_shard(shard)
         }
+    }
+
+    #[inline]
+    fn shard_mut(&mut self, s: usize) -> Option<&mut SlotMap<K, V>> {
+        if s == 0 {
+            Some(self.first.get_mut())
+        } else {
+            self.rest.get_mut(s - 1).map(UnsafeCell::get_mut)
+        }
+    }
+
+    /// Shared view of shard `s`. See the type-level concurrency contract.
+    #[inline]
+    fn shard_ref(&self, s: usize) -> Option<&SlotMap<K, V>> {
+        // SAFETY: `&self` readers run only under the full lock, which excludes
+        // every shard-scoped writer, so no `&mut` to this shard is live.
+        self.cell(s).map(|c| unsafe { &*c.get() })
+    }
+
+    /// Insert into `shard`, returning a key tagged with that shard index.
+    /// (Tests only; the collector inserts via `shard_ptr` + `tag_key`.)
+    #[cfg(test)]
+    pub(crate) fn insert_in(&mut self, shard: usize, value: V) -> K {
+        let shard = if shard < self.shard_count() { shard } else { 0 };
+        let raw = self.shard_mut(shard).expect("shard in range").insert(value);
+        Self::tag_key(raw, shard)
     }
 
     /// A key whose shard tag is out of range addresses nothing (`None`).
     #[inline]
     pub(crate) fn get(&self, key: K) -> Option<&V> {
-        match key.shard() {
-            0 => self.first.get(key),
-            s => self.rest.get(s - 1)?.get(key.strip_shard()),
-        }
+        self.shard_ref(key.shard())?.get(key.strip_shard())
     }
 
     #[inline]
     pub(crate) fn get_mut(&mut self, key: K) -> Option<&mut V> {
-        match key.shard() {
-            0 => self.first.get_mut(key),
-            s => self.rest.get_mut(s - 1)?.get_mut(key.strip_shard()),
-        }
+        self.shard_mut(key.shard())?.get_mut(key.strip_shard())
     }
 
     #[inline]
     pub(crate) fn remove(&mut self, key: K) -> Option<V> {
-        match key.shard() {
-            0 => self.first.remove(key),
-            s => self.rest.get_mut(s - 1)?.remove(key.strip_shard()),
-        }
+        self.shard_mut(key.shard())?.remove(key.strip_shard())
     }
 
     /// Remove without bounds or generation checks, from the key's own shard.
@@ -151,36 +189,37 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     /// The key must refer to a valid, currently occupied slot in that shard.
     #[inline(always)]
     pub(crate) unsafe fn remove_unchecked(&mut self, key: K) -> V {
-        match key.shard() {
-            0 => unsafe { self.first.remove_unchecked(key) },
-            s => unsafe {
-                self.rest
-                    .get_unchecked_mut(s - 1)
-                    .remove_unchecked(key.strip_shard())
-            },
-        }
+        let s = key.shard();
+        let m = if s == 0 {
+            self.first.get_mut()
+        } else {
+            unsafe { self.rest.get_unchecked_mut(s - 1).get_mut() }
+        };
+        unsafe { m.remove_unchecked(key.strip_shard()) }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.first.len() + self.rest.iter().map(|s| s.len()).sum::<usize>()
+        (0..self.shard_count())
+            .filter_map(|s| self.shard_ref(s))
+            .map(|m| m.len())
+            .sum()
     }
 
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.first.is_empty() && self.rest.iter().all(|s| s.is_empty())
+        self.len() == 0
     }
 
     /// Iterate every occupied entry across all shards. Keys are re-tagged with
     /// their shard index so callers get the same ids they were handed.
     ///
     /// Hand-rolled rather than `flat_map`: collection walks this in its hottest
-    /// loops, and the nested-closure version measurably slowed the thread-local
-    /// collector.
+    /// loops.
     pub(crate) fn iter(&self) -> Iter<'_, K, V> {
         Iter {
             map: self,
             shard: 0,
-            cur: Some(self.first.iter()),
+            cur: self.shard_ref(0).map(|m| m.iter()),
         }
     }
 
@@ -188,7 +227,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         IterMut {
             rest: &mut self.rest,
             shard: 0,
-            cur: Some(self.first.iter_mut()),
+            cur: Some(self.first.get_mut().iter_mut()),
         }
     }
 
@@ -203,16 +242,21 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
 
     #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
-        self.first.clear();
+        self.first.get_mut().clear();
         for s in self.rest.iter_mut() {
-            s.clear();
+            s.get_mut().clear();
         }
     }
 
     pub(crate) fn drain(&mut self) -> Vec<(K, V)> {
-        let mut out = self.first.drain();
+        let mut out = self.first.get_mut().drain();
         for (i, s) in self.rest.iter_mut().enumerate() {
-            out.extend(s.drain().into_iter().map(|(k, v)| (k.with_shard(i + 1), v)));
+            out.extend(
+                s.get_mut()
+                    .drain()
+                    .into_iter()
+                    .map(|(k, v)| (k.with_shard(i + 1), v)),
+            );
         }
         out
     }
@@ -244,7 +288,7 @@ impl<'a, K: SlotKey, V> Iterator for Iter<'a, K, V> {
 
 /// Mutable iterator over every occupied entry of a [`ShardedSlotMap`].
 pub(crate) struct IterMut<'a, K: SlotKey, V> {
-    rest: &'a mut [SlotMap<K, V>],
+    rest: &'a mut [UnsafeCell<SlotMap<K, V>>],
     shard: usize,
     cur: Option<crate::slot_map::IterMut<'a, K, V>>,
 }
@@ -264,7 +308,7 @@ impl<'a, K: SlotKey, V> Iterator for IterMut<'a, K, V> {
                         [] => self.cur = None,
                         [head, tail @ ..] => {
                             self.shard += 1;
-                            self.cur = Some(head.iter_mut());
+                            self.cur = Some(head.get_mut().iter_mut());
                             self.rest = tail;
                         }
                     }
