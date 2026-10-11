@@ -569,6 +569,82 @@ mod tests {
     }
 
     #[test]
+    fn sharded_counter_sums_across_threads_and_clamps() {
+        let c = std::sync::Arc::new(ShardedCounter::with_shards(8));
+        // Allocate on four threads, free everything on one other thread: the
+        // per-thread slots go negative/positive but the sum is exact.
+        let adders: Vec<_> = (0..4)
+            .map(|_| {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        c.add(3);
+                    }
+                })
+            })
+            .collect();
+        for h in adders {
+            h.join().unwrap();
+        }
+        assert_eq!(c.load(Ordering::Relaxed), 12_000);
+        let c2 = c.clone();
+        std::thread::spawn(move || {
+            for _ in 0..1000 {
+                c2.sub(9);
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(c.load(Ordering::Relaxed), 3_000);
+        // More released than added: the total clamps at zero.
+        c.sub(10_000);
+        assert_eq!(c.load(Ordering::Relaxed), 0);
+        c.store(5, Ordering::Relaxed);
+        assert_eq!(c.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn single_counter_saturates() {
+        let c = SingleCounter::with_shards(1);
+        assert_eq!(c.add(4), 4);
+        c.sub(10);
+        assert_eq!(c.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stw_write_excludes_a_reader_on_another_threads_shard() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, mpsc};
+        let lock = Arc::new(StwLock::with_shards(8));
+        let acquired = Arc::new(AtomicBool::new(false));
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // A reader on its own thread (hence its own shard) holds the lock...
+        let l = lock.clone();
+        let reader = std::thread::spawn(move || {
+            let _g = l.read().unwrap_or_else(|e| e.into_inner());
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        // ...so a writer on yet another thread must not get through.
+        let (l, a) = (lock.clone(), acquired.clone());
+        let writer = std::thread::spawn(move || {
+            let _g = l.write().unwrap_or_else(|e| e.into_inner());
+            a.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "a STW write must exclude readers on every shard"
+        );
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn single_shard_behaves_like_slotmap() {
         let mut m: ShardedSlotMap<ObjectId, u32> = ShardedSlotMap::with_shards(1);
         let a = m.insert_in(0, 7);
