@@ -1844,8 +1844,10 @@ impl<O: ObjectMap> GarbageCollector<O> {
         let shard_now = self.current_heap_size.add(size);
         if <O::Counter as Counter>::SINGLE {
             // One shard: its value is the exact total, so the peak is exact.
+            // A SingleCounter wraps a usize and is never negative, so the cast
+            // needs no clamp.
             self.peak_heap_size
-                .fetch_max(shard_now.max(0) as usize, Ordering::Relaxed);
+                .fetch_max(shard_now as usize, Ordering::Relaxed);
         } else if (shard_now - size as isize) >> PEAK_SAMPLE_SHIFT != shard_now >> PEAK_SAMPLE_SHIFT
         {
             // Sharded: an exact peak of the *sum* would need a shared write per
