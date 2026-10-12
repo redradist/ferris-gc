@@ -1,8 +1,8 @@
 use crate::sharded_map::Counter;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, UnsafeCell};
 use std::ops::{Deref, DerefMut};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -179,57 +179,100 @@ where
     }
 }
 
-impl<T> Trace for RefCell<GcPtr<T>>
+/// The object behind a [`GcCell`]: GC header, a reader-writer lock, and the
+/// value that lock guards.
+///
+/// The header lives outside the lock and the value, so the collector can
+/// update it while a user holds a borrow, without aliasing the user's `&mut`.
+/// The collector never blocks on the lock: it reads the value under
+/// `try_read`. If a `borrow_mut` holds the lock, the collector counts the
+/// scan as blocked (see `GarbageCollector::blocked_scans`), and that
+/// collection frees nothing.
+pub(crate) struct GcCellBox<T>
+where
+    T: 'static + Sized + Trace,
+{
+    info: GcInfo,
+    lock: RwLock<()>,
+    value: UnsafeCell<T>,
+}
+
+impl<T> GcCellBox<T>
+where
+    T: 'static + Sized + Trace,
+{
+    fn new(t: T) -> GcCellBox<T> {
+        GcCellBox {
+            info: GcInfo::new(),
+            lock: RwLock::new(()),
+            value: UnsafeCell::new(t),
+        }
+    }
+
+    /// Run `f` on the value unless a `borrow_mut` holds it. Never blocks.
+    #[inline]
+    fn try_with_value<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let _guard = match self.lock.try_read() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        // SAFETY: the read lock excludes every writer.
+        Some(f(unsafe { &*self.value.get() }))
+    }
+
+    /// [`Self::try_with_value`] for marking. A value it cannot read leaves the
+    /// current collection's mark incomplete, so that collection frees nothing.
+    #[inline]
+    fn scan_value(&self, f: impl FnOnce(&T)) {
+        if self.try_with_value(f).is_none() {
+            GLOBAL_GC.core.blocked_scans.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl<T> Trace for GcCellBox<T>
 where
     T: Sized + Trace,
 {
     fn is_root(&self) -> bool {
-        unreachable!("is_root on GcPtr is unreachable !!");
+        unreachable!("is_root on GcCellBox is unreachable !!");
     }
 
     fn reset_root(&self) {
-        self.borrow().t.reset_root();
+        // Skipping a value that is mutably borrowed leaves its handles counted
+        // as roots, which only keeps more alive.
+        self.try_with_value(|t| t.reset_root());
     }
 
     fn trace(&self) {
-        let prev = self
-            .borrow()
-            .info
-            .root_ref_count
-            .fetch_add(1, Ordering::AcqRel);
+        let prev = self.info.root_ref_count.fetch_add(1, Ordering::AcqRel);
         if prev == 0 {
-            self.borrow().t.trace();
+            self.scan_value(|t| t.trace());
         }
     }
 
     fn reset(&self) {
-        let prev = self
-            .borrow()
-            .info
-            .root_ref_count
-            .fetch_sub(1, Ordering::AcqRel);
+        let prev = self.info.root_ref_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            self.borrow().t.reset();
+            self.scan_value(|t| t.reset());
         }
     }
 
     fn is_traceable(&self) -> bool {
-        self.borrow().info.root_ref_count.load(Ordering::Acquire) > 0
+        self.info.root_ref_count.load(Ordering::Acquire) > 0
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        self.borrow().t.trace_children(children);
+        self.scan_value(|t| t.trace_children(children));
     }
 
     fn clear_trace(&self) {
-        self.borrow()
-            .info
-            .root_ref_count
-            .store(0, Ordering::Release);
+        self.info.root_ref_count.store(0, Ordering::Release);
     }
 }
 
-impl<T> Finalize for RefCell<GcPtr<T>>
+impl<T> Finalize for GcCellBox<T>
 where
     T: Sized + Trace,
 {
@@ -343,10 +386,12 @@ where
 
 /// # Safety
 /// The underlying GcInternal uses atomic ref-counting, and the global GC
-/// protects all structural mutations with Mutex/RwLock. `Gc<T>` is safe to
-/// send across threads when `T` itself is Send.
-unsafe impl<T> Sync for Gc<T> where T: 'static + Sized + Trace + Sync {}
-unsafe impl<T> Send for Gc<T> where T: 'static + Sized + Trace + Send {}
+/// protects all structural mutations with Mutex/RwLock. Every handle (and the
+/// collector) reaches the same value, so moving or sharing a handle shares
+/// `&T` across threads and may drop `T` on another thread: like `Arc<T>`,
+/// both need `T: Send + Sync`.
+unsafe impl<T> Sync for Gc<T> where T: 'static + Sized + Trace + Send + Sync {}
+unsafe impl<T> Send for Gc<T> where T: 'static + Sized + Trace + Send + Sync {}
 
 impl<T> Deref for Gc<T>
 where
@@ -377,7 +422,10 @@ where
 {
     /// Allocate a new thread-safe GC-managed object on the global collector.
     /// Starts the background collection strategy if not already active.
-    pub fn new(t: T) -> Gc<T> {
+    pub fn new(t: T) -> Gc<T>
+    where
+        T: Send + Sync,
+    {
         basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
@@ -388,7 +436,10 @@ where
     }
 
     /// Allocate a new thread-safe GC-managed object in the specified region.
-    pub fn new_in(t: T, region: SyncRegionId) -> Gc<T> {
+    pub fn new_in(t: T, region: SyncRegionId) -> Gc<T>
+    where
+        T: Send + Sync,
+    {
         basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).create_gc(t, region.0) }
@@ -396,7 +447,10 @@ where
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     /// On OOM, triggers an emergency GC collection and retries once before failing.
-    pub fn try_new(t: T) -> Result<Gc<T>, crate::gc::GcAllocError> {
+    pub fn try_new(t: T) -> Result<Gc<T>, crate::gc::GcAllocError>
+    where
+        T: Send + Sync,
+    {
         basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
@@ -407,7 +461,10 @@ where
     }
 
     /// Fallible allocation in a specified region.
-    pub fn try_new_in(t: T, region: SyncRegionId) -> Result<Gc<T>, crate::gc::GcAllocError> {
+    pub fn try_new_in(t: T, region: SyncRegionId) -> Result<Gc<T>, crate::gc::GcAllocError>
+    where
+        T: Send + Sync,
+    {
         basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).try_create_gc(t, region.0) }
@@ -500,7 +557,7 @@ where
     T: 'static + Sized + Trace,
 {
     is_root: AtomicBool,
-    ptr: *const RefCell<GcPtr<T>>,
+    ptr: *const GcCellBox<T>,
     pub(crate) object_id: ObjectId,
 }
 
@@ -508,7 +565,7 @@ impl<T> GcCellInternal<T>
 where
     T: 'static + Sized + Trace,
 {
-    fn new(ptr: *const RefCell<GcPtr<T>>, object_id: ObjectId) -> GcCellInternal<T> {
+    fn new(ptr: *const GcCellBox<T>, object_id: ObjectId) -> GcCellInternal<T> {
         GcCellInternal {
             is_root: AtomicBool::new(true),
             ptr,
@@ -530,7 +587,7 @@ where
             self.is_root.store(false, Ordering::Release);
             unsafe {
                 // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-                (*self.ptr).borrow().reset_root();
+                (*self.ptr).reset_root();
             }
         }
     }
@@ -538,20 +595,20 @@ where
     fn trace(&self) {
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).borrow().trace();
+            (*self.ptr).trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).borrow().reset();
+            (*self.ptr).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
         // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { (*self.ptr).borrow().is_traceable() }
+        unsafe { (*self.ptr).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -568,22 +625,77 @@ where
 
 /// A garbage-collected mutable cell that can be shared across threads.
 ///
-/// The thread-safe counterpart of the local `GcCell<T>`. `borrow_mut()`
-/// triggers the write barrier for generational collection.
+/// The thread-safe counterpart of the local `GcCell<T>`, with reader-writer
+/// lock semantics: any number of [`borrow`](Self::borrow)s or one
+/// [`borrow_mut`](Self::borrow_mut) at a time, across all threads and clones.
+/// A borrow that conflicts with one held elsewhere waits for it; the `try_`
+/// variants return `None` instead. A conflicting borrow on the thread that
+/// already holds the cell deadlocks, as with `RwLock`.
+///
+/// `borrow_mut()` triggers the write barrier for generational collection. The
+/// collector never waits for a borrow: a collection that finds a cell mutably
+/// borrowed frees nothing and is retried later.
 pub struct GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
     internal_ptr: *mut GcCellInternal<T>,
-    ptr: *const RefCell<GcPtr<T>>,
+    ptr: *const GcCellBox<T>,
     object_id: ObjectId,
 }
 
-// SAFETY: GcCell uses atomic ref-counting internally. All structural mutations
-// go through the global GC's Mutex. The RefCell itself is only accessed while
-// holding the STW read lock, preventing data races.
-unsafe impl<T> Sync for GcCell<T> where T: 'static + Sized + Trace + Sync {}
-unsafe impl<T> Send for GcCell<T> where T: 'static + Sized + Trace + Send {}
+// SAFETY: every handle (and the collector) reaches the same value, so moving
+// or sharing a handle shares `&T` across threads (T: Sync) and lets any
+// thread take `&mut T` or drop the value (T: Send). The value is only reached
+// under the cell's lock.
+unsafe impl<T> Sync for GcCell<T> where T: 'static + Sized + Trace + Send + Sync {}
+unsafe impl<T> Send for GcCell<T> where T: 'static + Sized + Trace + Send + Sync {}
+
+/// A shared borrow of a [`GcCell`]'s value, from [`GcCell::borrow`].
+pub struct GcCellRef<'a, T: 'static> {
+    value: &'a T,
+    _guard: RwLockReadGuard<'a, ()>,
+}
+
+impl<T> Deref for GcCellRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.value
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for GcCellRef<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+
+/// A mutable borrow of a [`GcCell`]'s value, from [`GcCell::borrow_mut`].
+pub struct GcCellRefMut<'a, T: 'static> {
+    value: &'a mut T,
+    _guard: RwLockWriteGuard<'a, ()>,
+}
+
+impl<T> Deref for GcCellRefMut<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.value
+    }
+}
+
+impl<T> DerefMut for GcCellRefMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.value
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for GcCellRefMut<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
 
 impl<T> Drop for GcCell<T>
 where
@@ -599,24 +711,15 @@ where
     }
 }
 
-impl<T> Deref for GcCell<T>
-where
-    T: 'static + Sized + Trace,
-{
-    type Target = RefCell<GcPtr<T>>;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { &(*self.ptr) }
-    }
-}
-
 impl<T> std::fmt::Debug for GcCell<T>
 where
     T: 'static + Sized + Trace + std::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("GcCell").field(&**self.borrow()).finish()
+        match self.try_borrow() {
+            Some(value) => f.debug_tuple("GcCell").field(&*value).finish(),
+            None => f.write_str("GcCell(<borrowed>)"),
+        }
     }
 }
 
@@ -625,7 +728,10 @@ where
     T: 'static + Sized + Trace,
 {
     /// Allocate a new thread-safe GC-managed interior-mutable cell on the global collector.
-    pub fn new(t: T) -> GcCell<T> {
+    pub fn new(t: T) -> GcCell<T>
+    where
+        T: Send + Sync,
+    {
         basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe {
@@ -635,7 +741,10 @@ where
     }
 
     /// Allocate a new thread-safe GC-managed interior-mutable cell in the specified region.
-    pub fn new_in(t: T, region: SyncRegionId) -> GcCell<T> {
+    pub fn new_in(t: T, region: SyncRegionId) -> GcCell<T>
+    where
+        T: Send + Sync,
+    {
         basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).create_gc_cell(t, region.0) }
@@ -643,7 +752,10 @@ where
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
     /// On OOM, triggers an emergency GC collection and retries once before failing.
-    pub fn try_new(t: T) -> Result<GcCell<T>, crate::gc::GcAllocError> {
+    pub fn try_new(t: T) -> Result<GcCell<T>, crate::gc::GcAllocError>
+    where
+        T: Send + Sync,
+    {
         basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe {
@@ -653,29 +765,90 @@ where
     }
 
     /// Fallible allocation in a specified region.
-    pub fn try_new_in(t: T, region: SyncRegionId) -> Result<GcCell<T>, crate::gc::GcAllocError> {
+    pub fn try_new_in(t: T, region: SyncRegionId) -> Result<GcCell<T>, crate::gc::GcAllocError>
+    where
+        T: Send + Sync,
+    {
         basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).try_create_gc_cell(t, region.0) }
     }
 
-    /// Mutable borrow with write barrier.
-    /// Triggers the write barrier so that if this object is in an older generation,
-    /// its card is marked dirty in the card table for young-generation collections.
-    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
-        unsafe {
-            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-            // self.ptr is valid for the lifetime of this GcCell handle.
-            let _stw = GLOBAL_GC
-                .core
-                .stw_lock
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            GLOBAL_GC
-                .core
-                .write_barrier(self.object_id, self.ptr as *const dyn Trace);
-            (*self.ptr).borrow_mut()
+    #[inline]
+    fn cell(&self) -> &GcCellBox<T> {
+        // SAFETY: the object is alive while this handle exists.
+        unsafe { &*self.ptr }
+    }
+
+    /// Shared borrow of the value. Waits while another thread holds a
+    /// [`borrow_mut`](Self::borrow_mut).
+    pub fn borrow(&self) -> GcCellRef<'_, T> {
+        let cell = self.cell();
+        let guard = cell.lock.read().unwrap_or_else(|e| e.into_inner());
+        GcCellRef {
+            // SAFETY: the read lock excludes every writer.
+            value: unsafe { &*cell.value.get() },
+            _guard: guard,
         }
+    }
+
+    /// Shared borrow, or `None` while a [`borrow_mut`](Self::borrow_mut) is held.
+    pub fn try_borrow(&self) -> Option<GcCellRef<'_, T>> {
+        let cell = self.cell();
+        let guard = match cell.lock.try_read() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        Some(GcCellRef {
+            // SAFETY: the read lock excludes every writer.
+            value: unsafe { &*cell.value.get() },
+            _guard: guard,
+        })
+    }
+
+    /// Mutable borrow with write barrier. Waits while any other borrow of the
+    /// cell is held.
+    ///
+    /// Triggers the write barrier so that if this object is in an older
+    /// generation, its card is marked dirty for young-generation collections.
+    pub fn borrow_mut(&self) -> GcCellRefMut<'_, T> {
+        loop {
+            if let Some(borrow) = self.try_borrow_mut() {
+                return borrow;
+            }
+            // Wait for the other borrows to end while holding no GC lock, so
+            // a collection is never held up by a thread waiting here.
+            drop(self.cell().lock.write().unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+
+    /// Mutable borrow with write barrier, or `None` while any other borrow of
+    /// the cell is held. May wait for a running collection to finish.
+    pub fn try_borrow_mut(&self) -> Option<GcCellRefMut<'_, T>> {
+        let cell = self.cell();
+        // Under the STW read lock, so no collection is running while the cell
+        // is locked here: a collection holds the STW write lock throughout,
+        // so the only mutable borrows it can meet are ones taken before it
+        // started - and those it detects (see `GcCellBox`).
+        let _stw = GLOBAL_GC
+            .core
+            .stw_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = match cell.lock.try_write() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        GLOBAL_GC
+            .core
+            .write_barrier(self.object_id, self.ptr as *const dyn Trace);
+        Some(GcCellRefMut {
+            // SAFETY: the write lock excludes every other borrow.
+            value: unsafe { &mut *cell.value.get() },
+            _guard: guard,
+        })
     }
 }
 
@@ -708,20 +881,20 @@ where
     fn trace(&self) {
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).borrow().trace();
+            (*self.ptr).trace();
         }
     }
 
     fn reset(&self) {
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).borrow().reset();
+            (*self.ptr).reset();
         }
     }
 
     fn is_traceable(&self) -> bool {
         // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { (*self.ptr).borrow().is_traceable() }
+        unsafe { (*self.ptr).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -751,8 +924,8 @@ where
 
 // SAFETY: GcWeak holds only an Arc<AtomicBool> (thread-safe) and a raw pointer
 // that is only dereferenced through the Mutex-protected global GC during upgrade().
-unsafe impl<T> Send for GcWeak<T> where T: 'static + Sized + Trace + Send {}
-unsafe impl<T> Sync for GcWeak<T> where T: 'static + Sized + Trace + Sync {}
+unsafe impl<T> Send for GcWeak<T> where T: 'static + Sized + Trace + Send + Sync {}
+unsafe impl<T> Sync for GcWeak<T> where T: 'static + Sized + Trace + Send + Sync {}
 
 impl<T> Clone for GcWeak<T>
 where
@@ -976,17 +1149,16 @@ impl GlobalGarbageCollector {
             // One allocation for the object, its first handle's tracer and
             // its ObjectEntry (see alloc_object_block).
             let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout) =
-                alloc_object_block::<RefCell<GcPtr<T>>, GcCellInternal<T>>().unwrap_or_else(|| {
+                alloc_object_block::<GcCellBox<T>, GcCellInternal<T>>().unwrap_or_else(|| {
                     std::alloc::handle_alloc_error(
-                        object_block_layout::<RefCell<GcPtr<T>>, GcCellInternal<T>>().0,
+                        object_block_layout::<GcCellBox<T>, GcCellInternal<T>>().0,
                     )
                 });
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
-            std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
+            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcCellBox<T>.
+            std::ptr::write(gc_ptr, GcCellBox::new(t));
 
-            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
-                as *const AtomicUsize as *const Cell<usize>
-                as usize
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
+                as *const Cell<usize> as usize
                 - gc_ptr as usize) as u16;
             std::ptr::write(
                 oe_ptr,
@@ -1144,14 +1316,13 @@ impl GlobalGarbageCollector {
             // collection takes the write lock - the old retry could only
             // deadlock this thread.
             let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout) =
-                alloc_object_block::<RefCell<GcPtr<T>>, GcCellInternal<T>>()
+                alloc_object_block::<GcCellBox<T>, GcCellInternal<T>>()
                     .ok_or(crate::gc::GcAllocError)?;
-            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
-            std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
+            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcCellBox<T>.
+            std::ptr::write(gc_ptr, GcCellBox::new(t));
 
-            let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
-                as *const AtomicUsize as *const Cell<usize>
-                as usize
+            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
+                as *const Cell<usize> as usize
                 - gc_ptr as usize) as u16;
             std::ptr::write(
                 oe_ptr,
@@ -1520,12 +1691,12 @@ impl GlobalGarbageCollector {
 
 impl SyncRegionId {
     /// Allocate a new `sync::Gc<T>` in this region (global collector).
-    pub fn gc<T: 'static + Sized + Trace>(self, t: T) -> Gc<T> {
+    pub fn gc<T: 'static + Sized + Trace + Send + Sync>(self, t: T) -> Gc<T> {
         Gc::new_in(t, self)
     }
 
     /// Fallible `sync::Gc<T>` allocation in this region (global collector).
-    pub fn try_gc<T: 'static + Sized + Trace>(
+    pub fn try_gc<T: 'static + Sized + Trace + Send + Sync>(
         self,
         t: T,
     ) -> Result<Gc<T>, crate::gc::GcAllocError> {
@@ -1533,12 +1704,12 @@ impl SyncRegionId {
     }
 
     /// Allocate a new `sync::GcCell<T>` in this region (global collector).
-    pub fn gc_cell<T: 'static + Sized + Trace>(self, t: T) -> GcCell<T> {
+    pub fn gc_cell<T: 'static + Sized + Trace + Send + Sync>(self, t: T) -> GcCell<T> {
         GcCell::new_in(t, self)
     }
 
     /// Fallible `sync::GcCell<T>` allocation in this region (global collector).
-    pub fn try_gc_cell<T: 'static + Sized + Trace>(
+    pub fn try_gc_cell<T: 'static + Sized + Trace + Send + Sync>(
         self,
         t: T,
     ) -> Result<GcCell<T>, crate::gc::GcAllocError> {
@@ -2067,40 +2238,26 @@ mod tests {
     // --- Cycle tests ---
 
     struct SyncCyclicNode {
-        next: std::cell::RefCell<Option<Gc<SyncCyclicNode>>>,
+        next: GcCell<Option<Gc<SyncCyclicNode>>>,
     }
-    // SAFETY: Tests run under TEST_MUTEX and call collect() manually after all
-    // mutations complete, so no true concurrent access occurs. The background
-    // basic-strategy thread can race with RefCell's non-atomic borrow counter;
-    // tests that use SyncCyclicNode are excluded from Miri via cfg_attr below.
-    unsafe impl Send for SyncCyclicNode {}
-    unsafe impl Sync for SyncCyclicNode {}
     impl crate::gc::Trace for SyncCyclicNode {
         fn is_root(&self) -> bool {
             false
         }
         fn reset_root(&self) {
-            if let Some(ref gc) = *self.next.borrow() {
-                gc.reset_root();
-            }
+            self.next.reset_root();
         }
         fn trace(&self) {
-            if let Some(ref gc) = *self.next.borrow() {
-                gc.trace();
-            }
+            self.next.trace();
         }
         fn reset(&self) {
-            if let Some(ref gc) = *self.next.borrow() {
-                gc.reset();
-            }
+            self.next.reset();
         }
         fn is_traceable(&self) -> bool {
             false
         }
         fn trace_children(&self, children: &mut Vec<*const dyn crate::gc::Trace>) {
-            if let Some(ref gc) = *self.next.borrow() {
-                gc.trace_children(children);
-            }
+            self.next.trace_children(children);
         }
     }
     impl crate::gc::Finalize for SyncCyclicNode {
@@ -2108,12 +2265,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // RefCell in SyncCyclicNode races with background GC thread
     fn sync_self_cycle_collected() {
         let (_guard, _) = setup();
         {
             let a = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             *a.next.borrow_mut() = Some(a.clone());
             drop(a);
@@ -2123,18 +2279,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // RefCell in SyncCyclicNode races with background GC thread
     fn sync_three_node_cycle_collected() {
         let (_guard, _) = setup();
         {
             let a = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             let b = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             let c = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             *a.next.borrow_mut() = Some(b.clone());
             *b.next.borrow_mut() = Some(c.clone());
@@ -2147,16 +2302,39 @@ mod tests {
         unsafe { (*GLOBAL_GC).collect() };
     }
 
+    /// Stops the basic strategy's background thread from collecting until
+    /// dropped, for tests that assert what one explicit collection frees (the
+    /// background collector could free the garbage first). Taking the write
+    /// lock also waits out a background collection already running.
+    struct PauseBackgroundCollector(Option<&'static super::GlobalGarbageCollector>);
+
+    impl PauseBackgroundCollector {
+        fn new() -> Self {
+            let mut gc = crate::basic_strategy::BASIC_STRATEGY_GLOBAL_GC
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            PauseBackgroundCollector(gc.take())
+        }
+    }
+
+    impl Drop for PauseBackgroundCollector {
+        fn drop(&mut self) {
+            *crate::basic_strategy::BASIC_STRATEGY_GLOBAL_GC
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = self.0;
+        }
+    }
+
     #[test]
-    #[cfg_attr(miri, ignore)] // RefCell in SyncCyclicNode races with background GC thread
     fn sync_cycle_collection_reports_tracers_collected() {
         let (_guard, _) = setup();
+        let _paused = PauseBackgroundCollector::new();
         {
             let a = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             let b = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             *a.next.borrow_mut() = Some(b.clone());
             *b.next.borrow_mut() = Some(a.clone());
@@ -2300,17 +2478,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // RefCell in SyncCyclicNode races with background GC thread
     fn sync_collect_region() {
         let (_guard, _) = setup();
+        let _paused = PauseBackgroundCollector::new();
         // Create cycle in a new region
         let region = (*GLOBAL_GC).new_region();
         {
             let a = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             let b = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             *a.next.borrow_mut() = Some(b.clone());
             *b.next.borrow_mut() = Some(a.clone());
@@ -2493,7 +2671,7 @@ mod tests {
         let g = Gc::try_new(11u64).expect("allocation succeeds");
         let c = GcCell::try_new(12u64).expect("allocation succeeds");
         assert_eq!(**g, 11);
-        assert_eq!(**c.borrow(), 12);
+        assert_eq!(*c.borrow(), 12);
         assert_eq!(live_objects(), before + 2);
         drop(g);
         drop(c);
@@ -2524,8 +2702,7 @@ mod tests {
 
     #[test]
     fn pool_and_system_blocks_free_from_any_thread() {
-        use super::{GcCellInternal, GcInternal, GcPtr, object_block_layout};
-        use std::cell::RefCell;
+        use super::{GcCellBox, GcCellInternal, GcInternal, GcPtr, object_block_layout};
         let (_guard, _baseline) = setup();
         let before = live_objects();
         // Small objects come from the allocating thread's pool, large and
@@ -2534,7 +2711,7 @@ mod tests {
             object_block_layout::<GcPtr<u64>, GcInternal<u64>>().0
         ));
         assert!(crate::pool::serves(
-            object_block_layout::<RefCell<GcPtr<u64>>, GcCellInternal<u64>>().0
+            object_block_layout::<GcCellBox<u64>, GcCellInternal<u64>>().0
         ));
         assert!(!crate::pool::serves(
             object_block_layout::<GcPtr<Big>, GcInternal<Big>>().0
@@ -2574,10 +2751,9 @@ mod tests {
         for (i, g) in small.iter().enumerate() {
             assert_eq!(***g, i as u64);
         }
-        // (Cells are not read: a `GcCell::borrow` is unsynchronized with the
-        // background collector's `reset_root`, which Miri flags as a race -
-        // independent of the pool.)
-        assert_eq!(cells.len(), n);
+        for (i, c) in cells.iter().enumerate() {
+            assert_eq!(*c.borrow(), i as u64);
+        }
         for (i, g) in big.iter().enumerate() {
             assert!(g.0.iter().all(|&v| v == i as u64));
         }
@@ -2596,5 +2772,153 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(live_objects(), before);
+    }
+
+    // --- GcCell: reader-writer semantics, no races with the collector ---
+
+    #[test]
+    fn gccell_borrows_while_background_collector_runs() {
+        // Repro for the old RefCell flag race: the basic strategy's collector
+        // thread reads the cell while this thread borrows it.
+        let (_guard, _baseline) = setup();
+        let cells: Vec<GcCell<u64>> = (0..6).map(GcCell::new).collect();
+        for _ in 0..if cfg!(miri) { 400 } else { 2000 } {
+            for (i, c) in cells.iter().enumerate() {
+                assert_eq!(*c.borrow(), i as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn gccell_try_borrow_and_debug_follow_rwlock_rules() {
+        let (_guard, _baseline) = setup();
+        let c = GcCell::new(5u64);
+        let r = c.borrow();
+        assert!(c.try_borrow().is_some(), "shared borrows coexist");
+        assert!(c.try_borrow_mut().is_none(), "no writer while read");
+        assert_eq!(format!("{:?}", c), "GcCell(5)");
+        drop(r);
+        let mut w = c.borrow_mut();
+        *w += 1;
+        assert!(c.try_borrow().is_none(), "no reader while written");
+        assert!(c.try_borrow_mut().is_none());
+        assert_eq!(format!("{:?}", c), "GcCell(<borrowed>)");
+        drop(w);
+        assert_eq!(*c.borrow(), 6);
+    }
+
+    #[test]
+    fn gccell_borrow_mut_from_many_threads_is_exclusive() {
+        let (_guard, _baseline) = setup();
+        let threads = 4;
+        let per = if cfg!(miri) { 20 } else { 2_000 };
+        let counter = GcCell::new(0u64);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let counter = counter.clone();
+                s.spawn(move || {
+                    for _ in 0..per {
+                        let mut v = counter.borrow_mut();
+                        // A non-atomic read-modify-write: lost updates would
+                        // show up in the total.
+                        let old = *v;
+                        std::hint::black_box(&old);
+                        *v = old + 1;
+                    }
+                });
+            }
+        });
+        assert_eq!(*counter.borrow(), (threads * per) as u64);
+    }
+
+    #[test]
+    fn gccell_borrow_mut_waits_for_a_reader_on_another_thread() {
+        let (_guard, _baseline) = setup();
+        let c = GcCell::new(1u64);
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let reader = c.clone();
+            let flag = released.clone();
+            s.spawn(move || {
+                let r = reader.borrow();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(r);
+            });
+            held_rx.recv().unwrap();
+            let mut w = c.borrow_mut();
+            assert!(
+                released.load(std::sync::atomic::Ordering::SeqCst),
+                "borrow_mut returned while another thread still read the cell"
+            );
+            *w = 2;
+        });
+        assert_eq!(*c.borrow(), 2);
+    }
+
+    #[test]
+    fn collection_during_borrow_mut_frees_nothing() {
+        let (_guard, _baseline) = setup();
+        // A child reachable only through the cell, with its handle already
+        // reset to non-root by a collection.
+        let cell = GcCell::new(None::<Gc<u64>>);
+        *cell.borrow_mut() = Some(Gc::new(7));
+        unsafe { (*GLOBAL_GC).collect() };
+
+        let held = cell.borrow_mut();
+        // Garbage made while the borrow is held: a dead 2-cycle. (Allocating
+        // under a borrow_mut must not deadlock.)
+        let weak = {
+            let a = Gc::new(SyncCyclicNode {
+                next: GcCell::new(None),
+            });
+            let b = Gc::new(SyncCyclicNode {
+                next: GcCell::new(None),
+            });
+            *a.next.borrow_mut() = Some(b.clone());
+            *b.next.borrow_mut() = Some(a.clone());
+            Gc::downgrade(&a)
+        };
+        // The collector cannot read the borrowed cell, so it must not free
+        // anything - in particular not the child, which `held` reaches.
+        let stats = unsafe {
+            (*GLOBAL_GC)
+                .core
+                .collect_generation(crate::generation::Generation::Gen2)
+        };
+        assert_eq!(stats.objects_collected, 0);
+        assert!(weak.is_alive(), "garbage kept while the mark is incomplete");
+        assert_eq!(***held.as_ref().unwrap(), 7);
+        drop(held);
+
+        // Once the borrow ends, a collection frees the garbage again.
+        unsafe { (*GLOBAL_GC).collect() };
+        assert!(!weak.is_alive());
+        assert_eq!(***cell.borrow().as_ref().unwrap(), 7);
+    }
+
+    #[test]
+    fn incremental_cycle_keeps_a_blocked_scan_across_a_full_collection() {
+        use crate::generation::Generation;
+        let (_guard, _baseline) = setup();
+        let cell = GcCell::new(None::<Gc<u64>>);
+        *cell.borrow_mut() = Some(Gc::new(7));
+        unsafe { (*GLOBAL_GC).collect() };
+
+        let held = cell.borrow_mut();
+        unsafe {
+            GLOBAL_GC.core.begin_collection(Generation::Gen2);
+            // Marks the (rooted) cell but cannot scan its value.
+            while !GLOBAL_GC.core.mark_step(usize::MAX) {}
+        }
+        drop(held);
+        // A full collection between the steps scans the cell fine and must not
+        // hide the incremental cycle's blocked scan from its finish.
+        unsafe { (*GLOBAL_GC).collect() };
+        let stats = unsafe { GLOBAL_GC.core.finish_collection() };
+        assert_eq!(stats.objects_collected, 0);
+        assert_eq!(***cell.borrow().as_ref().unwrap(), 7);
     }
 }

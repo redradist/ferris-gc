@@ -1597,6 +1597,8 @@ pub(crate) struct IncrementalState {
     /// Populated during begin_concurrent_collection so that mark steps
     /// can traverse the graph without following live pointers.
     pub(crate) edges: FxHashMap<ObjectId, Vec<ObjectId>>,
+    /// `blocked_scans` when this cycle's marking began.
+    pub(crate) scan_epoch: usize,
 }
 
 impl IncrementalState {
@@ -1607,6 +1609,7 @@ impl IncrementalState {
             colors: FxHashMap::default(),
             gray_stack: Vec::new(),
             edges: FxHashMap::default(),
+            scan_epoch: 0,
         }
     }
 }
@@ -1615,7 +1618,13 @@ impl IncrementalState {
 /// thread-safe access is needed (GlobalGarbageCollector, background strategies).
 /// For thread-local access, the lock field is None and access is zero-cost.
 pub(crate) struct GcMapsGuard<'a, O: ObjectMap = LocalObjects> {
-    maps: &'a mut GcMaps<O>,
+    /// A raw pointer, not `&'a mut GcMaps`: a reference field would stay
+    /// protected (in Stacked Borrows terms) for the whole of the guard's drop,
+    /// while the drop releases the shard locks - so another thread could
+    /// lock a shard and access it under a still-live `&mut` of the whole map.
+    /// References are created per use in `Deref`/`DerefMut` instead.
+    maps: std::ptr::NonNull<GcMaps<O>>,
+    _marker: std::marker::PhantomData<&'a mut GcMaps<O>>,
     _global: std::sync::MutexGuard<'a, ()>,
     /// Shard guards; empty (no allocation) for an unsharded map.
     _shards: Vec<std::sync::MutexGuard<'a, ()>>,
@@ -1624,13 +1633,15 @@ pub(crate) struct GcMapsGuard<'a, O: ObjectMap = LocalObjects> {
 impl<'a, O: ObjectMap> Deref for GcMapsGuard<'a, O> {
     type Target = GcMaps<O>;
     fn deref(&self) -> &GcMaps<O> {
-        self.maps
+        // SAFETY: the guard's locks give exclusive access to the maps.
+        unsafe { self.maps.as_ref() }
     }
 }
 
 impl<'a, O: ObjectMap> DerefMut for GcMapsGuard<'a, O> {
     fn deref_mut(&mut self) -> &mut GcMaps<O> {
-        self.maps
+        // SAFETY: the guard's locks give exclusive access to the maps.
+        unsafe { self.maps.as_mut() }
     }
 }
 
@@ -1653,6 +1664,13 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     /// insert, re-synced on the slow drop path); a stale non-zero costs a slower
     /// path, never correctness.
     pub(crate) weak_alive_len: AtomicUsize,
+    /// Number of times marking could not scan a value because a
+    /// `sync::GcCell` was mutably borrowed. A collection reads it when its
+    /// marking starts; if it moved by the sweep, the marks are incomplete and
+    /// the sweep frees nothing (see [`Self::keep_all_if_blocked_since`]). A
+    /// counter rather than a flag, so an incremental cycle cannot lose a
+    /// blocked scan to a full collection that runs between its steps.
+    pub(crate) blocked_scans: AtomicUsize,
     /// Allocation counter for adaptive collection triggering.
     pub(crate) allocation_count: O::Counter,
     pub(crate) card_table: CardTable,
@@ -1731,6 +1749,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             weak_alive_len: AtomicUsize::new(0),
+            blocked_scans: AtomicUsize::new(0),
             allocation_count: <O::Counter as Counter>::with_shards(shards),
             card_table: CardTable::new(),
             stw_lock: crate::sharded_map::StwLock::with_shards(shards),
@@ -1784,9 +1803,11 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
         // SAFETY: the global lock (plus every shard lock when sharded) gives
         // exclusive access to all of gc_maps across threads.
-        let maps = unsafe { &mut *self.gc_maps.get() };
+        // SAFETY: UnsafeCell::get never returns null.
+        let maps = unsafe { std::ptr::NonNull::new_unchecked(self.gc_maps.get()) };
         GcMapsGuard {
             maps,
+            _marker: std::marker::PhantomData,
             _global: global,
             _shards: shards,
         }
@@ -2307,6 +2328,27 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
+    /// Value of [`Self::blocked_scans`] when a collection's marking starts.
+    #[inline]
+    fn scan_epoch(&self) -> usize {
+        self.blocked_scans.load(Ordering::Acquire)
+    }
+
+    /// If marking since `epoch` could not scan a mutably borrowed
+    /// `sync::GcCell`, the marks are incomplete: mark every object live so
+    /// this collection's sweep frees nothing; a later collection retries. The
+    /// thread-local collector never blocks a scan.
+    #[inline]
+    fn keep_all_if_blocked_since(&self, gc_maps: &GcMaps<O>, epoch: usize) {
+        if self.blocked_scans.load(Ordering::Acquire) != epoch {
+            for entry in gc_maps.objects.values() {
+                // SAFETY: every registered object is valid while the maps
+                // are locked.
+                unsafe { entry.root_ref_count().set(1) };
+            }
+        }
+    }
+
     /// Root discovery: given gc_maps (as raw pointer), initialize root_count = handle_count
     /// for in-scope objects, then cascade reset_root through the object graph to decrement
     /// root_count for internal references. After this, objects with root_count > 0 are
@@ -2546,6 +2588,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 } else {
                     Some(max_gen)
                 };
+                let scan_epoch = self.scan_epoch();
                 Self::discover_roots(gc_maps_raw, scope, use_gen0_ids);
 
                 // Mark phase: trace from root objects (root_count > 0).
@@ -2581,6 +2624,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         }
                     }
                 }
+
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
 
                 // Combined pass: sweep + count + clear_trace + promotion in a single
                 // iteration over objects. Avoids 3 extra full iterations and uses
@@ -2800,6 +2846,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 } else {
                     Some(max_gen)
                 };
+                let scan_epoch = self.scan_epoch();
                 Self::discover_roots(gc_maps_raw, scope, false);
 
                 // Mark phase: trace from root objects (root_count > 0).
@@ -2818,6 +2865,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         }
                     }
                 }
+
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
 
                 // Count in-scope objects directly (no HashSet allocation)
                 stats.objects_scanned = gc_maps
@@ -2958,6 +3008,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 } else {
                     Some(max_gen)
                 };
+                let scan_epoch = self.scan_epoch();
                 Self::discover_roots(gc_maps_raw, scope, false);
 
                 // Parallel mark phase: collect root objects, then trace in parallel.
@@ -2985,6 +3036,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         }
                     }
                 }
+
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
 
                 // Count in-scope objects directly
                 stats.objects_scanned = gc_maps
@@ -3088,6 +3142,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
         incr.phase = CollectionPhase::Marking;
         incr.max_gen = max_gen;
+        incr.scan_epoch = self.scan_epoch();
         incr.colors.clear();
         incr.gray_stack.clear();
         // Gate for the allocation hot path: objects born from here until
@@ -3240,6 +3295,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         entry.root_ref_count().set(usize::from(live));
                     }
                 }
+
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_blocked_since(&gc_maps, incr.scan_epoch);
 
                 let mut stats = CollectionStats {
                     generation: max_gen,
@@ -3444,6 +3502,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
         incr.phase = CollectionPhase::Marking;
         incr.max_gen = max_gen;
+        incr.scan_epoch = self.scan_epoch();
         incr.colors.clear();
         incr.gray_stack.clear();
         incr.edges.clear();
@@ -3624,6 +3683,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 let mut gc_maps = self.lock_gc_maps();
 
                 let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
+                let scan_epoch = self.scan_epoch();
                 Self::discover_roots(gc_maps_raw, None, false);
 
                 // Mark phase: trace from root objects (root_count > 0).
@@ -3640,6 +3700,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         (&*entry.ptr).trace();
                     }
                 }
+
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
 
                 // Combined pass: sweep + count + clear_trace in a single iteration.
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
@@ -3744,6 +3807,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
                 // ---- Mark phase (same as collect_generation Gen2) ----
                 let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
+                let scan_epoch = self.scan_epoch();
                 Self::discover_roots(gc_maps_raw, None, false);
 
                 // Mark from root objects (root_count > 0).
@@ -3752,6 +3816,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         (&*obj_entry.ptr).trace();
                     }
                 }
+
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
 
                 stats.objects_scanned = gc_maps.objects.len();
 
