@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::basic_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_strategy_start};
 use crate::gc::{
     CompactLayout, Finalize, GarbageCollector, GcObjMem, ObjectEntry, ObjectEntryRef, SyncObjects,
-    Trace, TracerList,
+    Trace,
 };
 use crate::slot_map::ObjectId;
 
@@ -991,7 +991,6 @@ impl GlobalGarbageCollector {
                     mem: GcObjMem::Mem,
                     layout: CompactLayout::from_layout(block_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
                     handle_count: 0,
                     root_count: 0,
                     root_ref_count_offset,

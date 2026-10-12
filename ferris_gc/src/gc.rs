@@ -1169,16 +1169,15 @@ pub(crate) struct ObjectEntry {
     pub(crate) layout: CompactLayout,
     /// Packed generation (bits 31:30) + survive_count (bits 29:16, 14 bits) + region (bits 15:0).
     pub(crate) gen_survive_region: u32,
-    /// Tracer list: still used by sync.rs (global GC). Thread-local GC uses handle_count/root_count.
-    pub(crate) tracers: TracerList,
     /// Total number of live Gc<T>/GcCell<T> handles pointing to this object.
     /// RC hybrid: when handle_count reaches 0, the object is eagerly deallocated.
-    /// Used by thread-local GC; sync GC still uses tracers.
+    /// Thread-local GC only: sync handles count themselves atomically in the
+    /// object header (`SyncGcInfo::handle_count`).
     pub(crate) handle_count: u32,
     /// Number of handles that are currently roots (stack-owned, not yet reset by cascade).
     /// During collection: initialized to handle_count, then decremented by reset_root cascade.
     /// Objects with root_count > 0 after cascade are reachable from the stack.
-    /// Used by thread-local GC; sync GC still uses tracers.
+    /// Both collectors (the sync one copies it from `SyncGcInfo::root_count`).
     pub(crate) root_count: u32,
     /// Offset from the thin pointer to the object's `root_ref_count` Cell inside GcInfo.
     /// Allows inline mark-bit checks (is_traceable / clear_trace) without
@@ -1327,164 +1326,6 @@ impl ObjectEntry {
                 - std::mem::offset_of!(GcInfo, root_ref_count)
                 + std::mem::offset_of!(GcInfo, root_count);
             &*((self.ptr.get_thin_ptr() + offset) as *const Cell<u32>)
-        }
-    }
-}
-
-// --- Tracer types: still used by sync.rs (global GC), not by thread-local GC. ---
-
-#[allow(dead_code)]
-pub(crate) struct TracerInfo {
-    pub(crate) tracer_ptr: *const dyn Trace,
-    pub(crate) mem: GcObjMem,
-    pub(crate) layout: Layout,
-}
-
-/// Inline-optimized tracer list: stores the first tracer pointer inline (16B),
-/// boxing full TracerInfo only for non-inline or clone tracers.
-#[allow(dead_code)]
-pub(crate) enum TracerList {
-    Inline(*const dyn Trace),
-    One(Box<TracerInfo>),
-    #[allow(clippy::box_collection)]
-    Many(Box<Vec<TracerInfo>>),
-    Empty,
-}
-
-#[allow(dead_code)]
-impl TracerList {
-    #[inline]
-    pub(crate) fn new(t: TracerInfo) -> Self {
-        TracerList::One(Box::new(t))
-    }
-
-    #[inline]
-    pub(crate) fn new_inline(ptr: *const dyn Trace) -> Self {
-        TracerList::Inline(ptr)
-    }
-
-    #[inline]
-    pub(crate) fn push(&mut self, t: TracerInfo) {
-        *self = match std::mem::replace(self, TracerList::Empty) {
-            TracerList::Inline(ptr) => {
-                let first = TracerInfo {
-                    tracer_ptr: ptr,
-                    mem: GcObjMem::Inline,
-                    layout: Layout::new::<()>(),
-                };
-                TracerList::Many(Box::new(vec![first, t]))
-            }
-            TracerList::One(first) => TracerList::Many(Box::new(vec![*first, t])),
-            TracerList::Many(mut v) => {
-                v.push(t);
-                TracerList::Many(v)
-            }
-            TracerList::Empty => TracerList::One(Box::new(t)),
-        };
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            TracerList::Inline(_) | TracerList::One(_) => 1,
-            TracerList::Many(v) => v.len(),
-            TracerList::Empty => 0,
-        }
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        matches!(self, TracerList::Empty)
-    }
-
-    #[inline]
-    pub(crate) fn for_each_tracer<F: FnMut(*const dyn Trace)>(&self, mut f: F) {
-        match self {
-            TracerList::Inline(ptr) => f(*ptr),
-            TracerList::One(t) => f(t.tracer_ptr),
-            TracerList::Many(v) => {
-                for t in v.iter() {
-                    f(t.tracer_ptr);
-                }
-            }
-            TracerList::Empty => {}
-        }
-    }
-
-    #[inline]
-    pub(crate) fn remove_by_ptr(&mut self, ptr: *const u8) -> Option<TracerInfo> {
-        match self {
-            TracerList::Inline(t) => {
-                if (*t as *const u8) == ptr {
-                    let t = *t;
-                    *self = TracerList::Empty;
-                    Some(TracerInfo {
-                        tracer_ptr: t,
-                        mem: GcObjMem::Inline,
-                        layout: Layout::new::<()>(),
-                    })
-                } else {
-                    None
-                }
-            }
-            TracerList::One(t) => {
-                if (t.tracer_ptr as *const u8) == ptr {
-                    if let TracerList::One(t) = std::mem::replace(self, TracerList::Empty) {
-                        Some(*t)
-                    } else {
-                        unreachable!()
-                    }
-                } else {
-                    None
-                }
-            }
-            TracerList::Many(v) => {
-                if let Some(pos) = v.iter().position(|t| (t.tracer_ptr as *const u8) == ptr) {
-                    let removed = v.swap_remove(pos);
-                    if v.len() == 1 {
-                        if let TracerList::Many(mut v) = std::mem::replace(self, TracerList::Empty)
-                        {
-                            let last = v.pop().unwrap();
-                            *self = TracerList::One(Box::new(last));
-                        }
-                    }
-                    Some(removed)
-                } else {
-                    None
-                }
-            }
-            TracerList::Empty => None,
-        }
-    }
-
-    pub(crate) fn drain(&mut self) -> TracerDrain {
-        match std::mem::replace(self, TracerList::Empty) {
-            TracerList::Inline(ptr) => TracerDrain::One(Some(TracerInfo {
-                tracer_ptr: ptr,
-                mem: GcObjMem::Inline,
-                layout: Layout::new::<()>(),
-            })),
-            TracerList::One(t) => TracerDrain::One(Some(*t)),
-            TracerList::Many(v) => TracerDrain::Many(v.into_iter()),
-            TracerList::Empty => TracerDrain::One(None),
-        }
-    }
-}
-
-/// Iterator returned by TracerList::drain().
-#[allow(dead_code)]
-pub(crate) enum TracerDrain {
-    One(Option<TracerInfo>),
-    Many(std::vec::IntoIter<TracerInfo>),
-}
-
-impl Iterator for TracerDrain {
-    type Item = TracerInfo;
-    fn next(&mut self) -> Option<TracerInfo> {
-        match self {
-            TracerDrain::One(opt) => opt.take(),
-            TracerDrain::Many(it) => it.next(),
         }
     }
 }
@@ -1913,7 +1754,14 @@ impl<O: ObjectMap> GarbageCollector<O> {
             live_tracers: gc_maps
                 .objects
                 .values()
-                .map(|e| e.handle_count as usize)
+                .map(|e| {
+                    if O::SHARDED {
+                        // SAFETY: registered objects are valid while the maps are locked.
+                        unsafe { e.sync_info().handle_count.load(Ordering::Relaxed) as usize }
+                    } else {
+                        e.handle_count as usize
+                    }
+                })
                 .sum::<usize>(),
             gen0_objects: gen0,
             gen1_objects: gen1,
@@ -2014,23 +1862,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
         let mem = unsafe { std::ptr::read(&(*oe_ptr).mem) };
         let entry_block = unsafe { (*oe_ptr).entry_block };
 
-        // Free tracer allocations still registered on the entry (sync GC:
-        // dead cycle members keep each other's GcInternal tracers, whose
-        // handle Drops were lookup-miss no-ops during the drop phase — nobody
-        // else frees them). drain() also drops the TracerList's own heap
-        // storage (Many variant). Runs in the free phase, strictly after ALL
-        // destructors, so no handle can still read its GcInternal.
-        // Thread-local objects always have an empty list — this is a no-op.
-        for tracer in unsafe { (*oe_ptr).tracers.drain() } {
-            unsafe {
-                Self::dealloc_tracer_mem(
-                    tracer.tracer_ptr.get_thin_ptr() as *mut u8,
-                    tracer.mem,
-                    tracer.layout,
-                )
-            };
-        }
-
         let mem_ptr = fat_ptr.get_thin_ptr() as *mut u8;
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
         unsafe { Self::dealloc_gc_mem(mem_ptr, mem, layout) };
@@ -2121,14 +1952,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
     {
         let layout = Layout::new::<T>();
         // SAFETY: Layout is non-zero-sized and properly aligned for T; alloc returns a valid pointer or null.
-        let mem = unsafe {
-            if O::SHARDED {
-                // Sync handles' tracers come from the per-thread pool.
-                alloc_sync_mem(layout)
-            } else {
-                alloc(layout)
-            }
-        };
+        let mem = unsafe { alloc(layout) };
         if mem.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -2319,13 +2143,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
         Some(entry)
     }
 
-    /// Deallocate tracer memory (GcInternal/GcCellInternal allocation).
-    /// Used by sync.rs (global GC) only.
-    unsafe fn dealloc_tracer_mem(ptr: *mut u8, mem: GcObjMem, layout: Layout) {
-        unsafe { Self::dealloc_gc_mem(ptr, mem, layout) };
-    }
-
-    /// Release object or tracer memory. The sync collector's `GcObjMem::Mem`
+    /// Release object memory. The sync collector's `GcObjMem::Mem`
     /// came from [`alloc_sync_mem`] (possibly its pool); the constant gate
     /// keeps the thread-local paths exactly `dealloc_mem`.
     #[inline(always)]
@@ -2374,7 +2192,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
         if O::SHARDED {
             unsafe { entry.sync_info().handle_count.load(Ordering::Relaxed) as usize }
         } else {
-            entry.tracers.len()
+            // Thread-local handles die with their owner before the object
+            // can be unreachable.
+            0
         }
     }
 
@@ -2390,12 +2210,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 info.root_count.store(hc, Ordering::Relaxed);
                 entry.root_count = hc;
             } else {
-                let hc = if entry.handle_count > 0 {
-                    entry.handle_count
-                } else {
-                    entry.tracers.len() as u32
-                };
-                if entry.handle_count > 0 {
+                let hc = entry.handle_count;
+                if hc > 0 {
                     entry.gc_info_root_count().set(hc);
                 }
                 entry.root_count = hc;
@@ -2415,13 +2231,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
             } else if entry.handle_count > 0 {
                 entry.root_count = entry.gc_info_root_count().get();
             } else {
-                let mut roots = 0u32;
-                entry.tracers.for_each_tracer(|t| {
-                    if (&*t).is_root() {
-                        roots += 1;
-                    }
-                });
-                entry.root_count = roots;
+                entry.root_count = 0;
             }
             entry.root_ref_count().set(0);
         }
@@ -4587,7 +4397,6 @@ impl LocalGarbageCollector {
                     mem: obj_mem,
                     layout: CompactLayout::from_layout(obj_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
@@ -4680,7 +4489,6 @@ impl LocalGarbageCollector {
                     mem: obj_mem,
                     layout: CompactLayout::from_layout(obj_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
@@ -4774,7 +4582,6 @@ impl LocalGarbageCollector {
                     mem: obj_mem,
                     layout: CompactLayout::from_layout(obj_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
@@ -4851,7 +4658,6 @@ impl LocalGarbageCollector {
                     mem: obj_mem,
                     layout: CompactLayout::from_layout(obj_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
