@@ -1651,7 +1651,7 @@ lazy_static! {
 
 #[cfg(test)]
 mod tests {
-    use crate::gc::sync::{GLOBAL_GC, Gc};
+    use crate::gc::sync::{GLOBAL_GC, Gc, GcCell};
     use std::sync::Mutex;
 
     // Serialize sync GC tests since they share GLOBAL_GC.
@@ -2441,5 +2441,52 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             0
         );
+    }
+
+    // --- One block per object: [object | first tracer | ObjectEntry] ---
+
+    #[test]
+    fn first_handle_dropped_before_clone_keeps_object_block_alive() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let first = Gc::new(vec![1u64, 2, 3]);
+        let clone = first.clone();
+        // The first handle's tracer lives inside the object's block; dropping
+        // that handle must not free the block while the clone is alive.
+        drop(first);
+        assert_eq!(live_objects(), before + 1);
+        assert_eq!(***clone, vec![1, 2, 3]);
+        // Last handle gone: the whole block (object, both tracers' records,
+        // entry) is released.
+        drop(clone);
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn many_clones_dropped_in_mixed_order_free_the_block_once() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let a = Gc::new(7u64);
+        let clones: Vec<_> = (0..5).map(|_| a.clone()).collect();
+        drop(a);
+        for (i, c) in clones.into_iter().enumerate().rev() {
+            assert_eq!(**c, 7, "clone {i} must still read the live object");
+            drop(c);
+        }
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn try_new_allocates_one_block() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let g = Gc::try_new(11u64).expect("allocation succeeds");
+        let c = GcCell::try_new(12u64).expect("allocation succeeds");
+        assert_eq!(**g, 11);
+        assert_eq!(**c.borrow(), 12);
+        assert_eq!(live_objects(), before + 2);
+        drop(g);
+        drop(c);
+        assert_eq!(live_objects(), before);
     }
 }
