@@ -132,6 +132,7 @@ pub struct CollectionStats {
     pub duration: core::time::Duration,
 }
 
+#[cfg(feature = "std")]
 impl CollectionStats {
     /// Empty stats for a collection of generations up to `generation`.
     #[allow(deprecated)]

@@ -285,8 +285,6 @@ impl ObjectEntry {
     }
 }
 
-/// Unified GC maps. Single Mutex protects all state to simplify locking.
-
 /// RAII guard for a compacted memory block.
 /// Frees the contiguous buffer when all objects in it have been collected.
 pub(crate) struct CompactBlock {
