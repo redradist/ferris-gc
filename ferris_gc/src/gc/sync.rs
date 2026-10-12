@@ -9,58 +9,66 @@ use std::time::Duration;
 use crate::basic_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_strategy_start};
 use crate::gc::{
     CompactLayout, Finalize, GarbageCollector, GcObjMem, ObjectEntry, ObjectEntryRef, SyncObjects,
-    Trace, TracerInfo, TracerList,
+    Trace, TracerList,
 };
-use crate::slot_map::{ObjectId, SlotKey};
+use crate::slot_map::ObjectId;
 
-/// Byte offsets of the tracer and the `ObjectEntry` inside one sync object's
-/// block `[A (object) | B (first handle's tracer) | ObjectEntry]`.
+/// Layout of one sync object's block `[A (object) | ObjectEntry]`, and the
+/// entry's offset in it.
 #[inline]
-fn object_block_layout<A, B>() -> (std::alloc::Layout, usize, usize) {
-    let (ab, off_b) = std::alloc::Layout::new::<A>()
-        .extend(std::alloc::Layout::new::<B>())
-        .expect("sync object block layout");
-    let (abe, off_e) = ab
+fn object_block_layout<A>() -> (std::alloc::Layout, usize) {
+    let (ae, off_e) = std::alloc::Layout::new::<A>()
         .extend(std::alloc::Layout::new::<ObjectEntry>())
         .expect("sync object block layout");
-    (abe.pad_to_align(), off_b, off_e)
+    (ae.pad_to_align(), off_e)
 }
 
-/// One allocation for a new sync object, its first handle's tracer
-/// (`GcInternal` / `GcCellInternal`) and its `ObjectEntry`.
+/// One allocation for a new sync object and its `ObjectEntry`.
 ///
-/// This used to be four mallocs - object, tracer, a boxed `ObjectEntry`, and a
-/// boxed `TracerInfo` for the tracer list - plus four frees. With the shared
-/// locks gone, the allocator was about half of the sync allocation cost. The
-/// block is freed in one `dealloc` when the object dies: the entry is marked
-/// `ENTRY_EMBEDDED`, and the first tracer is registered `TracerList::Inline`
-/// (its memory is `GcObjMem::Inline`, freed with the object even if that
-/// handle is dropped first).
-///
-/// The block comes from the per-thread pool (`crate::pool`) when it fits a
-/// size class, otherwise from the system allocator (see `alloc_sync_mem`).
+/// Handles count themselves in the object header, so no per-handle tracer is
+/// allocated (this used to be four mallocs per object: object, first
+/// handle's tracer, boxed `ObjectEntry`, boxed tracer-list node). The entry is
+/// marked `ENTRY_EMBEDDED` and freed together with the object. The block
+/// comes from the per-thread pool (`crate::pool`) when it fits a size class,
+/// otherwise from the system allocator (see `alloc_sync_mem`).
 ///
 /// Returns `None` when the allocator fails.
 ///
 /// # Safety
-/// All three returned pointers are uninitialized and must be written before use.
+/// Both returned pointers are uninitialized and must be written before use.
 #[inline]
-unsafe fn alloc_object_block<A, B>()
--> Option<(*mut A, *mut B, *mut ObjectEntry, std::alloc::Layout)> {
-    let (layout, off_b, off_e) = object_block_layout::<A, B>();
+unsafe fn alloc_object_block<A>() -> Option<(*mut A, *mut ObjectEntry, std::alloc::Layout)> {
+    let (layout, off_e) = object_block_layout::<A>();
     // SAFETY: the layout is non-zero-sized (A holds a GcInfo) and well-formed.
     let p = unsafe { crate::gc::alloc_sync_mem(layout) };
     if p.is_null() {
         return None;
     }
-    // SAFETY: both offsets lie inside the block, from Layout::extend.
-    unsafe {
-        Some((
-            p as *mut A,
-            p.add(off_b) as *mut B,
-            p.add(off_e) as *mut ObjectEntry,
-            layout,
-        ))
+    // SAFETY: the offset lies inside the block, from Layout::extend.
+    unsafe { Some((p as *mut A, p.add(off_e) as *mut ObjectEntry, layout)) }
+}
+
+/// A sync collector object: `GcPtr<T>` or `GcCellBox<T>`, both headed by a
+/// `GcInfo`.
+trait SyncObject: Trace + 'static {
+    /// The header of the object at `this`.
+    ///
+    /// # Safety
+    /// `this` must point at an initialized object.
+    unsafe fn info_ptr(this: *mut Self) -> *mut GcInfo;
+}
+
+impl<T: 'static + Sized + Trace> SyncObject for GcPtr<T> {
+    #[inline]
+    unsafe fn info_ptr(this: *mut Self) -> *mut GcInfo {
+        unsafe { &raw mut (*this).info }
+    }
+}
+
+impl<T: 'static + Sized + Trace> SyncObject for GcCellBox<T> {
+    #[inline]
+    unsafe fn info_ptr(this: *mut Self) -> *mut GcInfo {
+        unsafe { &raw mut (*this).info }
     }
 }
 
@@ -82,15 +90,73 @@ impl SyncRegionId {
     }
 }
 
-struct GcInfo {
-    root_ref_count: AtomicUsize,
+/// Every sync object starts with this header (see `crate::gc::SyncGcInfo`).
+use crate::gc::SyncGcInfo as GcInfo;
+
+/// Count one more handle to the object headed by `info`. Relaxed, as in
+/// `Arc::clone`: the new handle comes from one that already keeps the object
+/// alive. Aborts rather than let the count wrap.
+#[inline]
+fn add_handle(info: &GcInfo) {
+    let old = info.handle_count.fetch_add(1, Ordering::Relaxed);
+    if old > i32::MAX as u32 {
+        std::process::abort();
+    }
 }
 
-impl GcInfo {
-    fn new() -> GcInfo {
-        GcInfo {
-            root_ref_count: AtomicUsize::new(0),
+/// Drop one handle to the object at `obj`, headed by `info`. The last handle
+/// frees the object.
+///
+/// # Safety
+/// The handle being dropped must point at `obj`, and `info` must be its
+/// header.
+#[inline]
+unsafe fn drop_handle(obj: *const u8, info: *const GcInfo) {
+    // During a sweep's destructor phase this handle may live inside a dead
+    // object and point at another object of the same dead batch - even at
+    // the object whose destructor is running. The collector owns those
+    // objects and already removed them from the map; touching the header
+    // here could be undefined behaviour, so the drop is a no-op.
+    if GLOBAL_GC.core.is_dying(obj as usize) {
+        return;
+    }
+    unsafe {
+        // Read the id first: once the count is decremented, another thread
+        // or a collection may free the object.
+        let object_id = (*info).object_id;
+        if (*info).handle_count.fetch_sub(1, Ordering::Release) == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            (*GLOBAL_GC).core.release_object(object_id);
         }
+    }
+}
+
+/// Root discovery's cascade for one handle inside a scanned object: this
+/// handle is not a root, so take it off the target's root count, and walk the
+/// target once. Only the global collector's root discovery sets the context;
+/// anything else (allocation, or a thread-local collection reaching a sync
+/// handle stored in a local object) is a no-op.
+///
+/// # Safety
+/// `obj` must be a live sync object headed by `info`.
+#[inline]
+unsafe fn cascade_handle(obj: &dyn Trace, info: &GcInfo) {
+    let visited = crate::gc::SYNC_CASCADE.get();
+    if visited.is_null() {
+        return;
+    }
+    let rc = info.root_count.load(Ordering::Relaxed);
+    info.root_count
+        .store(rc.saturating_sub(1), Ordering::Relaxed);
+    // root_ref_count is the cycle guard: 0 = unvisited, 1 = visited.
+    if info.root_ref_count.load(Ordering::Relaxed) == 0 {
+        info.root_ref_count.store(1, Ordering::Relaxed);
+        // Recorded so root discovery clears the guard even when the target
+        // is out of the collection's scope.
+        unsafe {
+            (*visited).push(&info.root_ref_count as *const AtomicUsize as *const Cell<usize>);
+        }
+        obj.reset_root();
     }
 }
 
@@ -286,110 +352,29 @@ where
     fn finalize(&self) {}
 }
 
-#[allow(dead_code)]
-pub(crate) struct GcInternal<T>
-where
-    T: 'static + Sized + Trace,
-{
-    is_root: AtomicBool,
-    ptr: *const GcPtr<T>,
-    pub(crate) object_id: ObjectId,
-}
-
-impl<T> GcInternal<T>
-where
-    T: 'static + Sized + Trace,
-{
-    fn new(ptr: *const GcPtr<T>, object_id: ObjectId) -> GcInternal<T> {
-        GcInternal {
-            is_root: AtomicBool::new(true),
-            ptr,
-            object_id,
-        }
-    }
-}
-
-impl<T> Trace for GcInternal<T>
-where
-    T: Sized + Trace,
-{
-    fn is_root(&self) -> bool {
-        self.is_root.load(Ordering::Acquire)
-    }
-
-    fn reset_root(&self) {
-        if self.is_root.load(Ordering::Acquire) {
-            self.is_root.store(false, Ordering::Release);
-            unsafe {
-                // SAFETY: Pointer is valid for the lifetime of this GcInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-                (*self.ptr).reset_root();
-            }
-        }
-    }
-
-    fn trace(&self) {
-        unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).trace();
-        }
-    }
-
-    fn reset(&self) {
-        unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).reset();
-        }
-    }
-
-    fn is_traceable(&self) -> bool {
-        // SAFETY: Pointer is valid for the lifetime of this GcInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { (*self.ptr).is_traceable() }
-    }
-
-    fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        children.push(self.ptr as *const dyn Trace);
-    }
-
-    unsafe fn relocate(&self, old_ptr: *const u8, new_ptr: *const u8) {
-        if self.ptr as *const u8 == old_ptr {
-            // SAFETY: Called during STW compaction. The stw_lock write guard
-            // guarantees no concurrent access to this field.
-            let self_mut = self as *const Self as *mut Self;
-            unsafe { (*self_mut).ptr = new_ptr as *const GcPtr<T> };
-        }
-    }
-}
-
-impl<T> Finalize for GcInternal<T>
-where
-    T: Sized + Trace,
-{
-    fn finalize(&self) {}
-}
-
 /// A garbage-collected smart pointer that can be shared across threads.
 ///
-/// `sync::Gc<T>` is `Send + Sync` when `T` is. All allocations and
-/// collections go through the global `GlobalGarbageCollector`, which uses
-/// an `RwLock`-based stop-the-world protocol: mutators hold a read lock,
-/// the collector acquires a write lock for mark-and-sweep.
+/// One pointer wide. Like `Arc`, a clone adds to an atomic handle count in the
+/// object's header and a drop subtracts from it; the last drop frees the
+/// object at once, and the global collector frees unreachable cycles.
+/// Allocation and collection synchronize through the collector's
+/// stop-the-world lock: mutators hold it for reading, a collection for
+/// writing.
 ///
 /// Dereferences to `T` (via `GcPtr<T>`).
 pub struct Gc<T>
 where
     T: 'static + Sized + Trace,
 {
-    internal_ptr: *mut GcInternal<T>,
     ptr: *const GcPtr<T>,
-    object_id: ObjectId,
 }
 
 /// # Safety
-/// The underlying GcInternal uses atomic ref-counting, and the global GC
-/// protects all structural mutations with Mutex/RwLock. Every handle (and the
-/// collector) reaches the same value, so moving or sharing a handle shares
-/// `&T` across threads and may drop `T` on another thread: like `Arc<T>`,
-/// both need `T: Send + Sync`.
+/// Handles count themselves atomically in the object header, and the global
+/// GC protects all structural mutations with Mutex/RwLock. Every handle (and
+/// the collector) reaches the same value, so moving or sharing a handle
+/// shares `&T` across threads and may drop `T` on another thread: like
+/// `Arc<T>`, both need `T: Send + Sync`.
 unsafe impl<T> Sync for Gc<T> where T: 'static + Sized + Trace + Send + Sync {}
 unsafe impl<T> Send for Gc<T> where T: 'static + Sized + Trace + Send + Sync {}
 
@@ -420,6 +405,13 @@ impl<T> Gc<T>
 where
     T: Sized + Trace,
 {
+    /// The object's id in the global collector.
+    #[inline]
+    pub(crate) fn object_id(&self) -> ObjectId {
+        // SAFETY: the object is alive while this handle exists.
+        unsafe { (*self.ptr).info.object_id }
+    }
+
     /// Allocate a new thread-safe GC-managed object on the global collector.
     /// Starts the background collection strategy if not already active.
     pub fn new(t: T) -> Gc<T>
@@ -475,9 +467,11 @@ impl<T> Clone for Gc<T>
 where
     T: 'static + Sized + Trace,
 {
+    #[inline]
     fn clone(&self) -> Self {
-        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-        unsafe { (*GLOBAL_GC).clone_from_gc(self) }
+        // SAFETY: this handle keeps the object alive.
+        add_handle(unsafe { &(*self.ptr).info });
+        Gc { ptr: self.ptr }
     }
 }
 
@@ -485,13 +479,10 @@ impl<T> Drop for Gc<T>
 where
     T: Sized + Trace,
 {
+    #[inline]
     fn drop(&mut self) {
-        let tracer_ptr = self.internal_ptr as *const u8;
-        let object_id = self.object_id;
-        unsafe {
-            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-            (*GLOBAL_GC).remove_tracer(object_id, tracer_ptr);
-        }
+        // SAFETY: `ptr` is this handle's object; its header is `info`.
+        unsafe { drop_handle(self.ptr as *const u8, &raw const (*self.ptr).info) };
     }
 }
 
@@ -499,20 +490,15 @@ impl<T> Trace for Gc<T>
 where
     T: Sized + Trace,
 {
+    /// Roots are counted per object (`SyncGcInfo::root_count`), not flagged
+    /// per handle.
     fn is_root(&self) -> bool {
-        if self.internal_ptr.is_null() {
-            return false;
-        }
-        // SAFETY: Null check above ensures the pointer is valid.
-        unsafe { (*self.internal_ptr).is_root() }
+        false
     }
 
     fn reset_root(&self) {
-        if self.internal_ptr.is_null() {
-            return;
-        }
-        // SAFETY: Null check above ensures the pointer is valid.
-        unsafe { (*self.internal_ptr).reset_root() }
+        // SAFETY: the object is alive while this handle exists.
+        unsafe { cascade_handle(&*self.ptr, &(*self.ptr).info) }
     }
 
     fn trace(&self) {
@@ -551,78 +537,6 @@ where
     fn finalize(&self) {}
 }
 
-#[allow(dead_code)]
-pub(crate) struct GcCellInternal<T>
-where
-    T: 'static + Sized + Trace,
-{
-    is_root: AtomicBool,
-    ptr: *const GcCellBox<T>,
-    pub(crate) object_id: ObjectId,
-}
-
-impl<T> GcCellInternal<T>
-where
-    T: 'static + Sized + Trace,
-{
-    fn new(ptr: *const GcCellBox<T>, object_id: ObjectId) -> GcCellInternal<T> {
-        GcCellInternal {
-            is_root: AtomicBool::new(true),
-            ptr,
-            object_id,
-        }
-    }
-}
-
-impl<T> Trace for GcCellInternal<T>
-where
-    T: Sized + Trace,
-{
-    fn is_root(&self) -> bool {
-        self.is_root.load(Ordering::Acquire)
-    }
-
-    fn reset_root(&self) {
-        if self.is_root.load(Ordering::Acquire) {
-            self.is_root.store(false, Ordering::Release);
-            unsafe {
-                // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-                (*self.ptr).reset_root();
-            }
-        }
-    }
-
-    fn trace(&self) {
-        unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).trace();
-        }
-    }
-
-    fn reset(&self) {
-        unsafe {
-            // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-            (*self.ptr).reset();
-        }
-    }
-
-    fn is_traceable(&self) -> bool {
-        // SAFETY: Pointer is valid for the lifetime of this GcCellInternal handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { (*self.ptr).is_traceable() }
-    }
-
-    fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        children.push(self.ptr as *const dyn Trace);
-    }
-}
-
-impl<T> Finalize for GcCellInternal<T>
-where
-    T: Sized + Trace,
-{
-    fn finalize(&self) {}
-}
-
 /// A garbage-collected mutable cell that can be shared across threads.
 ///
 /// The thread-safe counterpart of the local `GcCell<T>`, with reader-writer
@@ -639,9 +553,7 @@ pub struct GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
-    internal_ptr: *mut GcCellInternal<T>,
     ptr: *const GcCellBox<T>,
-    object_id: ObjectId,
 }
 
 // SAFETY: every handle (and the collector) reaches the same value, so moving
@@ -701,13 +613,10 @@ impl<T> Drop for GcCell<T>
 where
     T: Sized + Trace,
 {
+    #[inline]
     fn drop(&mut self) {
-        let tracer_ptr = self.internal_ptr as *const u8;
-        let object_id = self.object_id;
-        unsafe {
-            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-            (*GLOBAL_GC).remove_tracer(object_id, tracer_ptr);
-        }
+        // SAFETY: `ptr` is this handle's object; its header is `info`.
+        unsafe { drop_handle(self.ptr as *const u8, &raw const (*self.ptr).info) };
     }
 }
 
@@ -772,6 +681,12 @@ where
         basic_strategy_start();
         GLOBAL_GC_STRATEGY.ensure_started();
         unsafe { (*GLOBAL_GC).try_create_gc_cell(t, region.0) }
+    }
+
+    /// The object's id in the global collector.
+    #[inline]
+    pub(crate) fn object_id(&self) -> ObjectId {
+        self.cell().info.object_id
     }
 
     #[inline]
@@ -843,7 +758,7 @@ where
         };
         GLOBAL_GC
             .core
-            .write_barrier(self.object_id, self.ptr as *const dyn Trace);
+            .write_barrier(self.object_id(), self.ptr as *const dyn Trace);
         Some(GcCellRefMut {
             // SAFETY: the write lock excludes every other borrow.
             value: unsafe { &mut *cell.value.get() },
@@ -856,9 +771,10 @@ impl<T> Clone for GcCell<T>
 where
     T: 'static + Sized + Trace,
 {
+    #[inline]
     fn clone(&self) -> Self {
-        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-        unsafe { (*GLOBAL_GC).clone_from_gc_cell(self) }
+        add_handle(&self.cell().info);
+        GcCell { ptr: self.ptr }
     }
 }
 
@@ -866,16 +782,14 @@ impl<T> Trace for GcCell<T>
 where
     T: Sized + Trace,
 {
+    /// Roots are counted per object, not flagged per handle (see `Gc`).
     fn is_root(&self) -> bool {
-        // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
-        unsafe { (*self.internal_ptr).is_root() }
+        false
     }
 
     fn reset_root(&self) {
-        unsafe {
-            // SAFETY: internal_ptr is valid for the lifetime of this GcCell handle.
-            (*self.internal_ptr).reset_root();
-        }
+        // SAFETY: the object is alive while this handle exists.
+        unsafe { cascade_handle(self.cell(), &self.cell().info) }
     }
 
     fn trace(&self) {
@@ -991,11 +905,12 @@ where
 {
     /// Create a weak reference that does not prevent collection.
     pub fn downgrade(this: &Gc<T>) -> GcWeak<T> {
-        let alive = GLOBAL_GC.core.get_or_create_weak_alive(this.object_id);
+        let object_id = this.object_id();
+        let alive = GLOBAL_GC.core.get_or_create_weak_alive(object_id);
         GcWeak {
             alive,
             ptr: this.ptr,
-            object_id: this.object_id,
+            object_id,
         }
     }
 }
@@ -1042,35 +957,31 @@ impl GlobalGarbageCollector {
         }
     }
 
-    unsafe fn create_gc<T>(&self, t: T, region: crate::generation::RegionId) -> Gc<T>
-    where
-        T: Sized + Trace,
-    {
+    /// Allocate `obj` with its `ObjectEntry` in one block and register it in
+    /// this thread's shard. Its header already counts the one handle the
+    /// caller is about to create. `None` if allocation failed (`obj` is
+    /// dropped).
+    unsafe fn register_object<A: SyncObject>(
+        &self,
+        obj: A,
+        region: crate::generation::RegionId,
+    ) -> Option<*const A> {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            // One allocation for the object, its first handle's tracer and
-            // its ObjectEntry (see alloc_object_block).
-            let (gc_ptr, gc_inter_ptr, oe_ptr, block_layout) =
-                alloc_object_block::<GcPtr<T>, GcInternal<T>>().unwrap_or_else(|| {
-                    std::alloc::handle_alloc_error(
-                        object_block_layout::<GcPtr<T>, GcInternal<T>>().0,
-                    )
-                });
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
-            std::ptr::write(gc_ptr, GcPtr::new(t));
-
-            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
-                as *const Cell<usize> as usize
-                - gc_ptr as usize) as u16;
+            let (obj_ptr, oe_ptr, block_layout) = alloc_object_block::<A>()?;
+            std::ptr::write(obj_ptr, obj);
+            let info = A::info_ptr(obj_ptr);
+            let root_ref_count_offset =
+                ((&raw const (*info).root_ref_count) as usize - obj_ptr as usize) as u16;
             std::ptr::write(
                 oe_ptr,
                 ObjectEntry {
-                    ptr: gc_ptr as *const dyn Trace,
-                    // Frees the whole block, entry and first tracer included.
+                    ptr: obj_ptr as *const dyn Trace,
+                    // Frees the whole block, entry included.
                     mem: GcObjMem::Mem,
                     layout: CompactLayout::from_layout(block_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::new_inline(gc_inter_ptr as *const dyn Trace),
+                    tracers: TracerList::Empty,
                     handle_count: 0,
                     root_count: 0,
                     root_ref_count_offset,
@@ -1083,160 +994,39 @@ impl GlobalGarbageCollector {
             // (during marking/promotion), not on the allocation hot path.
             let obj_id = self.core.with_own_shard(|shard_map, shard| {
                 let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
-                // Initialize tracer memory BEFORE releasing the shard lock, so a
-                // collector cannot read uninitialized memory via tracer_ptr.
-                std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
+                // Before the shard unlocks: from then on the collector sees it.
+                (&raw mut (*info).object_id).write(obj_id);
                 obj_id
             });
             self.core.track_alloc(block_layout.size());
             self.core.note_new_object_during_marking(obj_id);
-
-            let gc = Gc {
-                internal_ptr: gc_inter_ptr,
-                ptr: gc_ptr,
-                object_id: obj_id,
-            };
-            // SAFETY: internal_ptr and ptr were just written above and are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
             self.core.allocation_count.add(1);
-            gc
+            Some(obj_ptr)
         }
     }
 
-    unsafe fn clone_from_gc<T>(&self, gc: &Gc<T>) -> Gc<T>
+    unsafe fn create_gc<T>(&self, t: T, region: crate::generation::RegionId) -> Gc<T>
     where
         T: Sized + Trace,
     {
-        unsafe {
-            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
-            // SAFETY: internal_ptr is valid; the source Gc handle is alive during clone.
-            let object_id = (*gc.internal_ptr).object_id;
-
-            // Shard-scoped: the cloned object's tracer list lives in that
-            // object's own shard, so the full-map lock is not needed.
-            self.core.with_shard_of(object_id, |shard_map| {
-                // RC hybrid: push tracer for the cloned object
-                if let Some(entry) = shard_map.get_mut(object_id.strip_shard()) {
-                    entry.tracers.push(TracerInfo {
-                        tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                        mem: mem_info_internal_ptr.0,
-                        layout: mem_info_internal_ptr.1,
-                    });
-                }
-                // Initialize tracer memory BEFORE releasing the shard lock, so a
-                // collector cannot read uninitialized memory via tracer_ptr.
-                std::ptr::write(gc_inter_ptr, GcInternal::new(gc.ptr, object_id));
-            });
-
-            let gc = Gc {
-                internal_ptr: gc_inter_ptr,
-                ptr: gc.ptr,
-                object_id,
-            };
-            // SAFETY: internal_ptr and ptr were just written above and are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
-            gc
-        }
+        let ptr = unsafe { self.register_object(GcPtr::new(t), region) }
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(object_block_layout::<GcPtr<T>>().0));
+        Gc { ptr }
     }
 
     unsafe fn create_gc_cell<T>(&self, t: T, region: crate::generation::RegionId) -> GcCell<T>
     where
         T: Sized + Trace,
     {
-        unsafe {
-            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            // One allocation for the object, its first handle's tracer and
-            // its ObjectEntry (see alloc_object_block).
-            let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout) =
-                alloc_object_block::<GcCellBox<T>, GcCellInternal<T>>().unwrap_or_else(|| {
-                    std::alloc::handle_alloc_error(
-                        object_block_layout::<GcCellBox<T>, GcCellInternal<T>>().0,
-                    )
-                });
-            // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcCellBox<T>.
-            std::ptr::write(gc_ptr, GcCellBox::new(t));
-
-            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
-                as *const Cell<usize> as usize
-                - gc_ptr as usize) as u16;
-            std::ptr::write(
-                oe_ptr,
-                ObjectEntry {
-                    ptr: gc_ptr as *const dyn Trace,
-                    // Frees the whole block, entry and first tracer included.
-                    mem: GcObjMem::Mem,
-                    layout: CompactLayout::from_layout(block_layout),
-                    gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::new_inline(gc_cell_inter_ptr as *const dyn Trace),
-                    handle_count: 0,
-                    root_count: 0,
-                    root_ref_count_offset,
-                    entry_block: crate::gc::ENTRY_EMBEDDED,
-                },
-            );
-            // Shard-scoped registration: insert into this thread's own shard so
-            // concurrent allocation does not serialize on one global lock.
-            // ptr_to_object, region stats, and card table are populated lazily
-            // (during marking/promotion), not on the allocation hot path.
-            let obj_id = self.core.with_own_shard(|shard_map, shard| {
-                let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
-                // Initialize tracer memory BEFORE releasing the shard lock, so a
-                // collector cannot read uninitialized memory via tracer_ptr.
-                std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
-                obj_id
-            });
-            self.core.track_alloc(block_layout.size());
-            self.core.note_new_object_during_marking(obj_id);
-
-            let gc = GcCell {
-                internal_ptr: gc_cell_inter_ptr,
-                ptr: gc_ptr,
-                object_id: obj_id,
-            };
-            // SAFETY: internal_ptr and ptr were just written above and are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.add(1);
-            gc
-        }
+        let ptr = unsafe { self.register_object(GcCellBox::new(t), region) }.unwrap_or_else(|| {
+            std::alloc::handle_alloc_error(object_block_layout::<GcCellBox<T>>().0)
+        });
+        GcCell { ptr }
     }
 
-    unsafe fn clone_from_gc_cell<T>(&self, gc: &GcCell<T>) -> GcCell<T>
-    where
-        T: Sized + Trace,
-    {
-        unsafe {
-            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_inter_ptr, mem_info) = self.core.alloc_mem::<GcCellInternal<T>>();
-            // SAFETY: internal_ptr is valid; the source GcCell handle is alive during clone.
-            let object_id = (*gc.internal_ptr).object_id;
-
-            // Shard-scoped: the cloned object's tracer list lives in that
-            // object's own shard, so the full-map lock is not needed.
-            self.core.with_shard_of(object_id, |shard_map| {
-                // RC hybrid: push tracer for the cloned object
-                if let Some(entry) = shard_map.get_mut(object_id.strip_shard()) {
-                    entry.tracers.push(TracerInfo {
-                        tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                        mem: mem_info.0,
-                        layout: mem_info.1,
-                    });
-                }
-                // Initialize tracer memory BEFORE releasing the shard lock, so a
-                // collector cannot read uninitialized memory via tracer_ptr.
-                std::ptr::write(gc_inter_ptr, GcCellInternal::new(gc.ptr, object_id));
-            });
-            let gc = GcCell {
-                internal_ptr: gc_inter_ptr,
-                ptr: gc.ptr,
-                object_id,
-            };
-            // SAFETY: internal_ptr and ptr were just written above and are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
-            gc
-        }
-    }
-
+    /// Fallible allocation: `GcAllocError` instead of aborting. No emergency
+    /// collection - the STW read lock is held while allocating, and a
+    /// collection takes the write lock, so a retry could only deadlock.
     unsafe fn try_create_gc<T>(
         &self,
         t: T,
@@ -1245,61 +1035,12 @@ impl GlobalGarbageCollector {
     where
         T: Sized + Trace,
     {
-        unsafe {
-            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            // One allocation for the object, its first handle's tracer and
-            // its ObjectEntry (see alloc_object_block). No emergency
-            // collection on failure: the STW read lock is held here, and a
-            // collection takes the write lock - the old retry could only
-            // deadlock this thread.
-            let (gc_ptr, gc_inter_ptr, oe_ptr, block_layout) =
-                alloc_object_block::<GcPtr<T>, GcInternal<T>>().ok_or(crate::gc::GcAllocError)?;
-            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
-            std::ptr::write(gc_ptr, GcPtr::new(t));
-
-            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
-                as *const Cell<usize> as usize
-                - gc_ptr as usize) as u16;
-            std::ptr::write(
-                oe_ptr,
-                ObjectEntry {
-                    ptr: gc_ptr as *const dyn Trace,
-                    // Frees the whole block, entry and first tracer included.
-                    mem: GcObjMem::Mem,
-                    layout: CompactLayout::from_layout(block_layout),
-                    gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::new_inline(gc_inter_ptr as *const dyn Trace),
-                    handle_count: 0,
-                    root_count: 0,
-                    root_ref_count_offset,
-                    entry_block: crate::gc::ENTRY_EMBEDDED,
-                },
-            );
-            // Shard-scoped registration: insert into this thread's own shard so
-            // concurrent allocation does not serialize on one global lock.
-            // ptr_to_object, region stats, and card table are populated lazily
-            // (during marking/promotion), not on the allocation hot path.
-            let obj_id = self.core.with_own_shard(|shard_map, shard| {
-                let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
-                // Initialize tracer memory BEFORE releasing the shard lock, so a
-                // collector cannot read uninitialized memory via tracer_ptr.
-                std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
-                obj_id
-            });
-            self.core.track_alloc(block_layout.size());
-            self.core.note_new_object_during_marking(obj_id);
-            let gc = Gc {
-                internal_ptr: gc_inter_ptr,
-                ptr: gc_ptr,
-                object_id: obj_id,
-            };
-            // SAFETY: internal_ptr and ptr were just written above and are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.add(1);
-            Ok(gc)
-        }
+        let ptr = unsafe { self.register_object(GcPtr::new(t), region) }
+            .ok_or(crate::gc::GcAllocError)?;
+        Ok(Gc { ptr })
     }
 
+    /// Fallible cell allocation; see [`Self::try_create_gc`].
     unsafe fn try_create_gc_cell<T>(
         &self,
         t: T,
@@ -1308,99 +1049,45 @@ impl GlobalGarbageCollector {
     where
         T: Sized + Trace,
     {
-        unsafe {
-            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            // One allocation for the object, its first handle's tracer and
-            // its ObjectEntry (see alloc_object_block). No emergency
-            // collection on failure: the STW read lock is held here, and a
-            // collection takes the write lock - the old retry could only
-            // deadlock this thread.
-            let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout) =
-                alloc_object_block::<GcCellBox<T>, GcCellInternal<T>>()
-                    .ok_or(crate::gc::GcAllocError)?;
-            // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcCellBox<T>.
-            std::ptr::write(gc_ptr, GcCellBox::new(t));
-
-            let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
-                as *const Cell<usize> as usize
-                - gc_ptr as usize) as u16;
-            std::ptr::write(
-                oe_ptr,
-                ObjectEntry {
-                    ptr: gc_ptr as *const dyn Trace,
-                    // Frees the whole block, entry and first tracer included.
-                    mem: GcObjMem::Mem,
-                    layout: CompactLayout::from_layout(block_layout),
-                    gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::new_inline(gc_cell_inter_ptr as *const dyn Trace),
-                    handle_count: 0,
-                    root_count: 0,
-                    root_ref_count_offset,
-                    entry_block: crate::gc::ENTRY_EMBEDDED,
-                },
-            );
-            // Shard-scoped registration: insert into this thread's own shard so
-            // concurrent allocation does not serialize on one global lock.
-            // ptr_to_object, region stats, and card table are populated lazily
-            // (during marking/promotion), not on the allocation hot path.
-            let obj_id = self.core.with_own_shard(|shard_map, shard| {
-                let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
-                // Initialize tracer memory BEFORE releasing the shard lock, so a
-                // collector cannot read uninitialized memory via tracer_ptr.
-                std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
-                obj_id
-            });
-            self.core.track_alloc(block_layout.size());
-            self.core.note_new_object_during_marking(obj_id);
-            let gc = GcCell {
-                internal_ptr: gc_cell_inter_ptr,
-                ptr: gc_ptr,
-                object_id: obj_id,
-            };
-            // SAFETY: internal_ptr and ptr were just written above and are valid.
-            (*(*gc.internal_ptr).ptr).reset_root();
-            self.core.allocation_count.add(1);
-            Ok(gc)
-        }
+        let ptr = unsafe { self.register_object(GcCellBox::new(t), region) }
+            .ok_or(crate::gc::GcAllocError)?;
+        Ok(GcCell { ptr })
     }
 
-    /// Create a new strong Gc<T> from a weak reference (for upgrade).
-    /// Caller must hold STW read lock.
     unsafe fn upgrade_weak<T>(&self, weak: &GcWeak<T>) -> Option<Gc<T>>
     where
         T: Sized + Trace,
     {
-        unsafe {
-            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-
-            let mut gc_maps = self.core.lock_gc_maps();
-            // Re-check under gc_maps lock: the object may have been freed by a
-            // concurrent drop (RC hybrid) between the alive check and this point.
-            let object_id = weak.object_id;
-            gc_maps.objects.get(object_id)?;
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
-            // RC hybrid: push tracer for upgraded object
-            if let Some(entry) = gc_maps.objects.get_mut(object_id) {
-                entry.tracers.push(TracerInfo {
-                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                });
+        // No collection runs while the STW read lock is held, and the
+        // object's shard lock excludes the paths that free it: both
+        // `release_object` (with weak refs present) and a sweep clear `alive`
+        // before freeing, under that lock. So seeing `alive` under it means
+        // the object is still there.
+        let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
+        self.core.with_shard_of(weak.object_id, |_shard| {
+            if !weak.alive.load(Ordering::Acquire) {
+                return None;
             }
-            // Initialize tracer memory BEFORE releasing the lock, so the background
-            // GC thread cannot read uninitialized memory via tracer_ptr.
-            std::ptr::write(gc_inter_ptr, GcInternal::new(weak.ptr, object_id));
-            drop(gc_maps);
-            let gc = Gc {
-                internal_ptr: gc_inter_ptr,
-                ptr: weak.ptr,
-                object_id,
-            };
-            // SAFETY: internal_ptr was just written above; weak.ptr is valid because
-            // the object exists (we checked under gc_maps lock above).
-            (*(*gc.internal_ptr).ptr).reset_root();
-            Some(gc)
-        }
+            // SAFETY: the object is alive (see above).
+            let info = unsafe { &(*weak.ptr).info };
+            let mut n = info.handle_count.load(Ordering::Relaxed);
+            loop {
+                // Zero: the last handle was dropped and the object is being
+                // freed; it cannot come back.
+                if n == 0 {
+                    return None;
+                }
+                match info.handle_count.compare_exchange_weak(
+                    n,
+                    n + 1,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Some(Gc { ptr: weak.ptr }),
+                    Err(current) => n = current,
+                }
+            }
+        })
     }
 
     /// # Safety
@@ -1444,13 +1131,6 @@ impl GlobalGarbageCollector {
         max_gen: crate::generation::Generation,
     ) -> crate::generation::CollectionStats {
         unsafe { self.core.collect_parallel_mark(max_gen) }
-    }
-
-    pub(crate) unsafe fn remove_tracer(&self, object_id: ObjectId, tracer_ptr: *const u8) {
-        unsafe {
-            // SAFETY: Caller provides valid object_id and tracer_ptr from a live Gc/GcCell handle.
-            self.core.remove_tracer(object_id, tracer_ptr);
-        }
     }
 
     /// # Safety
@@ -1838,7 +1518,18 @@ mod tests {
     // Serialize sync GC tests since they share GLOBAL_GC.
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
-    /// Clean residual state and return baseline trs count.
+    /// Live handles to one object (its header's count).
+    fn handles_of(e: &crate::gc::ObjectEntryRef) -> usize {
+        // SAFETY: entries of the global collector are sync objects, valid
+        // while the maps are locked.
+        unsafe {
+            e.sync_info()
+                .handle_count
+                .load(std::sync::atomic::Ordering::Relaxed) as usize
+        }
+    }
+
+    /// Clean residual state and return the baseline handle count.
     fn setup() -> (std::sync::MutexGuard<'static, ()>, usize) {
         let guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
@@ -1849,7 +1540,7 @@ mod tests {
             .lock_gc_maps()
             .objects
             .values()
-            .map(|e| e.tracers.len())
+            .map(|e| handles_of(e))
             .sum::<usize>();
         (guard, baseline)
     }
@@ -1866,7 +1557,7 @@ mod tests {
                 .lock_gc_maps()
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>()
                 - baseline,
             1
@@ -1887,7 +1578,7 @@ mod tests {
                 .lock_gc_maps()
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>()
                 - baseline,
             0
@@ -1909,7 +1600,7 @@ mod tests {
                 .lock_gc_maps()
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>()
                 - baseline,
             1
@@ -1932,7 +1623,7 @@ mod tests {
                 .lock_gc_maps()
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>()
                 - baseline,
             1
@@ -1957,7 +1648,7 @@ mod tests {
                 .lock_gc_maps()
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>()
                 - baseline,
             0
@@ -2059,7 +1750,7 @@ mod tests {
                 .lock_gc_maps()
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>()
                 - baseline,
             0
@@ -2087,7 +1778,7 @@ mod tests {
                 .lock_gc_maps()
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>()
                 - baseline,
             1
@@ -2136,7 +1827,7 @@ mod tests {
                 .lock_gc_maps()
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>()
                 - baseline,
             0
@@ -2207,11 +1898,11 @@ mod tests {
             .lock_gc_maps()
             .objects
             .values()
-            .map(|e| e.tracers.len())
+            .map(|e| handles_of(e))
             .sum();
         assert!(
             live - baseline >= 2,
-            "expected at least 2 new tracers, got {}",
+            "expected at least 2 new handles, got {}",
             live - baseline
         );
         // Stats should still report some live objects
@@ -2356,7 +2047,7 @@ mod tests {
         // tracer allocations that dead cycle members hold on each other.
         assert!(
             stats.tracers_collected >= 2,
-            "cycle members' remaining tracers must be counted (got {})",
+            "cycle members' remaining handles must be counted (got {})",
             stats.tracers_collected
         );
     }
@@ -2380,7 +2071,7 @@ mod tests {
                 .lock_gc_maps()
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>()
                 - baseline,
             1
@@ -2517,7 +2208,7 @@ mod tests {
             gc_maps
                 .objects
                 .values()
-                .map(|e| e.tracers.len())
+                .map(|e| handles_of(e))
                 .sum::<usize>(),
             baseline,
             "RC should free object immediately"
@@ -2561,16 +2252,18 @@ mod tests {
             .collect();
         // Each allocating thread owns its own shard - that affinity is what
         // removes the contention.
-        let shards: std::collections::HashSet<usize> =
-            per_thread.iter().map(|v| v[0].object_id.shard()).collect();
+        let shards: std::collections::HashSet<usize> = per_thread
+            .iter()
+            .map(|v| v[0].object_id().shard())
+            .collect();
         assert_eq!(
             shards.len(),
             4,
             "each allocating thread must own a distinct shard"
         );
         for v in &per_thread {
-            let s = v[0].object_id.shard();
-            assert!(v.iter().all(|g| g.object_id.shard() == s));
+            let s = v[0].object_id().shard();
+            assert!(v.iter().all(|g| g.object_id().shard() == s));
         }
         // Every object is registered and addressable through its tagged id.
         assert_eq!(live_objects(), before + 256);
@@ -2702,22 +2395,18 @@ mod tests {
 
     #[test]
     fn pool_and_system_blocks_free_from_any_thread() {
-        use super::{GcCellBox, GcCellInternal, GcInternal, GcPtr, object_block_layout};
+        use super::{GcCellBox, GcPtr, object_block_layout};
         let (_guard, _baseline) = setup();
         let before = live_objects();
         // Small objects come from the allocating thread's pool, large and
         // over-aligned ones from the system allocator.
+        assert!(crate::pool::serves(object_block_layout::<GcPtr<u64>>().0));
         assert!(crate::pool::serves(
-            object_block_layout::<GcPtr<u64>, GcInternal<u64>>().0
+            object_block_layout::<GcCellBox<u64>>().0
         ));
-        assert!(crate::pool::serves(
-            object_block_layout::<GcCellBox<u64>, GcCellInternal<u64>>().0
-        ));
+        assert!(!crate::pool::serves(object_block_layout::<GcPtr<Big>>().0));
         assert!(!crate::pool::serves(
-            object_block_layout::<GcPtr<Big>, GcInternal<Big>>().0
-        ));
-        assert!(!crate::pool::serves(
-            object_block_layout::<GcPtr<Aligned>, GcInternal<Aligned>>().0
+            object_block_layout::<GcPtr<Aligned>>().0
         ));
         let n = if cfg!(miri) { 6 } else { 300 };
         // The allocating thread exits before any of its objects die.
