@@ -2241,40 +2241,26 @@ mod tests {
     // --- Cycle tests ---
 
     struct SyncCyclicNode {
-        next: std::cell::RefCell<Option<Gc<SyncCyclicNode>>>,
+        next: GcCell<Option<Gc<SyncCyclicNode>>>,
     }
-    // SAFETY: Tests run under TEST_MUTEX and call collect() manually after all
-    // mutations complete, so no true concurrent access occurs. The background
-    // basic-strategy thread can race with RefCell's non-atomic borrow counter;
-    // tests that use SyncCyclicNode are excluded from Miri via cfg_attr below.
-    unsafe impl Send for SyncCyclicNode {}
-    unsafe impl Sync for SyncCyclicNode {}
     impl crate::gc::Trace for SyncCyclicNode {
         fn is_root(&self) -> bool {
             false
         }
         fn reset_root(&self) {
-            if let Some(ref gc) = *self.next.borrow() {
-                gc.reset_root();
-            }
+            self.next.reset_root();
         }
         fn trace(&self) {
-            if let Some(ref gc) = *self.next.borrow() {
-                gc.trace();
-            }
+            self.next.trace();
         }
         fn reset(&self) {
-            if let Some(ref gc) = *self.next.borrow() {
-                gc.reset();
-            }
+            self.next.reset();
         }
         fn is_traceable(&self) -> bool {
             false
         }
         fn trace_children(&self, children: &mut Vec<*const dyn crate::gc::Trace>) {
-            if let Some(ref gc) = *self.next.borrow() {
-                gc.trace_children(children);
-            }
+            self.next.trace_children(children);
         }
     }
     impl crate::gc::Finalize for SyncCyclicNode {
@@ -2282,12 +2268,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // RefCell in SyncCyclicNode races with background GC thread
     fn sync_self_cycle_collected() {
         let (_guard, _) = setup();
         {
             let a = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             *a.next.borrow_mut() = Some(a.clone());
             drop(a);
@@ -2297,18 +2282,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // RefCell in SyncCyclicNode races with background GC thread
     fn sync_three_node_cycle_collected() {
         let (_guard, _) = setup();
         {
             let a = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             let b = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             let c = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             *a.next.borrow_mut() = Some(b.clone());
             *b.next.borrow_mut() = Some(c.clone());
@@ -2322,15 +2306,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // RefCell in SyncCyclicNode races with background GC thread
     fn sync_cycle_collection_reports_tracers_collected() {
         let (_guard, _) = setup();
         {
             let a = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             let b = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             *a.next.borrow_mut() = Some(b.clone());
             *b.next.borrow_mut() = Some(a.clone());
@@ -2474,17 +2457,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // RefCell in SyncCyclicNode races with background GC thread
     fn sync_collect_region() {
         let (_guard, _) = setup();
         // Create cycle in a new region
         let region = (*GLOBAL_GC).new_region();
         {
             let a = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             let b = Gc::new(SyncCyclicNode {
-                next: std::cell::RefCell::new(None),
+                next: GcCell::new(None),
             });
             *a.next.borrow_mut() = Some(b.clone());
             *b.next.borrow_mut() = Some(a.clone());
@@ -2768,5 +2750,130 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(live_objects(), before);
+    }
+
+    // --- GcCell: reader-writer semantics, no races with the collector ---
+
+    #[test]
+    fn gccell_borrows_while_background_collector_runs() {
+        // Repro for the old RefCell flag race: the basic strategy's collector
+        // thread reads the cell while this thread borrows it.
+        let (_guard, _baseline) = setup();
+        let cells: Vec<GcCell<u64>> = (0..6).map(GcCell::new).collect();
+        for _ in 0..if cfg!(miri) { 400 } else { 2000 } {
+            for (i, c) in cells.iter().enumerate() {
+                assert_eq!(*c.borrow(), i as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn gccell_try_borrow_and_debug_follow_rwlock_rules() {
+        let (_guard, _baseline) = setup();
+        let c = GcCell::new(5u64);
+        let r = c.borrow();
+        assert!(c.try_borrow().is_some(), "shared borrows coexist");
+        assert!(c.try_borrow_mut().is_none(), "no writer while read");
+        assert_eq!(format!("{:?}", c), "GcCell(5)");
+        drop(r);
+        let mut w = c.borrow_mut();
+        *w += 1;
+        assert!(c.try_borrow().is_none(), "no reader while written");
+        assert!(c.try_borrow_mut().is_none());
+        assert_eq!(format!("{:?}", c), "GcCell(<borrowed>)");
+        drop(w);
+        assert_eq!(*c.borrow(), 6);
+    }
+
+    #[test]
+    fn gccell_borrow_mut_from_many_threads_is_exclusive() {
+        let (_guard, _baseline) = setup();
+        let threads = 4;
+        let per = if cfg!(miri) { 20 } else { 2_000 };
+        let counter = GcCell::new(0u64);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let counter = counter.clone();
+                s.spawn(move || {
+                    for _ in 0..per {
+                        let mut v = counter.borrow_mut();
+                        // A non-atomic read-modify-write: lost updates would
+                        // show up in the total.
+                        let old = *v;
+                        std::hint::black_box(&old);
+                        *v = old + 1;
+                    }
+                });
+            }
+        });
+        assert_eq!(*counter.borrow(), (threads * per) as u64);
+    }
+
+    #[test]
+    fn gccell_borrow_mut_waits_for_a_reader_on_another_thread() {
+        let (_guard, _baseline) = setup();
+        let c = GcCell::new(1u64);
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let reader = c.clone();
+            let flag = released.clone();
+            s.spawn(move || {
+                let r = reader.borrow();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(r);
+            });
+            held_rx.recv().unwrap();
+            let mut w = c.borrow_mut();
+            assert!(
+                released.load(std::sync::atomic::Ordering::SeqCst),
+                "borrow_mut returned while another thread still read the cell"
+            );
+            *w = 2;
+        });
+        assert_eq!(*c.borrow(), 2);
+    }
+
+    #[test]
+    fn collection_during_borrow_mut_frees_nothing() {
+        let (_guard, _baseline) = setup();
+        // A child reachable only through the cell, with its handle already
+        // reset to non-root by a collection.
+        let cell = GcCell::new(None::<Gc<u64>>);
+        *cell.borrow_mut() = Some(Gc::new(7));
+        unsafe { (*GLOBAL_GC).collect() };
+
+        let held = cell.borrow_mut();
+        // Garbage made while the borrow is held: a dead 2-cycle. (Allocating
+        // under a borrow_mut must not deadlock.)
+        let weak = {
+            let a = Gc::new(SyncCyclicNode {
+                next: GcCell::new(None),
+            });
+            let b = Gc::new(SyncCyclicNode {
+                next: GcCell::new(None),
+            });
+            *a.next.borrow_mut() = Some(b.clone());
+            *b.next.borrow_mut() = Some(a.clone());
+            Gc::downgrade(&a)
+        };
+        // The collector cannot read the borrowed cell, so it must not free
+        // anything - in particular not the child, which `held` reaches.
+        let stats = unsafe {
+            (*GLOBAL_GC)
+                .core
+                .collect_generation(crate::generation::Generation::Gen2)
+        };
+        assert_eq!(stats.objects_collected, 0);
+        assert!(weak.is_alive(), "garbage kept while the mark is incomplete");
+        assert_eq!(***held.as_ref().unwrap(), 7);
+        drop(held);
+
+        // Once the borrow ends, a collection frees the garbage again.
+        unsafe { (*GLOBAL_GC).collect() };
+        assert!(!weak.is_alive());
+        assert_eq!(***cell.borrow().as_ref().unwrap(), 7);
     }
 }
