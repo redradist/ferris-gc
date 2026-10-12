@@ -144,7 +144,7 @@ pub trait Trace: Finalize {
     /// Used after sweep to reset surviving objects for the next collection cycle.
     fn clear_trace(&self) {}
     /// Update internal pointers after object relocation during compaction.
-    /// Called during STW on each tracer; `old_ptr` is the original object address
+    /// Called during STW on each handle; `old_ptr` is the original object address
     /// and `new_ptr` is the new address after copying.
     ///
     /// # Safety
@@ -1055,7 +1055,7 @@ impl std::error::Error for GcAllocError {}
 ///   non-atomic ref_count, which frees the entire block once all refs are gone.
 pub(crate) enum GcObjMem {
     /// System-allocated memory. The raw pointer is derived from the owning
-    /// ObjectEntry/TracerInfo's fat `*const dyn Trace` thin pointer.
+    /// `ObjectEntry`'s fat `*const dyn Trace` thin pointer.
     Mem,
     /// TLAB sub-allocation. The `*mut TlabBlock` holds a ref_count reference
     /// to the backing block. Call `TlabBlock::release` to decrement.
@@ -1063,7 +1063,7 @@ pub(crate) enum GcObjMem {
     /// Compacted memory sub-allocation. The `Arc<CompactBlock>` keeps the
     /// contiguous buffer alive until all compacted objects are collected.
     Compact(Arc<CompactBlock>),
-    /// Part of a combined allocation (e.g. initial tracer co-allocated with
+    /// Part of a combined allocation (e.g. an `ObjectEntry` co-allocated with
     /// the object). No separate deallocation needed — freed with the object.
     Inline,
 }
@@ -1187,7 +1187,7 @@ pub(crate) struct ObjectEntry {
     /// Released when the ObjectEntry is removed from the SlotMap and deallocated.
     ///
     /// [`ENTRY_EMBEDDED`] marks an entry that lives inside its own object's
-    /// allocation (the sync collector's single `[object | tracer | entry]`
+    /// allocation (the sync collector's single `[object | entry]`
     /// block): it is freed together with the object, never on its own.
     pub(crate) entry_block: *mut crate::tlab::TlabBlock,
 }
@@ -1451,7 +1451,7 @@ pub(crate) struct GcMaps<O: ObjectMap = LocalObjects> {
 impl<O: ObjectMap> GcMaps<O> {
     /// Total number of handles across all objects.
     #[cfg(test)]
-    fn total_tracers(&self) -> usize {
+    fn total_handles(&self) -> usize {
         self.objects.values().map(|e| e.handle_count as usize).sum()
     }
 
@@ -2275,7 +2275,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
         unsafe {
             // Phase 1: Initialize root_count + LocalGcInfo.root_count + clear root_ref_count.
             // For thread-local objects (handle_count > 0): root_count = handle_count.
-            // For sync objects (handle_count == 0): root_count = tracers.len().
+            // For sync objects: root_count = the header's handle count.
             // Also clear root_ref_count (used as cycle guard in cascade AND mark phase).
             match scope {
                 None => {
@@ -2387,9 +2387,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
     }
 
     /// Generational collection: collect objects in generations 0..=max_gen.
-    /// For partial collections (< Gen2), traces from in-scope root tracers + dirty card table entries.
+    /// For partial collections (< Gen2), traces from in-scope roots + dirty card table entries.
     /// For full collections (Gen2), traces from ALL roots and clears the card table.
-    /// Sweep phase only collects objects/tracers in target generations.
+    /// Sweep phase only collects objects in target generations.
     /// Surviving objects in gens < max_gen may be promoted.
     pub unsafe fn collect_generation(&self, max_gen: Generation) -> CollectionStats {
         unsafe {
@@ -2800,7 +2800,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
     /// Collection with parallel mark AND parallel sweep.
     ///
     /// Uses rayon to parallelize the mark phase (root tracing) and the sweep phase
-    /// (deallocation). The mark phase partitions root tracers across worker threads;
+    /// (deallocation). The mark phase partitions roots across worker threads;
     /// each worker traces its assigned roots independently. This works because
     /// `LocalGcInfo::root_ref_count` uses `Cell<usize>` for the thread-local GC.
     /// Parallel mark requires reverting to AtomicUsize or using UnsafeCell.
@@ -3713,7 +3713,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
     /// Performs a full collection first (to free dead objects), then:
     /// 1. Allocates a single contiguous buffer for all live objects.
     /// 2. Copies each live object (GcPtr) into the buffer at aligned offsets.
-    /// 3. Updates tracer pointers via `Trace::relocate()`.
+    /// 3. Updates handle pointers via `Trace::relocate()`.
     /// 4. Updates ObjectEntry metadata.
     /// 5. Frees old individual allocations.
     ///
@@ -4101,48 +4101,6 @@ impl LocalGarbageCollector {
         // SAFETY: offset_b is within the combined allocation.
         let ptr_b = unsafe { ptr.add(offset_b) } as *mut B;
         Some((ptr_a, ptr_b, GcObjMem::Tlab(block), combined))
-    }
-
-    /// Try to allocate [A | B | ObjectEntry] in a single TLAB bump.
-    /// Returns pointers to all three plus the obj_mem, layout, and the entry's block pointer.
-    /// The block gets two add_refs: one for obj dealloc, one for entry dealloc.
-    ///
-    /// # Safety
-    /// All three returned pointers must be initialized via ptr::write before use.
-    #[inline]
-    #[allow(dead_code)]
-    unsafe fn try_alloc_triple_tlab<A: Sized, B: Sized>(
-        &mut self,
-    ) -> Option<(
-        *mut A,
-        *mut B,
-        *mut ObjectEntry,
-        GcObjMem,
-        Layout,
-        *mut crate::tlab::TlabBlock,
-    )> {
-        let layout_a = Layout::new::<A>();
-        let layout_b = Layout::new::<B>();
-        let layout_c = Layout::new::<ObjectEntry>();
-        let (ab, offset_b) = layout_a.extend(layout_b).ok()?;
-        let (abc, offset_c) = ab.extend(layout_c).ok()?;
-        let abc = abc.pad_to_align();
-
-        let tlab_result = if let Some(ref mut tlab) = self.tlab {
-            tlab.alloc_or_grow(abc)
-        } else {
-            let mut tlab = crate::tlab::Tlab::new()?;
-            let r = tlab.alloc(abc);
-            self.tlab = Some(tlab);
-            r
-        };
-        let (ptr, block) = tlab_result?;
-        let ptr_a = ptr as *mut A;
-        let ptr_b = unsafe { ptr.add(offset_b) } as *mut B;
-        let ptr_c = unsafe { ptr.add(offset_c) } as *mut ObjectEntry;
-        // Single TLAB ref covers the entire [A|B|ObjectEntry] allocation.
-        // Object memory uses Inline (no-op dealloc), entry_block release frees the ref.
-        Some((ptr_a, ptr_b, ptr_c, GcObjMem::Inline, abc, block))
     }
 
     /// Allocate an ObjectEntry in the TLAB. Returns a raw pointer to uninitialized
@@ -5125,20 +5083,11 @@ mod tests {
 
     #[test]
     fn object_entry_size() {
-        // Track ObjectEntry size to catch regressions.
-        // After GcInternal removal: handle_count + root_count (8B) added alongside TracerList
-        // (still needed by sync.rs). TracerList will be removed from ObjectEntry once sync.rs
-        // is migrated to the handle_count/root_count pattern.
+        // Track ObjectEntry size to catch regressions: 64 bytes since the
+        // per-handle tracer list was removed (sync handles count themselves
+        // in the object header, thread-local ones in handle_count).
         let size = std::mem::size_of::<super::ObjectEntry>();
-        eprintln!("ObjectEntry size: {}B", size);
-        eprintln!("GcObjMem size: {}B", std::mem::size_of::<super::GcObjMem>());
-        eprintln!(
-            "handle_count + root_count: {}B",
-            2 * std::mem::size_of::<u32>()
-        );
-        // ObjectEntry is now TLAB-allocated (not in SlotMap), so size is less critical.
-        // SlotMap stores ObjectEntryRef (8B pointer) instead.
-        assert!(size <= 96, "ObjectEntry grew unexpectedly to {size}B");
+        assert!(size <= 64, "ObjectEntry grew unexpectedly to {size}B");
     }
 
     #[test]
@@ -5152,12 +5101,12 @@ mod tests {
     #[test]
     fn one_object() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_handles());
         let _one = Gc::new(1);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
+                gc.borrow().core.lock_gc_maps().total_handles() - baseline,
                 1
             );
         });
@@ -5166,14 +5115,14 @@ mod tests {
     #[test]
     fn gc_collect_one_from_one() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_handles());
         {
             let _one = Gc::new(1);
         }
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
+                gc.borrow().core.lock_gc_maps().total_handles() - baseline,
                 0
             );
         });
@@ -5185,12 +5134,12 @@ mod tests {
         // Reassigning drops the old Gc (drop_handle decrements handle_count),
         // so only 1 handle remains for the surviving Gc.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_handles());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| {
             assert_eq!(
-                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
+                gc.borrow().core.lock_gc_maps().total_handles() - baseline,
                 1
             );
         });
@@ -5202,13 +5151,13 @@ mod tests {
     fn gc_collect_after_reassign() {
         // After reassign, one live Gc remains. collect() keeps live objects.
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_handles());
         let mut one = Gc::new(1);
         one = Gc::new(2);
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
+                gc.borrow().core.lock_gc_maps().total_handles() - baseline,
                 1
             );
         });
@@ -5219,7 +5168,7 @@ mod tests {
     #[allow(unused_assignments)]
     fn gc_collect_two_from_two() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_handles());
         {
             let mut one = Gc::new(1);
             one = Gc::new(2);
@@ -5228,7 +5177,7 @@ mod tests {
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
+                gc.borrow().core.lock_gc_maps().total_handles() - baseline,
                 0
             );
         });
@@ -5237,7 +5186,7 @@ mod tests {
     #[test]
     fn ptr_to_object_cleaned_on_collect() {
         clean_gc_state();
-        let baseline_trs = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
+        let baseline_handles = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_handles());
         let baseline_p2o = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().ptr_to_object.len());
         {
             let _one = Gc::new(1);
@@ -5245,7 +5194,7 @@ mod tests {
         LOCAL_GC.with(move |gc| unsafe {
             gc.borrow_mut().collect();
             assert_eq!(
-                gc.borrow().core.lock_gc_maps().total_tracers() - baseline_trs,
+                gc.borrow().core.lock_gc_maps().total_handles() - baseline_handles,
                 0
             );
             assert_eq!(
@@ -5258,7 +5207,7 @@ mod tests {
     #[test]
     fn collect_from_another_thread() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_handles());
         let _one = Gc::new(42);
         LOCAL_GC.with(|gc| {
             let gc_ptr = gc.as_ptr();
@@ -5269,7 +5218,7 @@ mod tests {
                 });
             });
             assert_eq!(
-                gc.borrow().core.lock_gc_maps().total_tracers() - baseline,
+                gc.borrow().core.lock_gc_maps().total_handles() - baseline,
                 1
             );
         });
@@ -5325,16 +5274,16 @@ mod tests {
     #[test]
     fn clone_from_registers_with_gc() {
         clean_gc_state();
-        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_tracers());
+        let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_handles());
         let source = Gc::new(42);
         let mut target = Gc::new(99);
         target.clone_from(&source);
         LOCAL_GC.with(|gc| {
-            let delta = gc.borrow().core.lock_gc_maps().total_tracers() - baseline;
-            // source + target + the new clone's tracer = at least 2 alive
+            let delta = gc.borrow().core.lock_gc_maps().total_handles() - baseline;
+            // source + target + the new clone = at least 2 handles alive
             assert!(
                 delta >= 2,
-                "clone_from should register new tracer with GC, got {delta}"
+                "clone_from should register a new handle with GC, got {delta}"
             );
         });
     }
@@ -5802,7 +5751,7 @@ mod tests {
     #[test]
     fn weak_does_not_prevent_collection() {
         // RC hybrid: object is freed immediately when last strong handle drops.
-        // Weak reference does not count as a tracer, so it doesn't affect RC.
+        // A weak reference is not a handle, so it doesn't affect RC.
         clean_gc_state();
         let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().objects.len());
         let weak = {
@@ -6075,7 +6024,7 @@ mod tests {
         assert_eq!(
             stats.live_handles - baseline,
             1,
-            "stats should report 1 new tracer"
+            "stats should report 1 new handle"
         );
     }
 

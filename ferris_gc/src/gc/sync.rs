@@ -1600,7 +1600,7 @@ mod tests {
         one = Gc::new(2);
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
-        // Reassignment drops old Gc (remove_tracer), so only 1 tracer remains
+        // Reassignment drops the old Gc, so only 1 handle remains
         assert_eq!(
             (*GLOBAL_GC)
                 .core
@@ -1623,7 +1623,7 @@ mod tests {
         one = Gc::new(2);
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe { (*GLOBAL_GC).collect() };
-        // one is still live, so 1 tracer remains
+        // one is still live, so 1 handle remains
         assert_eq!(
             (*GLOBAL_GC)
                 .core
@@ -2050,8 +2050,7 @@ mod tests {
             "dead 2-cycle must be collected (got {})",
             stats.objects_collected
         );
-        // Regression: the sweep stopped counting (and freeing) the GcInternal
-        // tracer allocations that dead cycle members hold on each other.
+        // The handles dead cycle members hold on each other die with them.
         assert!(
             stats.handles_collected >= 2,
             "cycle members' remaining handles must be counted (got {})",
@@ -2209,7 +2208,7 @@ mod tests {
         {
             let _obj = Gc::new(42);
         }
-        // RC should have freed it — check tracers are back to baseline
+        // RC should have freed it — check handles are back to baseline
         let gc_maps = (*GLOBAL_GC).core.lock_gc_maps();
         assert_eq!(
             gc_maps
