@@ -40,7 +40,12 @@ Both share the same API surface but differ in synchronization:
 Internal type hierarchy differs per GC:
 
 - **Thread-local:** `Gc<T>`/`GcCell<T>` is a single tagged pointer (8B `Cell<NonZeroUsize>`: bit 0 = root flag, bits 1.. = `*const GcPtr<T>`) straight to `GcPtr<T>` (`GcInfo` + `object_id` + data). Handle metadata (`handle_count`/`root_count`) lives in `ObjectEntry`. Both types are `!Send`/`!Sync`.
-- **Sync (global):** `sync::Gc<T>` → `GcInternal<T>` (tracer: root flag + object_id) → `GcPtr<T>`. Tracers are registered in `ObjectEntry.tracers` (`TracerList`). `sync::Gc`/`GcCell`/`GcWeak` need `T: Send + Sync` (like `Arc`), because the collector thread reaches every value.
+- **Sync (global):** `sync::Gc<T>` is one pointer to `GcPtr<T>`, whose header (`SyncGcInfo`) holds an atomic `handle_count`, the collector's `root_count`, and the `object_id`. As with `Arc`:
+  - clone is a relaxed `fetch_add`;
+  - drop is a `fetch_sub`, or for the only handle just a load;
+  - the last drop frees the object through `release_object`, which takes the object's shard lock.
+
+  Root discovery starts each root count at the handle count, and the cascade subtracts the handles found inside scanned objects. It does this only while `SYNC_CASCADE` is set, i.e. during the global collector's own discovery. `sync::Gc`/`GcCell`/`GcWeak` need `T: Send + Sync` (like `Arc`), because the collector thread reaches every value.
 - **`sync::GcCell<T>`** → `GcCellBox<T>` (`GcInfo` header + `RwLock<()>` + `UnsafeCell<T>`), with reader-writer semantics. `borrow`/`borrow_mut` block, and the `try_` variants return `None`. The collector never blocks on a cell: it only uses `try_read`. If a scan is blocked by a held `borrow_mut`, `blocked_scans` is bumped, and every sweep path calls `keep_all_if_blocked_since`, so that collection frees nothing.
 
 Raw allocations use TLAB bump allocation (thread-local arena blocks) with system allocator fallback. During a sweep, destructors of all dead objects run before any memory is freed (two-phase dealloc) and a dying-address registry makes interior handle drops no-ops — required for Miri/Stacked Borrows soundness of the tagged-pointer handles.
@@ -48,9 +53,9 @@ Raw allocations use TLAB bump allocation (thread-local arena blocks) with system
 ### Memory Management
 
 - **TLAB (Thread-Local Allocation Buffer):** Bump allocator for fast allocation. `Gc::new()` allocates the `GcPtr<T>` and its `ObjectEntry` in a single TLAB bump.
-- **Sync pool (`pool.rs`):** `sync::Gc::new` allocates `[object | first tracer | ObjectEntry]` as one block, and clones allocate their tracers, from a per-thread size-class pool. It serves blocks of at most 1 KiB with alignment of at most 16; larger or more-aligned layouts use the system allocator. All of these allocations are recorded as `GcObjMem::Mem`, and `free_sync_mem` tells pool blocks from system ones by layout alone. 64 KiB pages are carved from 2 MiB segments. Frees on the owning thread are plain stores; frees from other threads go through a per-page CAS stack. Heaps outlive their threads and are adopted by new ones.
+- **Sync pool (`pool.rs`):** `sync::Gc::new` allocates `[object | ObjectEntry]` as one block from a per-thread size-class pool. That is 96 bytes for a small `T`, with the 64-byte `ObjectEntry`. It serves blocks of at most 1 KiB with alignment of at most 16; larger or more-aligned layouts use the system allocator. All of these allocations are recorded as `GcObjMem::Mem`, and `free_sync_mem` tells pool blocks from system ones by layout alone. 64 KiB pages are carved from 2 MiB segments. Frees on the owning thread are plain stores; frees from other threads go through a per-page CAS stack. Heaps outlive their threads and are adopted by new ones.
 - **SlotMap:** Custom generation-counted slot map (`slot_map.rs`) stores `ObjectEntryRef` pointers. O(1) insert/remove with cache-friendly iteration. Keys are `ObjectId` (u64: upper 32 = generation, lower 32 = index).
-- **RC-hybrid deallocation:** Objects freed immediately when last tracer is removed (no waiting for GC cycle). GC only handles cyclic references.
+- **RC-hybrid deallocation:** Objects freed immediately when their last handle is dropped (no waiting for GC cycle). GC only handles cyclic references.
 - **Generational collection:** Gen0/Gen1/Gen2 with adaptive threshold scaling (GOGC-style: threshold proportional to live set size when <5% garbage collected).
 - **gen0_ids:** Fast Vec of Gen0 ObjectIds for O(Gen0) partial collections, with heuristic fallback to full iteration when stale entries exceed live objects.
 
