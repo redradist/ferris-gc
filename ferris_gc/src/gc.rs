@@ -1744,7 +1744,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 cascade_visited: Vec::new(),
             }),
             gc_maps_lock: Mutex::new(()),
-            shard_locks: (0..shards.clamp(1, crate::sharded_map::MAX_SHARDS))
+            shard_locks: (0..crate::sharded_map::shard_count_for(shards))
                 .map(|_| crate::sharded_map::CachePadded(Mutex::new(())))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),

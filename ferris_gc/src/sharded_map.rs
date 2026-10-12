@@ -22,7 +22,7 @@
 //! `SlotMap` (see `gc::ObjectMap`), so it pays nothing for sharding.
 
 use crate::slot_map::{SlotKey, SlotMap};
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -53,7 +53,7 @@ pub(crate) struct StwWriteGuard<'a> {
 
 impl StwLock {
     pub(crate) fn with_shards(n: usize) -> Self {
-        let n = n.clamp(1, MAX_SHARDS);
+        let n = shard_count_for(n);
         StwLock {
             shards: (0..n)
                 .map(|_| CachePadded(RwLock::new(())))
@@ -159,7 +159,7 @@ pub(crate) struct ShardedCounter {
 impl Counter for ShardedCounter {
     const SINGLE: bool = false;
     fn with_shards(n: usize) -> Self {
-        let n = n.clamp(1, MAX_SHARDS);
+        let n = shard_count_for(n);
         ShardedCounter {
             shards: (0..n)
                 .map(|_| CachePadded(AtomicIsize::new(0)))
@@ -228,16 +228,39 @@ pub(crate) const MAX_SHARDS: usize = 1 << crate::slot_map::SHARD_BITS;
 static NEXT_THREAD_ORDINAL: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
-    static THREAD_ORDINAL: usize = NEXT_THREAD_ORDINAL.fetch_add(1, Ordering::Relaxed);
+    /// This thread's ordinal; `usize::MAX` until first use. A `const`
+    /// initializer with no destructor: every access is one plain TLS load,
+    /// with no lazy-init check and no failure once the thread is exiting.
+    static THREAD_ORDINAL: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
-/// Shard this thread owns in a map of `shard_count` shards.
+#[cold]
+#[inline(never)]
+fn assign_thread_ordinal(slot: &Cell<usize>) -> usize {
+    let ordinal = NEXT_THREAD_ORDINAL.fetch_add(1, Ordering::Relaxed);
+    slot.set(ordinal);
+    ordinal
+}
+
+/// Number of shards to create for a request of `n`: clamped to
+/// `1..=MAX_SHARDS` and rounded up to a power of two, so that
+/// [`current_thread_shard`] can pick a shard with a mask instead of a
+/// division (it runs several times per allocation).
+#[inline]
+pub(crate) fn shard_count_for(n: usize) -> usize {
+    n.clamp(1, MAX_SHARDS).next_power_of_two()
+}
+
+/// Shard this thread owns in a map of `shard_count` shards. `shard_count`
+/// must be a power of two (see [`shard_count_for`]).
 #[inline]
 pub(crate) fn current_thread_shard(shard_count: usize) -> usize {
-    if shard_count <= 1 {
-        return 0;
-    }
-    THREAD_ORDINAL.try_with(|t| *t % shard_count).unwrap_or(0)
+    debug_assert!(shard_count.is_power_of_two());
+    let ordinal = THREAD_ORDINAL.with(|slot| match slot.get() {
+        usize::MAX => assign_thread_ordinal(slot),
+        ordinal => ordinal,
+    });
+    ordinal & (shard_count - 1)
 }
 
 #[cold]
@@ -278,9 +301,9 @@ pub(crate) struct ShardedSlotMap<K: SlotKey, V> {
 }
 
 impl<K: SlotKey, V> ShardedSlotMap<K, V> {
-    /// Create a map with `n` shards (clamped to `1..=MAX_SHARDS`).
+    /// Create a map with `n` shards (see [`shard_count_for`]).
     pub(crate) fn with_shards(n: usize) -> Self {
-        let n = n.clamp(1, MAX_SHARDS);
+        let n = shard_count_for(n);
         let rest = (1..n)
             .map(|_| CachePadded(UnsafeCell::new(SlotMap::new())))
             .collect::<Vec<_>>();
