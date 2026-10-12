@@ -185,9 +185,9 @@ where
 /// The header lives outside the lock and the value, so the collector can
 /// update it while a user holds a borrow, without aliasing the user's `&mut`.
 /// The collector never blocks on the lock: it reads the value under
-/// `try_read`. If a `borrow_mut` holds the lock, the collector marks the scan
-/// incomplete (see `GarbageCollector::trace_incomplete`), and that collection
-/// frees nothing.
+/// `try_read`. If a `borrow_mut` holds the lock, the collector counts the
+/// scan as blocked (see `GarbageCollector::blocked_scans`), and that
+/// collection frees nothing.
 pub(crate) struct GcCellBox<T>
 where
     T: 'static + Sized + Trace,
@@ -226,10 +226,7 @@ where
     #[inline]
     fn scan_value(&self, f: impl FnOnce(&T)) {
         if self.try_with_value(f).is_none() {
-            GLOBAL_GC
-                .core
-                .trace_incomplete
-                .store(true, Ordering::Release);
+            GLOBAL_GC.core.blocked_scans.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -2874,6 +2871,29 @@ mod tests {
         // Once the borrow ends, a collection frees the garbage again.
         unsafe { (*GLOBAL_GC).collect() };
         assert!(!weak.is_alive());
+        assert_eq!(***cell.borrow().as_ref().unwrap(), 7);
+    }
+
+    #[test]
+    fn incremental_cycle_keeps_a_blocked_scan_across_a_full_collection() {
+        use crate::generation::Generation;
+        let (_guard, _baseline) = setup();
+        let cell = GcCell::new(None::<Gc<u64>>);
+        *cell.borrow_mut() = Some(Gc::new(7));
+        unsafe { (*GLOBAL_GC).collect() };
+
+        let held = cell.borrow_mut();
+        unsafe {
+            GLOBAL_GC.core.begin_collection(Generation::Gen2);
+            // Marks the (rooted) cell but cannot scan its value.
+            while !GLOBAL_GC.core.mark_step(usize::MAX) {}
+        }
+        drop(held);
+        // A full collection between the steps scans the cell fine and must not
+        // hide the incremental cycle's blocked scan from its finish.
+        unsafe { (*GLOBAL_GC).collect() };
+        let stats = unsafe { GLOBAL_GC.core.finish_collection() };
+        assert_eq!(stats.objects_collected, 0);
         assert_eq!(***cell.borrow().as_ref().unwrap(), 7);
     }
 }
