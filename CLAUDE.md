@@ -47,6 +47,7 @@ Raw allocations use TLAB bump allocation (thread-local arena blocks) with system
 ### Memory Management
 
 - **TLAB (Thread-Local Allocation Buffer):** Bump allocator for fast allocation. `Gc::new()` allocates the `GcPtr<T>` and its `ObjectEntry` in a single TLAB bump.
+- **Sync pool (`pool.rs`):** `sync::Gc::new` allocates `[object | first tracer | ObjectEntry]` as one block, and clones allocate their tracers, from a per-thread size-class pool. It serves blocks of at most 1 KiB with alignment of at most 16; larger or more-aligned layouts use the system allocator. All of these allocations are recorded as `GcObjMem::Mem`, and `free_sync_mem` tells pool blocks from system ones by layout alone. 64 KiB pages are carved from 2 MiB segments. Frees on the owning thread are plain stores; frees from other threads go through a per-page CAS stack. Heaps outlive their threads and are adopted by new ones.
 - **SlotMap:** Custom generation-counted slot map (`slot_map.rs`) stores `ObjectEntryRef` pointers. O(1) insert/remove with cache-friendly iteration. Keys are `ObjectId` (u64: upper 32 = generation, lower 32 = index).
 - **RC-hybrid deallocation:** Objects freed immediately when last tracer is removed (no waiting for GC cycle). GC only handles cyclic references.
 - **Generational collection:** Gen0/Gen1/Gen2 with adaptive threshold scaling (GOGC-style: threshold proportional to live set size when <5% garbage collected).
