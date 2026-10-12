@@ -1118,6 +1118,11 @@ impl CompactLayout {
     }
 }
 
+/// `ObjectEntry::entry_block` value for an entry embedded in its object's own
+/// allocation, so that freeing the object frees the entry too. A dangling (but
+/// non-null, aligned) pointer that is only ever compared, never dereferenced.
+pub(crate) const ENTRY_EMBEDDED: *mut crate::tlab::TlabBlock = std::ptr::dangling_mut();
+
 /// Per-object metadata stored in a contiguous SlotMap.
 pub(crate) struct ObjectEntry {
     pub(crate) ptr: *const dyn Trace,
@@ -1142,6 +1147,10 @@ pub(crate) struct ObjectEntry {
     pub(crate) root_ref_count_offset: u16,
     /// TLAB block that holds this ObjectEntry allocation (null = system-allocated).
     /// Released when the ObjectEntry is removed from the SlotMap and deallocated.
+    ///
+    /// [`ENTRY_EMBEDDED`] marks an entry that lives inside its own object's
+    /// allocation (the sync collector's single `[object | tracer | entry]`
+    /// block): it is freed together with the object, never on its own.
     pub(crate) entry_block: *mut crate::tlab::TlabBlock,
 }
 
@@ -1921,11 +1930,14 @@ impl<O: ObjectMap> GarbageCollector<O> {
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
         unsafe { mem.dealloc_mem(mem_ptr, layout) };
         // Free the ObjectEntry memory itself.
-        if !entry_block.is_null() {
+        if entry_block == ENTRY_EMBEDDED {
+            // Lives inside the object's own block, which `dealloc_mem` above
+            // just freed; every field was read before that.
+        } else if !entry_block.is_null() {
             // TLAB-allocated: release the block reference.
             unsafe { crate::tlab::TlabBlock::release(entry_block) };
         } else {
-            // System-allocated (sync path or TLAB fallback): free via dealloc.
+            // Separately system-allocated (TLAB fallback): free via dealloc.
             unsafe { dealloc(oe_ptr as *mut u8, Layout::new::<ObjectEntry>()) };
         }
     }
