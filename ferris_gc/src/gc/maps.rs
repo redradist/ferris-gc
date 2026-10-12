@@ -113,9 +113,46 @@ pub(crate) struct GcMaps<O: ObjectMap = LocalObjects> {
     /// object's children and sweep live objects. Buffer is reused across
     /// collections.
     pub(crate) cascade_visited: CascadeVisited,
+    /// Which collections could free anything (thread-local collector): bit
+    /// `g` is set if a collection of generations `0..=g` could.
+    ///
+    /// The last handle's drop frees an object at once, so a collection only
+    /// frees unreachable objects that still have handles (cycles). Such
+    /// garbage can only appear when a handle is dropped and its object keeps
+    /// other handles: a handle moved into another object stays reachable
+    /// through it. Every such drop sets all bits; a collection of
+    /// generations `0..=g` clears bits `0..=g` when it starts, as it frees
+    /// all garbage in that scope (later drops set them again). An incomplete
+    /// scan or an abandoned incremental cycle sets all bits again. The
+    /// allocation triggers skip a collection whose bit is clear. The sync
+    /// collector has no allocation trigger and never sets them.
+    pub(crate) garbage_possible: u8,
 }
 
+/// `GcMaps::garbage_possible` with every generation's bit set.
+pub(crate) const GARBAGE_POSSIBLE_ALL: u8 = 0b111;
+
 impl<O: ObjectMap> GcMaps<O> {
+    /// A handle was dropped while its object kept others, or a collection
+    /// left garbage it may not have seen: any collection could free some.
+    #[inline(always)]
+    pub(crate) fn note_garbage_possible(&mut self) {
+        self.garbage_possible = GARBAGE_POSSIBLE_ALL;
+    }
+
+    /// A collection of generations `0..=max_gen` starts: it frees all the
+    /// garbage that scope holds now.
+    #[inline]
+    pub(crate) fn start_collecting(&mut self, max_gen: Generation) {
+        self.garbage_possible &= !((2u8 << max_gen as u8) - 1);
+    }
+
+    /// Whether a collection of generations `0..=max_gen` could free anything.
+    #[inline]
+    pub(crate) fn garbage_possible(&self, max_gen: Generation) -> bool {
+        self.garbage_possible & (1 << max_gen as u8) != 0
+    }
+
     /// Total number of handles across all objects.
     #[cfg(test)]
     pub(crate) fn total_handles(&self) -> usize {

@@ -1044,8 +1044,9 @@ impl LocalGarbageCollector {
         unsafe { self.core.try_alloc_mem_with_gc::<T>() }
     }
 
-    /// Check allocation count and trigger Gen0 collection if threshold exceeded.
-    /// The threshold adapts based on collection efficiency: if a collection frees
+    /// Check allocation count and trigger Gen0 collection if threshold exceeded
+    /// and a collection could free anything (see
+    /// `skip_collection_without_garbage`). The threshold adapts based on collection efficiency: if a collection frees
     /// little garbage, the threshold doubles (up to 100K) to avoid wasteful scans
     /// of a mostly-live heap. If a collection frees a lot, the threshold shrinks
     /// (down to 1K) to reclaim memory promptly.
@@ -1081,7 +1082,9 @@ impl LocalGarbageCollector {
             CollectionPhase::Idle => {
                 let count = self.core.allocation_count.load(Ordering::Relaxed);
                 let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
-                if count >= threshold {
+                if count >= threshold
+                    && unsafe { !self.skip_collection_without_garbage(Generation::Gen2) }
+                {
                     unsafe { self.core.begin_collection(Generation::Gen2) };
                 }
             }
@@ -1100,8 +1103,36 @@ impl LocalGarbageCollector {
     #[cold]
     #[inline(never)]
     unsafe fn collect_gen0_and_adapt(&self) {
+        if unsafe { self.skip_collection_without_garbage(Generation::Gen0) } {
+            return;
+        }
         let stats = unsafe { self.core.collect_generation(Generation::Gen0) };
         self.adapt_alloc_threshold(&stats);
+    }
+
+    /// The allocation trigger fired for a collection of generations
+    /// `0..=max_gen`. If no handle has been dropped while its object kept
+    /// others since the last collection of that scope, the scope holds no
+    /// garbage (see `GcMaps::garbage_possible`) and the collection would
+    /// free nothing: skip it, and treat it like a collection that freed
+    /// nothing (restart the trigger's count and grow its threshold). Also
+    /// trim `gen0_ids` of objects already freed by their last handle's drop,
+    /// which collections otherwise do. Returns whether it was skipped.
+    unsafe fn skip_collection_without_garbage(&self, max_gen: Generation) -> bool {
+        // SAFETY: thread-local collector, no concurrent access.
+        let gc_maps = unsafe { self.core.gc_maps_unsync() };
+        if gc_maps.garbage_possible(max_gen) {
+            return false;
+        }
+        self.core.allocation_count.store(0, Ordering::Relaxed);
+        self.grow_alloc_threshold(0);
+        // Trimming when more than half the ids are stale keeps it amortized
+        // O(1) per freed object.
+        if gc_maps.gen0_ids.len() > 2 * gc_maps.objects.len() {
+            let objects = &gc_maps.objects;
+            gc_maps.gen0_ids.retain(|&id| objects.get(id).is_some());
+        }
+        true
     }
 
     /// GOGC-style adaptive threshold: grow when almost nothing was collected
@@ -1114,12 +1145,20 @@ impl LocalGarbageCollector {
         let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
         let collected_ratio = stats.objects_collected as f64 / stats.objects_scanned as f64;
         if collected_ratio < 0.05 {
-            let new = stats.objects_scanned.max(threshold * 2);
-            self.core.alloc_threshold.store(new, Ordering::Relaxed);
+            self.grow_alloc_threshold(stats.objects_scanned);
         } else if collected_ratio > 0.25 {
             let new = (threshold / 2).max(LOCAL_GC_ALLOC_THRESHOLD);
             self.core.alloc_threshold.store(new, Ordering::Relaxed);
         }
+    }
+
+    /// Almost nothing was garbage: double the threshold, and make it at
+    /// least the `scanned` live set, so the next collection waits until the
+    /// live set has roughly doubled.
+    fn grow_alloc_threshold(&self, scanned: usize) {
+        let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
+        let new = scanned.max(threshold * 2);
+        self.core.alloc_threshold.store(new, Ordering::Relaxed);
     }
 
     // Forced: master's LLVM inlined this into Gc::new; once GarbageCollector
