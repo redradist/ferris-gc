@@ -23,9 +23,203 @@
 
 use crate::slot_map::{SlotKey, SlotMap};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::{LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Stop-the-world lock split per thread.
+///
+/// Every sync mutator operation (allocate, clone, `GcCell::borrow_mut`, weak
+/// upgrade) takes a *read* lock so a collection cannot run underneath it. With
+/// one `RwLock` that read is still an atomic write to a shared reader count, so
+/// the line bounced between cores on every allocation. Here each thread
+/// read-locks only **its own** padded `RwLock` (same index as its object
+/// shard), and a collection write-locks **all** of them in index order.
+///
+/// Semantics are unchanged: a writer still excludes every reader, and readers
+/// still never exclude each other. Lock order is always "STW lock(s) first,
+/// then object shard lock(s)", writers always in index order, so it adds no
+/// deadlock. `read`/`write` return `LockResult` like `RwLock`, so callers keep
+/// their `.unwrap_or_else(|e| e.into_inner())`.
+pub(crate) struct StwLock {
+    shards: Box<[CachePadded<RwLock<()>>]>,
+}
+
+/// Write guard holding every shard of a [`StwLock`]. The first guard is kept
+/// inline so a single-shard (thread-local) collector never allocates.
+pub(crate) struct StwWriteGuard<'a> {
+    _first: RwLockWriteGuard<'a, ()>,
+    _rest: Vec<RwLockWriteGuard<'a, ()>>,
+}
+
+impl StwLock {
+    pub(crate) fn with_shards(n: usize) -> Self {
+        let n = n.clamp(1, MAX_SHARDS);
+        StwLock {
+            shards: (0..n)
+                .map(|_| CachePadded(RwLock::new(())))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    /// Read-lock the calling thread's shard.
+    #[inline]
+    pub(crate) fn read(&self) -> LockResult<RwLockReadGuard<'_, ()>> {
+        self.shards[current_thread_shard(self.shards.len())].read()
+    }
+
+    /// Write-lock every shard, in index order. Poisoning is ignored, as every
+    /// caller already does with `.unwrap_or_else(|e| e.into_inner())`.
+    pub(crate) fn write(&self) -> LockResult<StwWriteGuard<'_>> {
+        let first = self.shards[0].write().unwrap_or_else(|e| e.into_inner());
+        let rest = self.shards[1..]
+            .iter()
+            .map(|l| l.write().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        Ok(StwWriteGuard {
+            _first: first,
+            _rest: rest,
+        })
+    }
+}
+
+/// Counter interface a collector is generic over (see `gc::ObjectMap`): the
+/// thread-local collector uses [`SingleCounter`] - a plain atomic, exactly the
+/// old code - and the global collector uses [`ShardedCounter`]. Dispatch is
+/// static, so the thread-local allocation path pays nothing for sharding
+/// (routing it through a runtime-checked sharded counter cost ~24 extra
+/// instructions per allocation).
+pub(crate) trait Counter: Send + Sync {
+    /// True when the value of the calling thread's slot is the exact total.
+    const SINGLE: bool;
+    fn with_shards(n: usize) -> Self;
+    /// Add `n`; returns the calling thread's slot value afterwards (the exact
+    /// total when [`Self::SINGLE`]).
+    fn add(&self, n: usize) -> isize;
+    fn sub(&self, n: usize);
+    fn load(&self, order: Ordering) -> usize;
+    fn store(&self, v: usize, order: Ordering);
+}
+
+/// A plain atomic counter (the thread-local collector).
+pub(crate) struct SingleCounter(AtomicUsize);
+
+impl Counter for SingleCounter {
+    const SINGLE: bool = true;
+    #[inline]
+    fn with_shards(_n: usize) -> Self {
+        SingleCounter(AtomicUsize::new(0))
+    }
+    #[inline]
+    fn add(&self, n: usize) -> isize {
+        (self.0.fetch_add(n, Ordering::Relaxed) + n) as isize
+    }
+    /// Saturating: never underflows when a release is tracked without a
+    /// matching add.
+    #[inline]
+    fn sub(&self, n: usize) {
+        let mut cur = self.0.load(Ordering::Relaxed);
+        loop {
+            match self.0.compare_exchange_weak(
+                cur,
+                cur.saturating_sub(n),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+    #[inline]
+    fn load(&self, order: Ordering) -> usize {
+        self.0.load(order)
+    }
+    #[inline]
+    fn store(&self, v: usize, order: Ordering) {
+        self.0.store(v, order)
+    }
+}
+
+/// A counter split per thread, so the hot path writes only its own cache line
+/// (the global collector).
+///
+/// The sync collector bumped `allocation_count` and `current_heap_size` on
+/// every allocation and drop; as single atomics those lines bounced between
+/// cores just like the old shared reader count. Each thread now updates its own
+/// padded shard and readers sum the shards.
+///
+/// Shards are signed: an object allocated on one thread and freed on another
+/// moves one shard down and another up; only the sum is meaningful, and it is
+/// clamped at zero when read.
+pub(crate) struct ShardedCounter {
+    shards: Box<[CachePadded<AtomicIsize>]>,
+}
+
+impl Counter for ShardedCounter {
+    const SINGLE: bool = false;
+    fn with_shards(n: usize) -> Self {
+        let n = n.clamp(1, MAX_SHARDS);
+        ShardedCounter {
+            shards: (0..n)
+                .map(|_| CachePadded(AtomicIsize::new(0)))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+    #[inline]
+    fn add(&self, n: usize) -> isize {
+        let mine = &self.shards[current_thread_shard(self.shards.len())];
+        mine.fetch_add(n as isize, Ordering::Relaxed) + n as isize
+    }
+    /// A shard may go negative; the clamp happens on read.
+    #[inline]
+    fn sub(&self, n: usize) {
+        let mine = &self.shards[current_thread_shard(self.shards.len())];
+        mine.fetch_sub(n as isize, Ordering::Relaxed);
+    }
+    /// Sum of all shards, clamped at zero (shards are read `Relaxed`).
+    #[inline]
+    fn load(&self, _order: Ordering) -> usize {
+        let sum: isize = self.shards.iter().map(|s| s.load(Ordering::Relaxed)).sum();
+        sum.max(0) as usize
+    }
+    /// Reset the total to `v` (shard 0 holds it, the rest are zeroed).
+    fn store(&self, v: usize, _order: Ordering) {
+        self.shards[0].store(v as isize, Ordering::Relaxed);
+        for s in self.shards[1..].iter() {
+            s.store(0, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Maximum shards, matching the shard bits reserved in a key's index.
+/// Aligns `T` to its own 128-byte slot so that per-thread state written on the
+/// hot path never shares a cache line with another thread's.
+///
+/// Sharding by thread separates the data *logically*, but adjacent shards (and
+/// their 8-byte `Mutex<()>` locks - eight to a line) still shared cache lines,
+/// so every lock/insert bounced the line between cores: four threads allocated
+/// no faster than two. 128 rather than 64 because Intel's adjacent-line
+/// prefetcher pulls lines in pairs.
+#[repr(align(128))]
+pub(crate) struct CachePadded<T>(pub(crate) T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 pub(crate) const MAX_SHARDS: usize = 1 << crate::slot_map::SHARD_BITS;
 
 /// Hands each thread a stable, distinct ordinal. Threads keep it for life,
@@ -55,6 +249,9 @@ fn shard_exhausted() -> ! {
     )
 }
 
+/// One shard: its own `SlotMap`, behind its own cell, on its own cache line.
+type Shard<K, V> = CachePadded<UnsafeCell<SlotMap<K, V>>>;
+
 /// A `SlotMap` split into per-thread shards, exposing a `SlotMap`-compatible
 /// surface so collector code iterates it unchanged.
 ///
@@ -76,8 +273,8 @@ fn shard_exhausted() -> ! {
 /// they are only called under `lock_gc_maps`. Concurrent per-shard work goes
 /// through [`Self::shard_ptr`] under that shard's lock.
 pub(crate) struct ShardedSlotMap<K: SlotKey, V> {
-    first: UnsafeCell<SlotMap<K, V>>,
-    rest: Box<[UnsafeCell<SlotMap<K, V>>]>,
+    first: Shard<K, V>,
+    rest: Box<[Shard<K, V>]>,
 }
 
 impl<K: SlotKey, V> ShardedSlotMap<K, V> {
@@ -85,10 +282,10 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     pub(crate) fn with_shards(n: usize) -> Self {
         let n = n.clamp(1, MAX_SHARDS);
         let rest = (1..n)
-            .map(|_| UnsafeCell::new(SlotMap::new()))
+            .map(|_| CachePadded(UnsafeCell::new(SlotMap::new())))
             .collect::<Vec<_>>();
         ShardedSlotMap {
-            first: UnsafeCell::new(SlotMap::new()),
+            first: CachePadded(UnsafeCell::new(SlotMap::new())),
             rest: rest.into_boxed_slice(),
         }
     }
@@ -102,9 +299,9 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     #[inline]
     fn cell(&self, s: usize) -> Option<&UnsafeCell<SlotMap<K, V>>> {
         if s == 0 {
-            Some(&self.first)
+            Some(&self.first.0)
         } else {
-            self.rest.get(s - 1)
+            self.rest.get(s - 1).map(|p| &p.0)
         }
     }
 
@@ -119,7 +316,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     pub(crate) fn shard_ptr(&self, s: usize) -> *mut SlotMap<K, V> {
         match self.cell(s) {
             Some(c) => c.get(),
-            None => self.first.get(),
+            None => self.first.0.get(),
         }
     }
 
@@ -146,7 +343,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         if s == 0 {
             Some(self.first.get_mut())
         } else {
-            self.rest.get_mut(s - 1).map(UnsafeCell::get_mut)
+            self.rest.get_mut(s - 1).map(|p| p.0.get_mut())
         }
     }
 
@@ -193,7 +390,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         let m = if s == 0 {
             self.first.get_mut()
         } else {
-            unsafe { self.rest.get_unchecked_mut(s - 1).get_mut() }
+            unsafe { self.rest.get_unchecked_mut(s - 1).0.get_mut() }
         };
         unsafe { m.remove_unchecked(key.strip_shard()) }
     }
@@ -244,7 +441,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
     pub(crate) fn clear(&mut self) {
         self.first.get_mut().clear();
         for s in self.rest.iter_mut() {
-            s.get_mut().clear();
+            s.0.get_mut().clear();
         }
     }
 
@@ -252,7 +449,7 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         let mut out = self.first.get_mut().drain();
         for (i, s) in self.rest.iter_mut().enumerate() {
             out.extend(
-                s.get_mut()
+                s.0.get_mut()
                     .drain()
                     .into_iter()
                     .map(|(k, v)| (k.with_shard(i + 1), v)),
@@ -288,7 +485,7 @@ impl<'a, K: SlotKey, V> Iterator for Iter<'a, K, V> {
 
 /// Mutable iterator over every occupied entry of a [`ShardedSlotMap`].
 pub(crate) struct IterMut<'a, K: SlotKey, V> {
-    rest: &'a mut [UnsafeCell<SlotMap<K, V>>],
+    rest: &'a mut [Shard<K, V>],
     shard: usize,
     cur: Option<crate::slot_map::IterMut<'a, K, V>>,
 }
@@ -308,7 +505,7 @@ impl<'a, K: SlotKey, V> Iterator for IterMut<'a, K, V> {
                         [] => self.cur = None,
                         [head, tail @ ..] => {
                             self.shard += 1;
-                            self.cur = Some(head.get_mut().iter_mut());
+                            self.cur = Some(head.0.get_mut().iter_mut());
                             self.rest = tail;
                         }
                     }
@@ -369,6 +566,82 @@ mod tests {
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(m.get(*id), Some(&(i as u32 + 100)));
         }
+    }
+
+    #[test]
+    fn sharded_counter_sums_across_threads_and_clamps() {
+        let c = std::sync::Arc::new(ShardedCounter::with_shards(8));
+        // Allocate on four threads, free everything on one other thread: the
+        // per-thread slots go negative/positive but the sum is exact.
+        let adders: Vec<_> = (0..4)
+            .map(|_| {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        c.add(3);
+                    }
+                })
+            })
+            .collect();
+        for h in adders {
+            h.join().unwrap();
+        }
+        assert_eq!(c.load(Ordering::Relaxed), 12_000);
+        let c2 = c.clone();
+        std::thread::spawn(move || {
+            for _ in 0..1000 {
+                c2.sub(9);
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(c.load(Ordering::Relaxed), 3_000);
+        // More released than added: the total clamps at zero.
+        c.sub(10_000);
+        assert_eq!(c.load(Ordering::Relaxed), 0);
+        c.store(5, Ordering::Relaxed);
+        assert_eq!(c.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn single_counter_saturates() {
+        let c = SingleCounter::with_shards(1);
+        assert_eq!(c.add(4), 4);
+        c.sub(10);
+        assert_eq!(c.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stw_write_excludes_a_reader_on_another_threads_shard() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, mpsc};
+        let lock = Arc::new(StwLock::with_shards(8));
+        let acquired = Arc::new(AtomicBool::new(false));
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // A reader on its own thread (hence its own shard) holds the lock...
+        let l = lock.clone();
+        let reader = std::thread::spawn(move || {
+            let _g = l.read().unwrap_or_else(|e| e.into_inner());
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        // ...so a writer on yet another thread must not get through.
+        let (l, a) = (lock.clone(), acquired.clone());
+        let writer = std::thread::spawn(move || {
+            let _g = l.write().unwrap_or_else(|e| e.into_inner());
+            a.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "a STW write must exclude readers on every shard"
+        );
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
     }
 
     #[test]

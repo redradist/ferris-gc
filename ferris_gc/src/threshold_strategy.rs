@@ -1,3 +1,4 @@
+use crate::sharded_map::Counter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
