@@ -309,9 +309,9 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe {
-            let region = gc.borrow().core.current_region();
-            gc.borrow_mut().create_gc(t, region)
+        LocalGarbageCollector::allocate(move |gc| unsafe {
+            let region = gc.core.current_region();
+            gc.create_gc(t, region)
         })
     }
 
@@ -326,7 +326,7 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc(t, region.0) })
+        LocalGarbageCollector::allocate(move |gc| unsafe { gc.create_gc(t, region.0) })
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -341,9 +341,9 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe {
-            let region = gc.borrow().core.current_region();
-            gc.borrow_mut().try_create_gc(t, region)
+        LocalGarbageCollector::allocate(move |gc| unsafe {
+            let region = gc.core.current_region();
+            gc.try_create_gc(t, region)
         })
     }
 
@@ -358,7 +358,7 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc(t, region.0) })
+        LocalGarbageCollector::allocate(move |gc| unsafe { gc.try_create_gc(t, region.0) })
     }
 }
 
@@ -598,9 +598,9 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe {
-            let region = gc.borrow().core.current_region();
-            gc.borrow_mut().create_gc_cell(t, region)
+        LocalGarbageCollector::allocate(move |gc| unsafe {
+            let region = gc.core.current_region();
+            gc.create_gc_cell(t, region)
         })
     }
 
@@ -615,7 +615,7 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().create_gc_cell(t, region.0) })
+        LocalGarbageCollector::allocate(move |gc| unsafe { gc.create_gc_cell(t, region.0) })
     }
 
     /// Fallible allocation. Returns `Err(GcAllocError)` if memory is exhausted.
@@ -630,9 +630,9 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe {
-            let region = gc.borrow().core.current_region();
-            gc.borrow_mut().try_create_gc_cell(t, region)
+        LocalGarbageCollector::allocate(move |gc| unsafe {
+            let region = gc.core.current_region();
+            gc.try_create_gc_cell(t, region)
         })
     }
 
@@ -647,7 +647,7 @@ where
             }
         });
         // SAFETY: Thread-local access ensures single-threaded borrow.
-        LOCAL_GC.with(move |gc| unsafe { gc.borrow_mut().try_create_gc_cell(t, region.0) })
+        LocalGarbageCollector::allocate(move |gc| unsafe { gc.try_create_gc_cell(t, region.0) })
     }
 
     /// Mutable borrow with write barrier.
@@ -1046,28 +1046,49 @@ impl LocalGarbageCollector {
 
     /// Check allocation count and trigger Gen0 collection if threshold exceeded
     /// and a collection could free anything (see
-    /// `skip_collection_without_garbage`). The threshold adapts based on collection efficiency: if a collection frees
-    /// little garbage, the threshold doubles (up to 100K) to avoid wasteful scans
-    /// of a mostly-live heap. If a collection frees a lot, the threshold shrinks
-    /// (down to 1K) to reclaim memory promptly.
+    /// `skip_collection_without_garbage`). The threshold adapts based on
+    /// collection efficiency: if a collection frees little garbage, the
+    /// threshold doubles to avoid wasteful scans of a mostly-live heap. If a
+    /// collection frees a lot, the threshold shrinks (down to 1K) to reclaim
+    /// memory promptly.
+    ///
+    /// # Safety
+    /// No borrow of the collector may be live: see [`Self::allocate`].
     #[inline]
-    unsafe fn maybe_collect(&self) {
+    unsafe fn maybe_collect(gc: &RefCell<Self>) {
         // Only the cheap trigger checks stay inline. Every collection entry
         // point is kept out of line: inlining the collector into the allocation
         // fast path bloated it enough that LLVM stopped inlining Gc::new into its
         // callers (measured +4-6% instructions on alloc/churn).
-        let budget = self.core.local_incremental_budget.load(Ordering::Relaxed);
+        // SAFETY: only reads; a collection that is due takes a shared borrow.
+        let this = unsafe { &*gc.as_ptr() };
+        let budget = this.core.local_incremental_budget.load(Ordering::Relaxed);
         if budget > 0 {
-            unsafe { self.step_incremental(budget) };
+            unsafe { gc.borrow().step_incremental(budget) };
             return;
         }
 
         // Classic full-collect path.
-        let count = self.core.allocation_count.load(Ordering::Relaxed);
-        let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
+        let count = this.core.allocation_count.load(Ordering::Relaxed);
+        let threshold = this.core.alloc_threshold.load(Ordering::Relaxed);
         if count >= threshold {
-            unsafe { self.collect_gen0_and_adapt() };
+            unsafe { gc.borrow().collect_gen0_and_adapt() };
         }
+    }
+
+    /// Run an allocation on this thread's collector, then the allocation
+    /// trigger. The trigger runs only once the allocation's `&mut` borrow
+    /// has ended: a collection drops dead objects, and the drops of the
+    /// handles inside them borrow the collector again, which would alias
+    /// that `&mut` (undefined behaviour under Stacked Borrows).
+    #[inline(always)]
+    fn allocate<R>(alloc: impl FnOnce(&mut LocalGarbageCollector) -> R) -> R {
+        LOCAL_GC.with(|gc| {
+            let allocated = alloc(&mut gc.borrow_mut());
+            // SAFETY: the allocation's borrow ended above.
+            unsafe { Self::maybe_collect(gc) };
+            allocated
+        })
     }
 
     /// On-thread incremental mode (set by the local background/g1 strategies):
@@ -1232,7 +1253,6 @@ impl LocalGarbageCollector {
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.add(1);
-            self.maybe_collect();
             gc
         }
     }
@@ -1324,7 +1344,6 @@ impl LocalGarbageCollector {
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.add(1);
-            self.maybe_collect();
             gc
         }
     }
@@ -1417,7 +1436,6 @@ impl LocalGarbageCollector {
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.add(1);
-            self.maybe_collect();
             Ok(gc)
         }
     }
@@ -1493,7 +1511,6 @@ impl LocalGarbageCollector {
             (*gc_ptr).reset_root();
             GC_MAPS_CTX.set(std::ptr::null_mut());
             self.core.allocation_count.add(1);
-            self.maybe_collect();
             Ok(gc)
         }
     }
