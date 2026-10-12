@@ -2590,7 +2590,7 @@ mod tests {
         std::thread::spawn(move || {
             drop((small, cells, big, aligned));
             let g = Gc::new(7u64);
-            assert_eq!(***g, 7);
+            assert_eq!(**g, 7);
         })
         .join()
         .unwrap();
