@@ -126,7 +126,7 @@ unsafe fn drop_handle(obj: *const u8, info: *const GcInfo) {
         let object_id = (*info).object_id;
         if (*info).handle_count.fetch_sub(1, Ordering::Release) == 1 {
             std::sync::atomic::fence(Ordering::Acquire);
-            (*GLOBAL_GC).core.release_object(object_id);
+            GLOBAL_GC.core.release_object(object_id);
         }
     }
 }
@@ -2609,5 +2609,178 @@ mod tests {
         let stats = unsafe { GLOBAL_GC.core.finish_collection() };
         assert_eq!(stats.objects_collected, 0);
         assert_eq!(***cell.borrow().as_ref().unwrap(), 7);
+    }
+
+    // --- One-word handles counted in the object header ---
+
+    static COUNTED_DROPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Counts its drops, to check an object is freed exactly once.
+    struct Counted(u64);
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            COUNTED_DROPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    leaf_trace!(Counted);
+
+    fn header_handles<T: crate::gc::Trace>(g: &Gc<T>) -> u32 {
+        unsafe {
+            (*g.ptr)
+                .info
+                .handle_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn handles_are_one_pointer_wide() {
+        assert_eq!(std::mem::size_of::<Gc<u64>>(), std::mem::size_of::<usize>());
+        assert_eq!(
+            std::mem::size_of::<GcCell<u64>>(),
+            std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::size_of::<Option<Gc<u64>>>(),
+            2 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn clone_and_drop_count_handles_in_the_header() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let drops = COUNTED_DROPS.load(std::sync::atomic::Ordering::SeqCst);
+        let g = Gc::new(Counted(5));
+        assert_eq!(header_handles(&g), 1);
+        let c1 = g.clone();
+        let c2 = c1.clone();
+        assert_eq!(header_handles(&g), 3);
+        assert_eq!(c2.0, 5);
+        drop(c1);
+        assert_eq!(header_handles(&g), 2);
+        drop(g);
+        assert_eq!(live_objects(), before + 1, "a handle is left");
+        drop(c2);
+        assert_eq!(live_objects(), before, "the last drop frees the object");
+        assert_eq!(
+            COUNTED_DROPS.load(std::sync::atomic::Ordering::SeqCst),
+            drops + 1
+        );
+    }
+
+    #[test]
+    fn clones_dropped_on_many_threads_free_the_object_once() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let drops = COUNTED_DROPS.load(std::sync::atomic::Ordering::SeqCst);
+        let rounds = if cfg!(miri) { 4 } else { 200 };
+        for _ in 0..rounds {
+            let g = Gc::new(Counted(7));
+            let cell = GcCell::new(g.clone());
+            std::thread::scope(|s| {
+                for _ in 0..4 {
+                    let mine = g.clone();
+                    let cell = cell.clone();
+                    s.spawn(move || {
+                        let more: Vec<_> = (0..8).map(|_| mine.clone()).collect();
+                        assert!(more.iter().all(|h| h.0 == 7));
+                        let from_cell = cell.borrow().clone();
+                        drop(more);
+                        drop(from_cell);
+                    });
+                }
+            });
+            drop(cell);
+            assert_eq!(header_handles(&g), 1);
+            drop(g);
+        }
+        assert_eq!(live_objects(), before);
+        assert_eq!(
+            COUNTED_DROPS.load(std::sync::atomic::Ordering::SeqCst),
+            drops + rounds
+        );
+    }
+
+    #[test]
+    fn weak_upgrade_racing_the_last_drop_never_resurrects() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let drops = COUNTED_DROPS.load(std::sync::atomic::Ordering::SeqCst);
+        let rounds = if cfg!(miri) { 3 } else { 100 };
+        for _ in 0..rounds {
+            let g = Gc::new(Counted(9));
+            let weak = Gc::downgrade(&g);
+            std::thread::scope(|s| {
+                let weak = &weak;
+                s.spawn(move || {
+                    // Upgrades that succeed must see a live value; once one
+                    // fails, the object is gone for good.
+                    let mut failed = false;
+                    for _ in 0..50 {
+                        match weak.upgrade() {
+                            Some(strong) => {
+                                assert!(!failed, "upgrade succeeded after the object died");
+                                assert_eq!(strong.0, 9);
+                            }
+                            None => failed = true,
+                        }
+                    }
+                });
+                drop(g);
+            });
+            assert!(weak.upgrade().is_none());
+            assert!(!weak.is_alive());
+        }
+        assert_eq!(live_objects(), before);
+        assert_eq!(
+            COUNTED_DROPS.load(std::sync::atomic::Ordering::SeqCst),
+            drops + rounds
+        );
+    }
+
+    #[test]
+    fn sync_handle_inside_a_local_object_is_a_root() {
+        // A thread-local collection walks the local object's fields, which
+        // include the sync handle; that must not discount it as an interior
+        // handle of the sync object.
+        struct Holder {
+            s: Gc<u64>,
+        }
+        impl crate::gc::Trace for Holder {
+            fn is_root(&self) -> bool {
+                false
+            }
+            fn reset_root(&self) {
+                self.s.reset_root();
+            }
+            fn trace(&self) {
+                self.s.trace();
+            }
+            fn reset(&self) {
+                self.s.reset();
+            }
+            fn is_traceable(&self) -> bool {
+                false
+            }
+            fn trace_children(&self, children: &mut Vec<*const dyn crate::gc::Trace>) {
+                self.s.trace_children(children);
+            }
+        }
+        impl crate::gc::Finalize for Holder {
+            fn finalize(&self) {}
+        }
+        let (_guard, _baseline) = setup();
+        let local = crate::gc::Gc::new(Holder { s: Gc::new(41) });
+        crate::gc::LOCAL_GC.with(|gc| unsafe { gc.borrow_mut().collect() });
+        let _paused = PauseBackgroundCollector::new();
+        let stats = unsafe {
+            (*GLOBAL_GC)
+                .core
+                .collect_generation(crate::generation::Generation::Gen2)
+        };
+        assert_eq!(stats.objects_collected, 0);
+        assert_eq!(**local.s, 41);
+        assert_eq!(header_handles(&local.s), 1);
     }
 }
