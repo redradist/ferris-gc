@@ -2499,4 +2499,101 @@ mod tests {
         drop(c);
         assert_eq!(live_objects(), before);
     }
+
+    /// 2 KiB payload: too large for the per-thread pool.
+    struct Big([u64; 256]);
+    /// Over-aligned payload: the pool only serves 16-byte alignment.
+    #[repr(align(64))]
+    struct Aligned(u64);
+
+    macro_rules! leaf_trace {
+        ($($t:ty),*) => {$(
+            impl crate::gc::Trace for $t {
+                fn is_root(&self) -> bool { false }
+                fn reset_root(&self) {}
+                fn trace(&self) {}
+                fn reset(&self) {}
+                fn is_traceable(&self) -> bool { false }
+            }
+            impl crate::gc::Finalize for $t {
+                fn finalize(&self) {}
+            }
+        )*};
+    }
+    leaf_trace!(Big, Aligned);
+
+    #[test]
+    fn pool_and_system_blocks_free_from_any_thread() {
+        use super::{GcCellInternal, GcInternal, GcPtr, object_block_layout};
+        use std::cell::RefCell;
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        // Small objects come from the allocating thread's pool, large and
+        // over-aligned ones from the system allocator.
+        assert!(crate::pool::serves(
+            object_block_layout::<GcPtr<u64>, GcInternal<u64>>().0
+        ));
+        assert!(crate::pool::serves(
+            object_block_layout::<RefCell<GcPtr<u64>>, GcCellInternal<u64>>().0
+        ));
+        assert!(!crate::pool::serves(
+            object_block_layout::<GcPtr<Big>, GcInternal<Big>>().0
+        ));
+        assert!(!crate::pool::serves(
+            object_block_layout::<GcPtr<Aligned>, GcInternal<Aligned>>().0
+        ));
+        let n = if cfg!(miri) { 6 } else { 300 };
+        // The allocating thread exits before any of its objects die.
+        let (small, cells, big, aligned) = std::thread::spawn(move || {
+            (
+                (0..n).map(|i| Gc::new(i as u64)).collect::<Vec<_>>(),
+                (0..n).map(|i| GcCell::new(i as u64)).collect::<Vec<_>>(),
+                (0..3).map(|i| Gc::new(Big([i; 256]))).collect::<Vec<_>>(),
+                (0..3).map(|i| Gc::new(Aligned(i))).collect::<Vec<_>>(),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(live_objects(), before + 2 * n + 6);
+        // Clones (their tracers from a second thread's pool) outlive the
+        // originals, which die here, on a third thread.
+        let clones = std::thread::scope(|s| {
+            s.spawn(|| {
+                (
+                    small.iter().map(Gc::clone).collect::<Vec<_>>(),
+                    cells.iter().map(GcCell::clone).collect::<Vec<_>>(),
+                    big.iter().map(Gc::clone).collect::<Vec<_>>(),
+                    aligned.iter().map(Gc::clone).collect::<Vec<_>>(),
+                )
+            })
+            .join()
+            .unwrap()
+        });
+        drop((small, cells, big, aligned));
+        let (small, cells, big, aligned) = clones;
+        for (i, g) in small.iter().enumerate() {
+            assert_eq!(***g, i as u64);
+        }
+        for (i, c) in cells.iter().enumerate() {
+            assert_eq!(**c.borrow(), i as u64);
+        }
+        for (i, g) in big.iter().enumerate() {
+            assert!(g.0.iter().all(|&v| v == i as u64));
+        }
+        for (i, g) in aligned.iter().enumerate() {
+            assert_eq!(g.0, i as u64);
+            assert_eq!((&***g as *const Aligned).addr() % 64, 0);
+        }
+        assert_eq!(live_objects(), before + 2 * n + 6);
+        // The last handles die on yet another thread, which then allocates
+        // again (adopting a retired heap or its pages).
+        std::thread::spawn(move || {
+            drop((small, cells, big, aligned));
+            let g = Gc::new(7u64);
+            assert_eq!(***g, 7);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(live_objects(), before);
+    }
 }
