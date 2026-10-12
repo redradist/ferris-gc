@@ -18,6 +18,26 @@ cargo bench --features _internal   # Run benchmarks (requires _internal feature)
 cargo check                        # Type-check without full compilation
 ```
 
+## Code Guidelines
+
+Every change, performance work included, should follow these:
+
+- **Consistent naming.** One word per concept across the codebase, and the same word in both collectors.
+  - A *handle* is a `Gc`/`GcCell` value.
+  - An *object* is what a handle points to.
+  - An *entry* is its `ObjectEntry`.
+  - `drop_handle` takes a handle away; `release_object` frees an object that has no handles left.
+  - Thread-local and sync counterparts get the same name, or an explicit `Local*`/`Sync*` prefix (`LocalGcInfo`/`SyncGcInfo`).
+  - A rename updates every use, doc and test. A public name that changes keeps a `#[deprecated]` alias for a release.
+- **Consistent logic.** The same problem is solved the same way in both collectors (handle counting, root discovery, object release). When they must differ, a comment says why at the place they differ.
+- **SOLID where it applies.**
+  - One responsibility per module and type (see the `gc/` module split).
+  - Extend through traits (`ObjectMap`, `Counter`, `SyncObject`) rather than `if`-chains over kinds.
+  - Small interfaces; dependencies on the trait, not the concrete map or counter.
+  - Do not add an abstraction that costs the hot path or has a single implementation and no second one in sight. Static dispatch (generics, `const` flags like `O::SHARDED`) is preferred over `dyn` on hot paths.
+- **No duplicated logic.** Shared steps live in one function used by both paths, unless a measured hot-path cost justifies a specialized copy, which then says so.
+- **Refactors are behaviour- and performance-neutral.** Verify with callgrind (same instruction counts on all benchmarks, local GC included), all tests, clippy (stable and nightly), and Miri. Do not mix refactors with functional or performance changes in one PR.
+
 ## Architecture
 
 ### Core Traits
