@@ -35,7 +35,9 @@ Every change, performance work included, should follow these:
   - Extend through traits (`ObjectMap`, `Counter`, `SyncObject`) rather than `if`-chains over kinds.
   - Small interfaces; dependencies on the trait, not the concrete map or counter.
   - Do not add an abstraction that costs the hot path or has a single implementation and no second one in sight. Static dispatch (generics, `const` flags like `O::SHARDED`) is preferred over `dyn` on hot paths.
-- **No duplicated logic.** Shared steps live in one function used by both paths, unless a measured hot-path cost justifies a specialized copy, which then says so.
+- **DRY (Don't Repeat Yourself).** Each piece of knowledge has one home: shared steps live in one function used by every path (e.g. `unregister_object`, `CollectionStats::new`/`finish`). A specialized copy is allowed only when a measured hot-path cost justifies it, and then a comment says so.
+- **KISS (Keep It Simple).** Prefer the simplest design that is correct and fast enough: plain data and functions over layers of indirection, one clear protocol over clever special cases. Unsafe and concurrent code especially should be easy to reason about. A simpler invariant beats a few saved instructions unless the benchmark says otherwise.
+- **YAGNI (You Aren't Gonna Need It).** Build what the current task needs, not what might be needed later: no speculative options, hooks, generic parameters or feature flags without a present use. Remove dead code (unused functions, variants, fields) instead of keeping it "just in case".
 - **Refactors are behaviour- and performance-neutral.** Verify with callgrind (same instruction counts on all benchmarks, local GC included), all tests, clippy (stable and nightly), and Miri. Do not mix refactors with functional or performance changes in one PR.
 
 ## Architecture
