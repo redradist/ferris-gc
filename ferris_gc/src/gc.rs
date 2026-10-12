@@ -1653,6 +1653,10 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     /// insert, re-synced on the slow drop path); a stale non-zero costs a slower
     /// path, never correctness.
     pub(crate) weak_alive_len: AtomicUsize,
+    /// Set during marking when a value could not be scanned because a
+    /// `sync::GcCell` was mutably borrowed. The mark is then incomplete, and
+    /// the collection's sweep frees nothing (see [`Self::take_trace_incomplete`]).
+    pub(crate) trace_incomplete: AtomicBool,
     /// Allocation counter for adaptive collection triggering.
     pub(crate) allocation_count: O::Counter,
     pub(crate) card_table: CardTable,
@@ -1731,6 +1735,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             weak_alive_len: AtomicUsize::new(0),
+            trace_incomplete: AtomicBool::new(false),
             allocation_count: <O::Counter as Counter>::with_shards(shards),
             card_table: CardTable::new(),
             stw_lock: crate::sharded_map::StwLock::with_shards(shards),
@@ -2307,6 +2312,21 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
+    /// If marking could not scan a mutably borrowed `sync::GcCell`, the marks
+    /// are incomplete: mark every object live so this collection's sweep frees
+    /// nothing; a later collection retries. The thread-local collector never
+    /// sets the flag.
+    #[inline]
+    fn keep_all_if_trace_incomplete(&self, gc_maps: &GcMaps<O>) {
+        if self.trace_incomplete.swap(false, Ordering::AcqRel) {
+            for entry in gc_maps.objects.values() {
+                // SAFETY: every registered object is valid while the maps
+                // are locked.
+                unsafe { entry.root_ref_count().set(1) };
+            }
+        }
+    }
+
     /// Root discovery: given gc_maps (as raw pointer), initialize root_count = handle_count
     /// for in-scope objects, then cascade reset_root through the object graph to decrement
     /// root_count for internal references. After this, objects with root_count > 0 are
@@ -2582,6 +2602,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_trace_incomplete(&gc_maps);
+
                 // Combined pass: sweep + count + clear_trace + promotion in a single
                 // iteration over objects. Avoids 3 extra full iterations and uses
                 // inline root_ref_count access instead of vtable dispatch.
@@ -2819,6 +2842,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_trace_incomplete(&gc_maps);
+
                 // Count in-scope objects directly (no HashSet allocation)
                 stats.objects_scanned = gc_maps
                     .objects
@@ -2985,6 +3011,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         }
                     }
                 }
+
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_trace_incomplete(&gc_maps);
 
                 // Count in-scope objects directly
                 stats.objects_scanned = gc_maps
@@ -3240,6 +3269,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         entry.root_ref_count().set(usize::from(live));
                     }
                 }
+
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_trace_incomplete(&gc_maps);
 
                 let mut stats = CollectionStats {
                     generation: max_gen,
@@ -3641,6 +3673,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_trace_incomplete(&gc_maps);
+
                 // Combined pass: sweep + count + clear_trace in a single iteration.
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
                 for (id, entry) in gc_maps.objects.iter_mut() {
@@ -3752,6 +3787,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         (&*obj_entry.ptr).trace();
                     }
                 }
+
+                // A mutably borrowed sync::GcCell left the mark incomplete.
+                self.keep_all_if_trace_incomplete(&gc_maps);
 
                 stats.objects_scanned = gc_maps.objects.len();
 
