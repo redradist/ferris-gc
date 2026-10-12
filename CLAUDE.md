@@ -40,7 +40,8 @@ Both share the same API surface but differ in synchronization:
 Internal type hierarchy differs per GC:
 
 - **Thread-local:** `Gc<T>`/`GcCell<T>` is a single tagged pointer (8B `Cell<NonZeroUsize>`: bit 0 = root flag, bits 1.. = `*const GcPtr<T>`) straight to `GcPtr<T>` (`GcInfo` + `object_id` + data). Handle metadata (`handle_count`/`root_count`) lives in `ObjectEntry`. Both types are `!Send`/`!Sync`.
-- **Sync (global):** `sync::Gc<T>` → `GcInternal<T>` (tracer: root flag + object_id) → `GcPtr<T>`. Tracers are registered in `ObjectEntry.tracers` (`TracerList`).
+- **Sync (global):** `sync::Gc<T>` → `GcInternal<T>` (tracer: root flag + object_id) → `GcPtr<T>`. Tracers are registered in `ObjectEntry.tracers` (`TracerList`). `sync::Gc`/`GcCell`/`GcWeak` need `T: Send + Sync` (like `Arc`), because the collector thread reaches every value.
+- **`sync::GcCell<T>`** → `GcCellBox<T>` (`GcInfo` header + `RwLock<()>` + `UnsafeCell<T>`), with reader-writer semantics. `borrow`/`borrow_mut` block, and the `try_` variants return `None`. The collector never blocks on a cell: it only uses `try_read`. If a scan is blocked by a held `borrow_mut`, `blocked_scans` is bumped, and every sweep path calls `keep_all_if_blocked_since`, so that collection frees nothing.
 
 Raw allocations use TLAB bump allocation (thread-local arena blocks) with system allocator fallback. During a sweep, destructors of all dead objects run before any memory is freed (two-phase dealloc) and a dying-address registry makes interior handle drops no-ops — required for Miri/Stacked Borrows soundness of the tagged-pointer handles.
 
