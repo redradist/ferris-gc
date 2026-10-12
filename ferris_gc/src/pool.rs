@@ -31,11 +31,16 @@
 //!
 //! # Lifetime
 //!
-//! Heaps are never freed. When a thread exits, its heap (with every page
-//! still holding live objects) goes on a global list and is adopted by the
-//! next thread that allocates. A page whose blocks are all free is released:
-//! kept in a small per-heap cache of empty pages, beyond that returned to the
-//! system allocator.
+//! Pages are carved from [`SEGMENT_SIZE`] segments, so the system allocator
+//! (and the OS) is asked for memory once per 32 pages rather than per page.
+//! A page whose blocks are all free is released: kept in a small per-heap
+//! cache, beyond that returned to its segment. Segments with every page free
+//! are kept for reuse up to [`EMPTY_SEGMENTS_KEPT`] and returned to the
+//! system beyond that, so idle retained memory is bounded.
+//!
+//! Heaps are never freed. When a thread exits, its empty pages go back to
+//! their segments and its heap (with every page still holding live objects)
+//! goes on a global list, to be adopted by the next thread that allocates.
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::Cell;
@@ -50,12 +55,18 @@ const GRANULE: usize = 16;
 /// Largest block the pool serves; bigger requests use the system allocator.
 const MAX_BLOCK: usize = 1024;
 const CLASSES: usize = MAX_BLOCK / GRANULE;
-/// Empty pages a heap keeps for reuse before returning them to the system.
-const EMPTY_PAGES_KEPT: usize = 32;
+/// Empty pages a heap keeps before returning them to their segment.
+const EMPTY_PAGES_KEPT: usize = 8;
+const SEGMENT_PAGES: usize = 32;
+/// Unit requested from the system allocator (2 MiB).
+const SEGMENT_SIZE: usize = PAGE_SIZE * SEGMENT_PAGES;
+/// Fully free segments kept for reuse (16 MiB) before returning one to the
+/// system.
+const EMPTY_SEGMENTS_KEPT: usize = 8;
 
-const PAGE_LAYOUT: Layout = match Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
+const SEGMENT_LAYOUT: Layout = match Layout::from_size_align(SEGMENT_SIZE, PAGE_SIZE) {
     Ok(layout) => layout,
-    Err(_) => panic!("invalid pool page layout"),
+    Err(_) => panic!("invalid pool segment layout"),
 };
 
 /// Tag bit in `Page::xfree`: the page is full and not linked in its heap.
@@ -71,9 +82,11 @@ struct FreeNode {
 #[repr(C)]
 struct Page {
     // ---- Read or written by other threads ----
-    /// Owning heap. Written only when the page is first created; a remote
-    /// thread reads it while holding a live block of the page.
+    /// Owning heap. Written when a heap takes the page from its segment; a
+    /// remote thread reads it while holding a live block of the page.
     heap: *mut Heap,
+    /// Segment the page belongs to; never changes.
+    segment: *mut Segment,
     /// Blocks freed by other threads, plus the [`FULL`] tag bit.
     xfree: AtomicPtr<FreeNode>,
     /// Link in the owner's `rescued` stack; written by the remote thread that
@@ -136,6 +149,154 @@ thread_local! {
     static HEAP: HeapSlot = const { HeapSlot(Cell::new(ptr::null_mut())) };
 }
 
+/// A [`SEGMENT_SIZE`] allocation carved into pages. Only touched under the
+/// [`SOURCE`] lock.
+struct Segment {
+    base: *mut u8,
+    /// Pages given back, linked through `Page::next`.
+    free: *mut Page,
+    /// Pages `untouched..SEGMENT_PAGES` were never handed out.
+    untouched: usize,
+    /// Pages not held by any heap.
+    available: usize,
+    /// Link in `PageSource::partial` or `PageSource::empty`.
+    next: *mut Segment,
+    prev: *mut Segment,
+}
+
+/// Segments with pages to hand out: `partial` (some pages in use) is
+/// preferred over `empty` (none in use), so empty segments stay empty and can
+/// be returned to the system. A segment with no available page is in neither.
+struct PageSource {
+    partial: *mut Segment,
+    empty: *mut Segment,
+    empty_count: usize,
+}
+
+// SAFETY: the segments are only reached through the mutex.
+unsafe impl Send for PageSource {}
+
+static SOURCE: Mutex<PageSource> = Mutex::new(PageSource {
+    partial: ptr::null_mut(),
+    empty: ptr::null_mut(),
+    empty_count: 0,
+});
+
+impl PageSource {
+    unsafe fn push(list: &mut *mut Segment, seg: *mut Segment) {
+        unsafe {
+            (*seg).prev = ptr::null_mut();
+            (*seg).next = *list;
+            if !list.is_null() {
+                (**list).prev = seg;
+            }
+            *list = seg;
+        }
+    }
+
+    unsafe fn remove(list: &mut *mut Segment, seg: *mut Segment) {
+        unsafe {
+            let (prev, next) = ((*seg).prev, (*seg).next);
+            if prev.is_null() {
+                *list = next;
+            } else {
+                (*prev).next = next;
+            }
+            if !next.is_null() {
+                (*next).prev = prev;
+            }
+        }
+    }
+
+    /// Hand out a page with a fresh header for `heap`.
+    unsafe fn take(&mut self, heap: *mut Heap) -> Option<*mut Page> {
+        unsafe {
+            let seg = if !self.partial.is_null() {
+                self.partial
+            } else if !self.empty.is_null() {
+                let seg = self.empty;
+                Self::remove(&mut self.empty, seg);
+                self.empty_count -= 1;
+                Self::push(&mut self.partial, seg);
+                seg
+            } else {
+                let base = alloc(SEGMENT_LAYOUT);
+                if base.is_null() {
+                    return None;
+                }
+                let seg = Box::into_raw(Box::new(Segment {
+                    base,
+                    free: ptr::null_mut(),
+                    untouched: 0,
+                    available: SEGMENT_PAGES,
+                    next: ptr::null_mut(),
+                    prev: ptr::null_mut(),
+                }));
+                Self::push(&mut self.partial, seg);
+                seg
+            };
+            let page = if !(*seg).free.is_null() {
+                let page = (*seg).free;
+                (*seg).free = (*page).next;
+                page
+            } else {
+                let page: *mut Page = (*seg).base.add((*seg).untouched * PAGE_SIZE).cast();
+                (*seg).untouched += 1;
+                page
+            };
+            (*seg).available -= 1;
+            if (*seg).available == 0 {
+                Self::remove(&mut self.partial, seg);
+            }
+            ptr::write(
+                page,
+                Page {
+                    heap,
+                    segment: seg,
+                    xfree: AtomicPtr::new(ptr::null_mut()),
+                    rescue_next: ptr::null_mut(),
+                    free: ptr::null_mut(),
+                    used: 0,
+                    bump: 0,
+                    block_size: 0,
+                    class: 0,
+                    next: ptr::null_mut(),
+                    prev: ptr::null_mut(),
+                    linked: false,
+                },
+            );
+            Some(page)
+        }
+    }
+
+    /// Take back an empty page no heap holds any more.
+    unsafe fn give(&mut self, page: *mut Page) {
+        unsafe {
+            let seg = (*page).segment;
+            (*page).next = (*seg).free;
+            (*seg).free = page;
+            (*seg).available += 1;
+            if (*seg).available == 1 {
+                Self::push(&mut self.partial, seg);
+            }
+            if (*seg).available == SEGMENT_PAGES {
+                Self::remove(&mut self.partial, seg);
+                if self.empty_count < EMPTY_SEGMENTS_KEPT {
+                    Self::push(&mut self.empty, seg);
+                    self.empty_count += 1;
+                } else {
+                    dealloc((*seg).base, SEGMENT_LAYOUT);
+                    drop(Box::from_raw(seg));
+                }
+            }
+        }
+    }
+}
+
+fn source() -> std::sync::MutexGuard<'static, PageSource> {
+    SOURCE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Size class serving `layout`, or `None` if the pool does not serve it.
 #[inline]
 fn class_of(layout: Layout) -> Option<usize> {
@@ -146,12 +307,18 @@ fn class_of(layout: Layout) -> Option<usize> {
     Some((size - 1) / GRANULE)
 }
 
+/// Whether the pool serves `layout` (at most [`MAX_BLOCK`] bytes, at most
+/// [`GRANULE`]-aligned). Every such layout is always allocated from the pool,
+/// so callers can tell pool blocks from system allocations by layout alone.
+#[inline]
+pub(crate) fn serves(layout: Layout) -> bool {
+    class_of(layout).is_some()
+}
+
 /// Allocate a block for `layout` from this thread's heap.
 ///
-/// Returns `None` if the pool does not serve the layout (too large or
-/// over-aligned), the system allocator failed, or the thread is past its
-/// thread-local destructors. Callers then fall back to the system allocator.
-/// A returned block must be released with [`free`].
+/// Returns `None` if the layout is not [`serves`]-able or the system
+/// allocator failed. A returned block must be released with [`free_block`].
 #[inline]
 pub(crate) fn alloc_block(layout: Layout) -> Option<NonNull<u8>> {
     let class = class_of(layout)?;
@@ -164,11 +331,28 @@ pub(crate) fn alloc_block(layout: Layout) -> Option<NonNull<u8>> {
         // SAFETY: `heap` is this thread's heap.
         unsafe { heap_alloc(heap, class) }
     })
-    .ok()
-    .flatten()
+    .unwrap_or_else(|_| orphan_alloc(class))
 }
 
-/// Return a block obtained from [`alloc_block`]. Any thread may call this.
+/// Shared heap for allocations made after a thread's own heap was retired
+/// (from other thread-local destructors). Its mutex stands in for thread
+/// ownership; no thread's slot holds it, so every free of its blocks takes the
+/// remote path.
+static ORPHAN: Mutex<HeapPtr> = Mutex::new(HeapPtr(ptr::null_mut()));
+
+#[cold]
+#[inline(never)]
+fn orphan_alloc(class: usize) -> Option<NonNull<u8>> {
+    let mut orphan = ORPHAN.lock().unwrap_or_else(|e| e.into_inner());
+    if orphan.0.is_null() {
+        orphan.0 = heap_acquire();
+    }
+    // SAFETY: the lock makes this thread the heap's only user.
+    unsafe { heap_alloc(orphan.0, class) }
+}
+
+/// Return a block obtained from [`alloc_block`]. Any thread may call this,
+/// including from thread-local destructors.
 ///
 /// # Safety
 /// `block` must come from [`alloc_block`] and not have been freed already;
@@ -207,6 +391,7 @@ fn heap_acquire() -> *mut Heap {
 unsafe fn heap_retire(heap: *mut Heap) {
     unsafe {
         drain_rescued(heap);
+        let mut source = source();
         for class in 0..CLASSES {
             let mut page = (*heap).avail[class];
             while !page.is_null() {
@@ -214,7 +399,7 @@ unsafe fn heap_retire(heap: *mut Heap) {
                 collect_remote(page);
                 if (*page).used == 0 {
                     unlink(heap, page);
-                    dealloc(page.cast(), PAGE_LAYOUT);
+                    source.give(page);
                 }
                 page = next;
             }
@@ -222,7 +407,7 @@ unsafe fn heap_retire(heap: *mut Heap) {
         while !(*heap).empty.is_null() {
             let page = (*heap).empty;
             (*heap).empty = (*page).next;
-            dealloc(page.cast(), PAGE_LAYOUT);
+            source.give(page);
         }
         (*heap).empty_count = 0;
     }
@@ -343,27 +528,7 @@ unsafe fn new_page(heap: *mut Heap, class: usize) -> Option<*mut Page> {
             (*heap).empty_count -= 1;
             page
         } else {
-            let page: *mut Page = alloc(PAGE_LAYOUT).cast();
-            if page.is_null() {
-                return None;
-            }
-            ptr::write(
-                page,
-                Page {
-                    heap,
-                    xfree: AtomicPtr::new(ptr::null_mut()),
-                    rescue_next: ptr::null_mut(),
-                    free: ptr::null_mut(),
-                    used: 0,
-                    bump: 0,
-                    block_size: 0,
-                    class: 0,
-                    next: ptr::null_mut(),
-                    prev: ptr::null_mut(),
-                    linked: false,
-                },
-            );
-            page
+            source().take(heap)?
         };
         (*page).class = class;
         (*page).block_size = (class + 1) * GRANULE;
@@ -423,8 +588,12 @@ unsafe fn remote_free(heap: *mut Heap, page: *mut Page, node: *mut FreeNode) {
             let mut head = rescued.load(Ordering::Relaxed);
             loop {
                 (*page).rescue_next = head;
-                match rescued.compare_exchange_weak(head, page, Ordering::Release, Ordering::Relaxed)
-                {
+                match rescued.compare_exchange_weak(
+                    head,
+                    page,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => break,
                     Err(current) => head = current,
                 }
@@ -433,7 +602,7 @@ unsafe fn remote_free(heap: *mut Heap, page: *mut Page, node: *mut FreeNode) {
     }
 }
 
-/// Keep an empty page for reuse, or return it to the system.
+/// Keep an empty page for reuse, or return it to its segment.
 unsafe fn release_page(heap: *mut Heap, page: *mut Page) {
     unsafe {
         if (*heap).empty_count < EMPTY_PAGES_KEPT {
@@ -441,7 +610,7 @@ unsafe fn release_page(heap: *mut Heap, page: *mut Page) {
             (*heap).empty = page;
             (*heap).empty_count += 1;
         } else {
-            dealloc(page.cast(), PAGE_LAYOUT);
+            source().give(page);
         }
     }
 }
@@ -572,7 +741,9 @@ mod tests {
             assert_eq!(linked, 1);
             assert_eq!(empty, 2);
             // Freed pages are reused rather than requested again.
-            let again: Vec<*mut u8> = (0..n).map(|_| alloc_block(layout(64)).unwrap().as_ptr()).collect();
+            let again: Vec<*mut u8> = (0..n)
+                .map(|_| alloc_block(layout(64)).unwrap().as_ptr())
+                .collect();
             assert!(again.iter().all(|&p| pages.contains(&page_of(p))));
             for p in again {
                 unsafe { free_block(p) };
@@ -596,11 +767,17 @@ mod tests {
             // More than a page, so the first page is retired as full and must
             // come back through `rescued`.
             let n = PER_PAGE_64 + 5;
-            let blocks: Vec<*mut u8> = (0..n).map(|_| alloc_block(layout(64)).unwrap().as_ptr()).collect();
+            let blocks: Vec<*mut u8> = (0..n)
+                .map(|_| alloc_block(layout(64)).unwrap().as_ptr())
+                .collect();
             let pages: HashSet<usize> = blocks.iter().map(|&p| page_of(p)).collect();
-            to_remote.send(blocks.into_iter().map(SendPtr).collect()).unwrap();
+            to_remote
+                .send(blocks.into_iter().map(SendPtr).collect())
+                .unwrap();
             from_remote.recv().unwrap();
-            let again: Vec<*mut u8> = (0..n).map(|_| alloc_block(layout(64)).unwrap().as_ptr()).collect();
+            let again: Vec<*mut u8> = (0..n)
+                .map(|_| alloc_block(layout(64)).unwrap().as_ptr())
+                .collect();
             assert!(again.iter().all(|&p| pages.contains(&page_of(p))));
             for p in again {
                 unsafe { free_block(p) };
@@ -638,6 +815,39 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn allocates_after_heap_retired() {
+        // Thread-local destructors run in reverse registration order, so this
+        // one (registered before the pool's) runs after the heap is retired
+        // and must be served by the orphan heap.
+        struct Late;
+        impl Drop for Late {
+            fn drop(&mut self) {
+                let blocks: Vec<*mut u8> = (0..3)
+                    .map(|_| alloc_block(layout(32)).unwrap().as_ptr())
+                    .collect();
+                for p in blocks {
+                    unsafe { free_block(p) };
+                }
+            }
+        }
+        thread_local! {
+            static LATE: Late = const { Late };
+        }
+        thread::spawn(|| {
+            LATE.with(|_| {});
+            let p = alloc_block(layout(32)).unwrap().as_ptr();
+            unsafe { free_block(p) };
+        })
+        .join()
+        .unwrap();
+        // Directly, too: blocks from the orphan heap free through the remote path.
+        let p = orphan_alloc(class_of(layout(32)).unwrap())
+            .unwrap()
+            .as_ptr();
+        unsafe { free_block(p) };
     }
 
     #[test]

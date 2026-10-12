@@ -37,21 +37,22 @@ fn object_block_layout<A, B>() -> (std::alloc::Layout, usize, usize) {
 /// (its memory is `GcObjMem::Inline`, freed with the object even if that
 /// handle is dropped first).
 ///
-/// The block comes from this thread's pool (`crate::pool`) when it fits a
-/// size class, otherwise from the system allocator; the returned `GcObjMem`
-/// says which, for the `ObjectEntry` that frees it.
+/// The block comes from the per-thread pool (`crate::pool`) when it fits a
+/// size class, otherwise from the system allocator (see `alloc_sync_mem`).
 ///
 /// Returns `None` when the allocator fails.
 ///
 /// # Safety
 /// All three returned pointers are uninitialized and must be written before use.
 #[inline]
-#[allow(clippy::type_complexity)]
 unsafe fn alloc_object_block<A, B>()
--> Option<(*mut A, *mut B, *mut ObjectEntry, std::alloc::Layout, GcObjMem)> {
+-> Option<(*mut A, *mut B, *mut ObjectEntry, std::alloc::Layout)> {
     let (layout, off_b, off_e) = object_block_layout::<A, B>();
     // SAFETY: the layout is non-zero-sized (A holds a GcInfo) and well-formed.
-    let (p, mem) = unsafe { crate::gc::alloc_sync_mem(layout)? };
+    let p = unsafe { crate::gc::alloc_sync_mem(layout) };
+    if p.is_null() {
+        return None;
+    }
     // SAFETY: both offsets lie inside the block, from Layout::extend.
     unsafe {
         Some((
@@ -59,7 +60,6 @@ unsafe fn alloc_object_block<A, B>()
             p.add(off_b) as *mut B,
             p.add(off_e) as *mut ObjectEntry,
             layout,
-            mem,
         ))
     }
 }
@@ -877,7 +877,7 @@ impl GlobalGarbageCollector {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             // One allocation for the object, its first handle's tracer and
             // its ObjectEntry (see alloc_object_block).
-            let (gc_ptr, gc_inter_ptr, oe_ptr, block_layout, block_mem) =
+            let (gc_ptr, gc_inter_ptr, oe_ptr, block_layout) =
                 alloc_object_block::<GcPtr<T>, GcInternal<T>>().unwrap_or_else(|| {
                     std::alloc::handle_alloc_error(
                         object_block_layout::<GcPtr<T>, GcInternal<T>>().0,
@@ -894,7 +894,7 @@ impl GlobalGarbageCollector {
                 ObjectEntry {
                     ptr: gc_ptr as *const dyn Trace,
                     // Frees the whole block, entry and first tracer included.
-                    mem: block_mem,
+                    mem: GcObjMem::Mem,
                     layout: CompactLayout::from_layout(block_layout),
                     gen_survive_region: region.0 & 0xFFFF,
                     tracers: TracerList::new_inline(gc_inter_ptr as *const dyn Trace),
@@ -975,7 +975,7 @@ impl GlobalGarbageCollector {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             // One allocation for the object, its first handle's tracer and
             // its ObjectEntry (see alloc_object_block).
-            let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout, block_mem) =
+            let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout) =
                 alloc_object_block::<RefCell<GcPtr<T>>, GcCellInternal<T>>().unwrap_or_else(|| {
                     std::alloc::handle_alloc_error(
                         object_block_layout::<RefCell<GcPtr<T>>, GcCellInternal<T>>().0,
@@ -993,7 +993,7 @@ impl GlobalGarbageCollector {
                 ObjectEntry {
                     ptr: gc_ptr as *const dyn Trace,
                     // Frees the whole block, entry and first tracer included.
-                    mem: block_mem,
+                    mem: GcObjMem::Mem,
                     layout: CompactLayout::from_layout(block_layout),
                     gen_survive_region: region.0 & 0xFFFF,
                     tracers: TracerList::new_inline(gc_cell_inter_ptr as *const dyn Trace),
@@ -1080,7 +1080,7 @@ impl GlobalGarbageCollector {
             // collection on failure: the STW read lock is held here, and a
             // collection takes the write lock - the old retry could only
             // deadlock this thread.
-            let (gc_ptr, gc_inter_ptr, oe_ptr, block_layout, block_mem) =
+            let (gc_ptr, gc_inter_ptr, oe_ptr, block_layout) =
                 alloc_object_block::<GcPtr<T>, GcInternal<T>>().ok_or(crate::gc::GcAllocError)?;
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
@@ -1093,7 +1093,7 @@ impl GlobalGarbageCollector {
                 ObjectEntry {
                     ptr: gc_ptr as *const dyn Trace,
                     // Frees the whole block, entry and first tracer included.
-                    mem: block_mem,
+                    mem: GcObjMem::Mem,
                     layout: CompactLayout::from_layout(block_layout),
                     gen_survive_region: region.0 & 0xFFFF,
                     tracers: TracerList::new_inline(gc_inter_ptr as *const dyn Trace),
@@ -1143,7 +1143,7 @@ impl GlobalGarbageCollector {
             // collection on failure: the STW read lock is held here, and a
             // collection takes the write lock - the old retry could only
             // deadlock this thread.
-            let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout, block_mem) =
+            let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout) =
                 alloc_object_block::<RefCell<GcPtr<T>>, GcCellInternal<T>>()
                     .ok_or(crate::gc::GcAllocError)?;
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
@@ -1158,7 +1158,7 @@ impl GlobalGarbageCollector {
                 ObjectEntry {
                     ptr: gc_ptr as *const dyn Trace,
                     // Frees the whole block, entry and first tracer included.
-                    mem: block_mem,
+                    mem: GcObjMem::Mem,
                     layout: CompactLayout::from_layout(block_layout),
                     gen_survive_region: region.0 & 0xFFFF,
                     tracers: TracerList::new_inline(gc_cell_inter_ptr as *const dyn Trace),
