@@ -1090,6 +1090,38 @@ impl GcObjMem {
     }
 }
 
+/// Allocate memory for the sync collector: a block of the per-thread pool
+/// when the layout fits one of its size classes, the system allocator
+/// otherwise. Recorded as `GcObjMem::Mem`; [`free_sync_mem`] tells the two
+/// apart by the layout alone. Returns null if the allocator fails.
+///
+/// # Safety
+/// `layout` must be non-zero-sized.
+#[inline]
+pub(crate) unsafe fn alloc_sync_mem(layout: Layout) -> *mut u8 {
+    if crate::pool::serves(layout) {
+        return crate::pool::alloc_block(layout).map_or(std::ptr::null_mut(), |p| p.as_ptr());
+    }
+    // SAFETY: Caller guarantees a non-zero-sized layout.
+    unsafe { alloc(layout) }
+}
+
+/// Free memory from [`alloc_sync_mem`].
+///
+/// # Safety
+/// `ptr` must come from `alloc_sync_mem(layout)` with this same `layout`,
+/// and not have been freed already.
+#[inline]
+pub(crate) unsafe fn free_sync_mem(ptr: *mut u8, layout: Layout) {
+    if crate::pool::serves(layout) {
+        // SAFETY: a pool-served layout was allocated from the pool.
+        unsafe { crate::pool::free_block(ptr) };
+    } else {
+        // SAFETY: otherwise it came from the system allocator.
+        unsafe { dealloc(ptr, layout) };
+    }
+}
+
 /// Compact layout: size as u32, alignment as log2.
 /// Saves 8B vs std::alloc::Layout (8B vs 16B).
 #[derive(Clone, Copy)]
@@ -1928,7 +1960,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
         let mem_ptr = fat_ptr.get_thin_ptr() as *mut u8;
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
-        unsafe { mem.dealloc_mem(mem_ptr, layout) };
+        unsafe { Self::dealloc_gc_mem(mem_ptr, mem, layout) };
         // Free the ObjectEntry memory itself.
         // Only the sync (sharded) collector embeds entries; the constant gate
         // compiles the check out of the thread-local drop path.
@@ -2016,7 +2048,14 @@ impl<O: ObjectMap> GarbageCollector<O> {
     {
         let layout = Layout::new::<T>();
         // SAFETY: Layout is non-zero-sized and properly aligned for T; alloc returns a valid pointer or null.
-        let mem = unsafe { alloc(layout) };
+        let mem = unsafe {
+            if O::SHARDED {
+                // Sync handles' tracers come from the per-thread pool.
+                alloc_sync_mem(layout)
+            } else {
+                alloc(layout)
+            }
+        };
         if mem.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -2245,7 +2284,19 @@ impl<O: ObjectMap> GarbageCollector<O> {
     /// Deallocate tracer memory (GcInternal/GcCellInternal allocation).
     /// Used by sync.rs (global GC) only.
     unsafe fn dealloc_tracer_mem(ptr: *mut u8, mem: GcObjMem, layout: Layout) {
-        unsafe { mem.dealloc_mem(ptr, layout) };
+        unsafe { Self::dealloc_gc_mem(ptr, mem, layout) };
+    }
+
+    /// Release object or tracer memory. The sync collector's `GcObjMem::Mem`
+    /// came from [`alloc_sync_mem`] (possibly its pool); the constant gate
+    /// keeps the thread-local paths exactly `dealloc_mem`.
+    #[inline(always)]
+    unsafe fn dealloc_gc_mem(ptr: *mut u8, mem: GcObjMem, layout: Layout) {
+        if O::SHARDED && matches!(mem, GcObjMem::Mem) {
+            unsafe { free_sync_mem(ptr, layout) };
+        } else {
+            unsafe { mem.dealloc_mem(ptr, layout) };
+        }
     }
 
     /// Full collection (all generations). Backwards-compatible with existing callers.
@@ -3974,7 +4025,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
             for (ptr, mem, layout) in old_mems {
                 // SAFETY: Old allocation is no longer in use; objects have been relocated to the compact buffer.
-                mem.dealloc_mem(ptr, layout);
+                Self::dealloc_gc_mem(ptr, mem, layout);
             }
 
             num_objects
