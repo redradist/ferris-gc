@@ -2302,9 +2302,33 @@ mod tests {
         unsafe { (*GLOBAL_GC).collect() };
     }
 
+    /// Stops the basic strategy's background thread from collecting until
+    /// dropped, for tests that assert what one explicit collection frees (the
+    /// background collector could free the garbage first). Taking the write
+    /// lock also waits out a background collection already running.
+    struct PauseBackgroundCollector(Option<&'static super::GlobalGarbageCollector>);
+
+    impl PauseBackgroundCollector {
+        fn new() -> Self {
+            let mut gc = crate::basic_strategy::BASIC_STRATEGY_GLOBAL_GC
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            PauseBackgroundCollector(gc.take())
+        }
+    }
+
+    impl Drop for PauseBackgroundCollector {
+        fn drop(&mut self) {
+            *crate::basic_strategy::BASIC_STRATEGY_GLOBAL_GC
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = self.0;
+        }
+    }
+
     #[test]
     fn sync_cycle_collection_reports_tracers_collected() {
         let (_guard, _) = setup();
+        let _paused = PauseBackgroundCollector::new();
         {
             let a = Gc::new(SyncCyclicNode {
                 next: GcCell::new(None),
@@ -2456,6 +2480,7 @@ mod tests {
     #[test]
     fn sync_collect_region() {
         let (_guard, _) = setup();
+        let _paused = PauseBackgroundCollector::new();
         // Create cycle in a new region
         let region = (*GLOBAL_GC).new_region();
         {
