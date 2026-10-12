@@ -124,9 +124,18 @@ unsafe fn drop_handle(obj: *const u8, info: *const GcInfo) {
         // Read the id first: once the count is decremented, another thread
         // or a collection may free the object.
         let object_id = (*info).object_id;
-        if (*info).handle_count.fetch_sub(1, Ordering::Release) == 1 {
+        let count = &(*info).handle_count;
+        // The only handle (the Acquire pairs with other handles' Release
+        // decrements, so their uses of the value happen before the free): no
+        // clone can race, as it would need this handle, and a weak upgrade
+        // adds a handle only under the object's shard lock, which
+        // `release_object` re-checks. This skips the atomic decrement in the
+        // common single-handle case.
+        if count.load(Ordering::Acquire) == 1 {
+            GLOBAL_GC.core.release_object(object_id, Some(count));
+        } else if count.fetch_sub(1, Ordering::Release) == 1 {
             std::sync::atomic::fence(Ordering::Acquire);
-            GLOBAL_GC.core.release_object(object_id);
+            GLOBAL_GC.core.release_object(object_id, None);
         }
     }
 }
@@ -957,19 +966,20 @@ impl GlobalGarbageCollector {
         }
     }
 
-    /// Allocate `obj` with its `ObjectEntry` in one block and register it in
-    /// this thread's shard. Its header already counts the one handle the
-    /// caller is about to create. `None` if allocation failed (`obj` is
-    /// dropped).
+    /// Allocate an object built by `make` with its `ObjectEntry` in one block
+    /// and register it in this thread's shard. Its header already counts the
+    /// one handle the caller is about to create. `None` if allocation failed
+    /// (`make` is not called).
+    #[inline(always)]
     unsafe fn register_object<A: SyncObject>(
         &self,
-        obj: A,
+        make: impl FnOnce() -> A,
         region: crate::generation::RegionId,
     ) -> Option<*const A> {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (obj_ptr, oe_ptr, block_layout) = alloc_object_block::<A>()?;
-            std::ptr::write(obj_ptr, obj);
+            std::ptr::write(obj_ptr, make());
             let info = A::info_ptr(obj_ptr);
             let root_ref_count_offset =
                 ((&raw const (*info).root_ref_count) as usize - obj_ptr as usize) as u16;
@@ -1009,7 +1019,7 @@ impl GlobalGarbageCollector {
     where
         T: Sized + Trace,
     {
-        let ptr = unsafe { self.register_object(GcPtr::new(t), region) }
+        let ptr = unsafe { self.register_object(|| GcPtr::new(t), region) }
             .unwrap_or_else(|| std::alloc::handle_alloc_error(object_block_layout::<GcPtr<T>>().0));
         Gc { ptr }
     }
@@ -1018,9 +1028,10 @@ impl GlobalGarbageCollector {
     where
         T: Sized + Trace,
     {
-        let ptr = unsafe { self.register_object(GcCellBox::new(t), region) }.unwrap_or_else(|| {
-            std::alloc::handle_alloc_error(object_block_layout::<GcCellBox<T>>().0)
-        });
+        let ptr =
+            unsafe { self.register_object(|| GcCellBox::new(t), region) }.unwrap_or_else(|| {
+                std::alloc::handle_alloc_error(object_block_layout::<GcCellBox<T>>().0)
+            });
         GcCell { ptr }
     }
 
@@ -1035,7 +1046,7 @@ impl GlobalGarbageCollector {
     where
         T: Sized + Trace,
     {
-        let ptr = unsafe { self.register_object(GcPtr::new(t), region) }
+        let ptr = unsafe { self.register_object(|| GcPtr::new(t), region) }
             .ok_or(crate::gc::GcAllocError)?;
         Ok(Gc { ptr })
     }
@@ -1049,7 +1060,7 @@ impl GlobalGarbageCollector {
     where
         T: Sized + Trace,
     {
-        let ptr = unsafe { self.register_object(GcCellBox::new(t), region) }
+        let ptr = unsafe { self.register_object(|| GcCellBox::new(t), region) }
             .ok_or(crate::gc::GcAllocError)?;
         Ok(GcCell { ptr })
     }

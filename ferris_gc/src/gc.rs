@@ -4178,7 +4178,14 @@ impl GarbageCollector<SyncObjects> {
     ///
     /// Finding the object already gone is normal: a collection that ran
     /// after the count reached zero freed it as unreachable.
-    pub(crate) unsafe fn release_object(&self, object_id: ObjectId) {
+    ///
+    /// `unique` is the header count when the caller's handle is the only one
+    /// and was not decremented. With weak references present an upgrade may
+    /// have added a handle since; that is re-checked under the full lock
+    /// (upgrades hold the object's shard lock), and then the caller's handle
+    /// is just taken off the count. Without weak references nothing can add
+    /// one, so the count is left as it is - the object is freed.
+    pub(crate) unsafe fn release_object(&self, object_id: ObjectId, unique: Option<&AtomicU32>) {
         use crate::slot_map::SlotKey;
         let fast = self.with_shard_of(object_id, |shard| {
             // Re-check the weak hint *under* the shard lock: a weak ref is
@@ -4207,6 +4214,16 @@ impl GarbageCollector<SyncObjects> {
             Some(r) => r,
             None => {
                 let mut gc_maps = self.lock_gc_maps();
+                if let Some(count) = unique {
+                    if count
+                        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        // A weak upgrade added a handle: this one only leaves.
+                        count.fetch_sub(1, Ordering::Release);
+                        return;
+                    }
+                }
                 let r = Self::release_object_inner(&mut gc_maps, &self.card_table, object_id);
                 // Re-sync the hint while every shard is held, so a program that
                 // used weak refs only briefly returns to the fast path.
