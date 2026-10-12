@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::basic_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_strategy_start};
 use crate::gc::{
-    CompactLayout, Finalize, GarbageCollector, GcObjMem, ObjectEntry, ObjectEntryRef, SyncObjects,
-    Trace,
+    CompactLayout, Finalize, GarbageCollector, GcObjMem, ObjectEntry, ObjectEntryRef, SyncGcInfo,
+    SyncObjects, Trace,
 };
 use crate::slot_map::ObjectId;
 
@@ -39,7 +39,7 @@ fn object_block_layout<A>() -> (std::alloc::Layout, usize) {
 #[inline]
 unsafe fn alloc_object_block<A>() -> Option<(*mut A, *mut ObjectEntry, std::alloc::Layout)> {
     let (layout, off_e) = object_block_layout::<A>();
-    // SAFETY: the layout is non-zero-sized (A holds a GcInfo) and well-formed.
+    // SAFETY: the layout is non-zero-sized (A holds a SyncGcInfo) and well-formed.
     let p = unsafe { crate::gc::alloc_sync_mem(layout) };
     if p.is_null() {
         return None;
@@ -49,25 +49,25 @@ unsafe fn alloc_object_block<A>() -> Option<(*mut A, *mut ObjectEntry, std::allo
 }
 
 /// A sync collector object: `GcPtr<T>` or `GcCellBox<T>`, both headed by a
-/// `GcInfo`.
+/// `SyncGcInfo`.
 trait SyncObject: Trace + 'static {
     /// The header of the object at `this`.
     ///
     /// # Safety
     /// `this` must point at an initialized object.
-    unsafe fn info_ptr(this: *mut Self) -> *mut GcInfo;
+    unsafe fn info_ptr(this: *mut Self) -> *mut SyncGcInfo;
 }
 
 impl<T: 'static + Sized + Trace> SyncObject for GcPtr<T> {
     #[inline]
-    unsafe fn info_ptr(this: *mut Self) -> *mut GcInfo {
+    unsafe fn info_ptr(this: *mut Self) -> *mut SyncGcInfo {
         unsafe { &raw mut (*this).info }
     }
 }
 
 impl<T: 'static + Sized + Trace> SyncObject for GcCellBox<T> {
     #[inline]
-    unsafe fn info_ptr(this: *mut Self) -> *mut GcInfo {
+    unsafe fn info_ptr(this: *mut Self) -> *mut SyncGcInfo {
         unsafe { &raw mut (*this).info }
     }
 }
@@ -90,14 +90,11 @@ impl SyncRegionId {
     }
 }
 
-/// Every sync object starts with this header (see `crate::gc::SyncGcInfo`).
-use crate::gc::SyncGcInfo as GcInfo;
-
 /// Count one more handle to the object headed by `info`. Relaxed, as in
 /// `Arc::clone`: the new handle comes from one that already keeps the object
 /// alive. Aborts rather than let the count wrap.
 #[inline]
-fn add_handle(info: &GcInfo) {
+fn add_handle(info: &SyncGcInfo) {
     let old = info.handle_count.fetch_add(1, Ordering::Relaxed);
     if old > i32::MAX as u32 {
         std::process::abort();
@@ -111,7 +108,7 @@ fn add_handle(info: &GcInfo) {
 /// The handle being dropped must point at `obj`, and `info` must be its
 /// header.
 #[inline]
-unsafe fn drop_handle(obj: *const u8, info: *const GcInfo) {
+unsafe fn drop_handle(obj: *const u8, info: *const SyncGcInfo) {
     // During a sweep's destructor phase this handle may live inside a dead
     // object and point at another object of the same dead batch - even at
     // the object whose destructor is running. The collector owns those
@@ -149,7 +146,7 @@ unsafe fn drop_handle(obj: *const u8, info: *const GcInfo) {
 /// # Safety
 /// `obj` must be a live sync object headed by `info`.
 #[inline]
-unsafe fn cascade_handle(obj: &dyn Trace, info: &GcInfo) {
+unsafe fn cascade_handle(obj: &dyn Trace, info: &SyncGcInfo) {
     let visited = crate::gc::SYNC_CASCADE.get();
     if visited.is_null() {
         return;
@@ -177,7 +174,7 @@ pub struct GcPtr<T>
 where
     T: 'static + Sized + Trace,
 {
-    info: GcInfo,
+    info: SyncGcInfo,
     t: T,
 }
 
@@ -187,7 +184,7 @@ where
 {
     fn new(t: T) -> GcPtr<T> {
         GcPtr {
-            info: GcInfo::new(),
+            info: SyncGcInfo::new(),
             t,
         }
     }
@@ -267,7 +264,7 @@ pub(crate) struct GcCellBox<T>
 where
     T: 'static + Sized + Trace,
 {
-    info: GcInfo,
+    info: SyncGcInfo,
     lock: RwLock<()>,
     value: UnsafeCell<T>,
 }
@@ -278,7 +275,7 @@ where
 {
     fn new(t: T) -> GcCellBox<T> {
         GcCellBox {
-            info: GcInfo::new(),
+            info: SyncGcInfo::new(),
             lock: RwLock::new(()),
             value: UnsafeCell::new(t),
         }
@@ -2027,7 +2024,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_cycle_collection_reports_tracers_collected() {
+    fn sync_cycle_collection_reports_handles_collected() {
         let (_guard, _) = setup();
         let _paused = PauseBackgroundCollector::new();
         {
@@ -2056,9 +2053,9 @@ mod tests {
         // Regression: the sweep stopped counting (and freeing) the GcInternal
         // tracer allocations that dead cycle members hold on each other.
         assert!(
-            stats.tracers_collected >= 2,
+            stats.handles_collected >= 2,
             "cycle members' remaining handles must be counted (got {})",
-            stats.tracers_collected
+            stats.handles_collected
         );
     }
 

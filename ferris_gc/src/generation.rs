@@ -120,7 +120,11 @@ pub struct CollectionStats {
     pub objects_collected: usize,
     /// Number of surviving objects promoted to the next generation.
     pub objects_promoted: usize,
-    /// Number of tracer handles deallocated (pointing to collected objects).
+    /// Number of handles that died with the collected objects (handles the
+    /// dead objects held to each other, e.g. inside a dead cycle).
+    pub handles_collected: usize,
+    /// Old name of [`Self::handles_collected`]; always equal to it.
+    #[deprecated(since = "0.3.0", note = "renamed to `handles_collected`")]
     pub tracers_collected: usize,
     /// Total bytes reclaimed by this collection.
     pub bytes_freed: usize,
@@ -128,14 +132,43 @@ pub struct CollectionStats {
     pub duration: core::time::Duration,
 }
 
+impl CollectionStats {
+    /// Empty stats for a collection of generations up to `generation`.
+    #[allow(deprecated)]
+    pub(crate) fn new(generation: Generation) -> CollectionStats {
+        CollectionStats {
+            generation,
+            objects_scanned: 0,
+            objects_collected: 0,
+            objects_promoted: 0,
+            handles_collected: 0,
+            tracers_collected: 0,
+            bytes_freed: 0,
+            duration: core::time::Duration::ZERO,
+        }
+    }
+
+    /// Record the collection's duration, completing the stats (this also
+    /// fills the deprecated aliases).
+    #[allow(deprecated)]
+    pub(crate) fn finish(&mut self, duration: core::time::Duration) {
+        self.duration = duration;
+        self.tracers_collected = self.handles_collected;
+    }
+}
+
 /// Snapshot of GC diagnostics.
 #[derive(Debug, Clone)]
 pub struct GcStats {
-    /// Total bytes allocated for GC-managed objects (object data only, not tracers).
+    /// Total bytes allocated for GC-managed objects (object data and their
+    /// entries).
     pub heap_size: usize,
     /// Number of live GC-managed objects.
     pub live_objects: usize,
-    /// Number of live tracers (Gc/GcCell handles pointing to objects).
+    /// Number of live handles (`Gc`/`GcCell`) pointing to objects.
+    pub live_handles: usize,
+    /// Old name of [`Self::live_handles`]; always equal to it.
+    #[deprecated(since = "0.3.0", note = "renamed to `live_handles`")]
     pub live_tracers: usize,
     /// Number of objects per generation.
     pub gen0_objects: usize,
