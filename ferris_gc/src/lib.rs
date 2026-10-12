@@ -43,6 +43,8 @@ mod generation;
 #[cfg(feature = "std")]
 pub(crate) mod sharded_map;
 #[cfg(feature = "std")]
+pub(crate) mod pool;
+#[cfg(feature = "std")]
 pub(crate) mod slot_map;
 #[cfg(feature = "std")]
 mod threshold_strategy;

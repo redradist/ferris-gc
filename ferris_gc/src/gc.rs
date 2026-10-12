@@ -1059,6 +1059,8 @@ pub(crate) enum GcObjMem {
     /// Part of a combined allocation (e.g. initial tracer co-allocated with
     /// the object). No separate deallocation needed — freed with the object.
     Inline,
+    /// A block of the sync collector's per-thread pool (`crate::pool`).
+    Pool,
 }
 
 impl GcObjMem {
@@ -1086,8 +1088,28 @@ impl GcObjMem {
             GcObjMem::Inline => {
                 // No-op: inline allocations are freed with their parent object.
             }
+            GcObjMem::Pool => {
+                // SAFETY: Caller guarantees ptr is a live block from the pool.
+                unsafe { crate::pool::free_block(ptr) };
+            }
         }
     }
+}
+
+/// Allocate memory for the sync collector: a block of this thread's pool when
+/// the layout fits a size class, the system allocator otherwise. Returns
+/// `None` if the allocator fails.
+///
+/// # Safety
+/// `layout` must be non-zero-sized.
+#[inline]
+pub(crate) unsafe fn alloc_sync_mem(layout: Layout) -> Option<(*mut u8, GcObjMem)> {
+    if let Some(block) = crate::pool::alloc_block(layout) {
+        return Some((block.as_ptr(), GcObjMem::Pool));
+    }
+    // SAFETY: Caller guarantees a non-zero-sized layout.
+    let p = unsafe { alloc(layout) };
+    (!p.is_null()).then_some((p, GcObjMem::Mem))
 }
 
 /// Compact layout: size as u32, alignment as log2.
@@ -2015,6 +2037,14 @@ impl<O: ObjectMap> GarbageCollector<O> {
         T: Sized,
     {
         let layout = Layout::new::<T>();
+        if O::SHARDED {
+            // Sync handles' tracers come from the per-thread pool.
+            // SAFETY: tracer types are non-zero-sized.
+            return match unsafe { alloc_sync_mem(layout) } {
+                Some((mem, kind)) => (mem as *mut T, (kind, layout)),
+                None => std::alloc::handle_alloc_error(layout),
+            };
+        }
         // SAFETY: Layout is non-zero-sized and properly aligned for T; alloc returns a valid pointer or null.
         let mem = unsafe { alloc(layout) };
         if mem.is_null() {
