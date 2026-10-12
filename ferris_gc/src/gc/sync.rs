@@ -8,10 +8,58 @@ use std::time::Duration;
 
 use crate::basic_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_strategy_start};
 use crate::gc::{
-    CompactLayout, Finalize, GarbageCollector, ObjectEntry, ObjectEntryRef, SyncObjects, Trace,
-    TracerInfo, TracerList,
+    CompactLayout, Finalize, GarbageCollector, GcObjMem, ObjectEntry, ObjectEntryRef, SyncObjects,
+    Trace, TracerInfo, TracerList,
 };
 use crate::slot_map::{ObjectId, SlotKey};
+
+/// Byte offsets of the tracer and the `ObjectEntry` inside one sync object's
+/// block `[A (object) | B (first handle's tracer) | ObjectEntry]`.
+#[inline]
+fn object_block_layout<A, B>() -> (std::alloc::Layout, usize, usize) {
+    let (ab, off_b) = std::alloc::Layout::new::<A>()
+        .extend(std::alloc::Layout::new::<B>())
+        .expect("sync object block layout");
+    let (abe, off_e) = ab
+        .extend(std::alloc::Layout::new::<ObjectEntry>())
+        .expect("sync object block layout");
+    (abe.pad_to_align(), off_b, off_e)
+}
+
+/// One allocation for a new sync object, its first handle's tracer
+/// (`GcInternal` / `GcCellInternal`) and its `ObjectEntry`.
+///
+/// This used to be four mallocs - object, tracer, a boxed `ObjectEntry`, and a
+/// boxed `TracerInfo` for the tracer list - plus four frees. With the shared
+/// locks gone, the allocator was about half of the sync allocation cost. The
+/// block is freed in one `dealloc` when the object dies: the entry is marked
+/// `ENTRY_EMBEDDED`, and the first tracer is registered `TracerList::Inline`
+/// (its memory is `GcObjMem::Inline`, freed with the object even if that
+/// handle is dropped first).
+///
+/// Returns `None` when the system allocator fails.
+///
+/// # Safety
+/// All three returned pointers are uninitialized and must be written before use.
+#[inline]
+unsafe fn alloc_object_block<A, B>()
+-> Option<(*mut A, *mut B, *mut ObjectEntry, std::alloc::Layout)> {
+    let (layout, off_b, off_e) = object_block_layout::<A, B>();
+    // SAFETY: the layout is non-zero-sized (A holds a GcInfo) and well-formed.
+    let p = unsafe { std::alloc::alloc(layout) };
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: both offsets lie inside the block, from Layout::extend.
+    unsafe {
+        Some((
+            p as *mut A,
+            p.add(off_b) as *mut B,
+            p.add(off_e) as *mut ObjectEntry,
+            layout,
+        ))
+    }
+}
 
 /// Convenience alias for an optional thread-safe GC pointer.
 pub type OptGc<T> = Option<Gc<T>>;
@@ -824,29 +872,35 @@ impl GlobalGarbageCollector {
     {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<GcPtr<T>>();
-            let (gc_inter_ptr, mem_info_internal_ptr) = self.core.alloc_mem::<GcInternal<T>>();
+            // One allocation for the object, its first handle's tracer and
+            // its ObjectEntry (see alloc_object_block).
+            let (gc_ptr, gc_inter_ptr, oe_ptr, block_layout) =
+                alloc_object_block::<GcPtr<T>, GcInternal<T>>().unwrap_or_else(|| {
+                    std::alloc::handle_alloc_error(
+                        object_block_layout::<GcPtr<T>, GcInternal<T>>().0,
+                    )
+                });
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
                 as *const Cell<usize> as usize
                 - gc_ptr as usize) as u16;
-            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
-                ptr: gc_ptr as *const dyn Trace,
-                mem: mem_info_gc_ptr.0,
-                layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
-                gen_survive_region: region.0 & 0xFFFF,
-                tracers: TracerList::new(TracerInfo {
-                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                }),
-                handle_count: 0,
-                root_count: 0,
-                root_ref_count_offset,
-                entry_block: std::ptr::null_mut(),
-            }));
+            std::ptr::write(
+                oe_ptr,
+                ObjectEntry {
+                    ptr: gc_ptr as *const dyn Trace,
+                    // Frees the whole block, entry and first tracer included.
+                    mem: GcObjMem::Mem,
+                    layout: CompactLayout::from_layout(block_layout),
+                    gen_survive_region: region.0 & 0xFFFF,
+                    tracers: TracerList::new_inline(gc_inter_ptr as *const dyn Trace),
+                    handle_count: 0,
+                    root_count: 0,
+                    root_ref_count_offset,
+                    entry_block: crate::gc::ENTRY_EMBEDDED,
+                },
+            );
             // Shard-scoped registration: insert into this thread's own shard so
             // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
@@ -858,7 +912,7 @@ impl GlobalGarbageCollector {
                 std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
                 obj_id
             });
-            self.core.track_alloc(mem_info_gc_ptr.1.size());
+            self.core.track_alloc(block_layout.size());
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = Gc {
@@ -916,9 +970,14 @@ impl GlobalGarbageCollector {
     {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_ptr, mem_info_gc_ptr) = self.core.alloc_mem::<RefCell<GcPtr<T>>>();
-            let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                self.core.alloc_mem::<GcCellInternal<T>>();
+            // One allocation for the object, its first handle's tracer and
+            // its ObjectEntry (see alloc_object_block).
+            let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout) =
+                alloc_object_block::<RefCell<GcPtr<T>>, GcCellInternal<T>>().unwrap_or_else(|| {
+                    std::alloc::handle_alloc_error(
+                        object_block_layout::<RefCell<GcPtr<T>>, GcCellInternal<T>>().0,
+                    )
+                });
             // SAFETY: Pointer was just allocated via alloc_mem and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
@@ -926,21 +985,21 @@ impl GlobalGarbageCollector {
                 as *const AtomicUsize as *const Cell<usize>
                 as usize
                 - gc_ptr as usize) as u16;
-            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
-                ptr: gc_ptr as *const dyn Trace,
-                mem: mem_info_gc_ptr.0,
-                layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
-                gen_survive_region: region.0 & 0xFFFF,
-                tracers: TracerList::new(TracerInfo {
-                    tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                }),
-                handle_count: 0,
-                root_count: 0,
-                root_ref_count_offset,
-                entry_block: std::ptr::null_mut(),
-            }));
+            std::ptr::write(
+                oe_ptr,
+                ObjectEntry {
+                    ptr: gc_ptr as *const dyn Trace,
+                    // Frees the whole block, entry and first tracer included.
+                    mem: GcObjMem::Mem,
+                    layout: CompactLayout::from_layout(block_layout),
+                    gen_survive_region: region.0 & 0xFFFF,
+                    tracers: TracerList::new_inline(gc_cell_inter_ptr as *const dyn Trace),
+                    handle_count: 0,
+                    root_count: 0,
+                    root_ref_count_offset,
+                    entry_block: crate::gc::ENTRY_EMBEDDED,
+                },
+            );
             // Shard-scoped registration: insert into this thread's own shard so
             // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
@@ -952,7 +1011,7 @@ impl GlobalGarbageCollector {
                 std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
                 obj_id
             });
-            self.core.track_alloc(mem_info_gc_ptr.1.size());
+            self.core.track_alloc(block_layout.size());
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell {
@@ -1013,39 +1072,34 @@ impl GlobalGarbageCollector {
     {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_ptr, mem_info_gc_ptr) = self.core.try_alloc_mem_with_gc::<GcPtr<T>>()?;
-            let (gc_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem_with_gc::<GcInternal<T>>() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        mem_info_gc_ptr
-                            .0
-                            .dealloc_mem(gc_ptr as *mut u8, mem_info_gc_ptr.1);
-                        return Err(e);
-                    }
-                };
+            // One allocation for the object, its first handle's tracer and
+            // its ObjectEntry (see alloc_object_block). No emergency
+            // collection on failure: the STW read lock is held here, and a
+            // collection takes the write lock - the old retry could only
+            // deadlock this thread.
+            let (gc_ptr, gc_inter_ptr, oe_ptr, block_layout) =
+                alloc_object_block::<GcPtr<T>, GcInternal<T>>().ok_or(crate::gc::GcAllocError)?;
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for GcPtr<T>.
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const AtomicUsize
                 as *const Cell<usize> as usize
                 - gc_ptr as usize) as u16;
-            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
-                ptr: gc_ptr as *const dyn Trace,
-                mem: mem_info_gc_ptr.0,
-                layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
-                gen_survive_region: region.0 & 0xFFFF,
-                tracers: TracerList::new(TracerInfo {
-                    tracer_ptr: gc_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                }),
-                handle_count: 0,
-                root_count: 0,
-                root_ref_count_offset,
-                entry_block: std::ptr::null_mut(),
-            }));
+            std::ptr::write(
+                oe_ptr,
+                ObjectEntry {
+                    ptr: gc_ptr as *const dyn Trace,
+                    // Frees the whole block, entry and first tracer included.
+                    mem: GcObjMem::Mem,
+                    layout: CompactLayout::from_layout(block_layout),
+                    gen_survive_region: region.0 & 0xFFFF,
+                    tracers: TracerList::new_inline(gc_inter_ptr as *const dyn Trace),
+                    handle_count: 0,
+                    root_count: 0,
+                    root_ref_count_offset,
+                    entry_block: crate::gc::ENTRY_EMBEDDED,
+                },
+            );
             // Shard-scoped registration: insert into this thread's own shard so
             // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
@@ -1057,7 +1111,7 @@ impl GlobalGarbageCollector {
                 std::ptr::write(gc_inter_ptr, GcInternal::new(gc_ptr, obj_id));
                 obj_id
             });
-            self.core.track_alloc(mem_info_gc_ptr.1.size());
+            self.core.track_alloc(block_layout.size());
             self.core.note_new_object_during_marking(obj_id);
             let gc = Gc {
                 internal_ptr: gc_inter_ptr,
@@ -1081,19 +1135,14 @@ impl GlobalGarbageCollector {
     {
         unsafe {
             let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-            let (gc_ptr, mem_info_gc_ptr) =
-                self.core.try_alloc_mem_with_gc::<RefCell<GcPtr<T>>>()?;
-            let (gc_cell_inter_ptr, mem_info_internal_ptr) =
-                match self.core.try_alloc_mem_with_gc::<GcCellInternal<T>>() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // SAFETY: Memory was allocated with the same layout via try_alloc_mem_with_gc.
-                        mem_info_gc_ptr
-                            .0
-                            .dealloc_mem(gc_ptr as *mut u8, mem_info_gc_ptr.1);
-                        return Err(e);
-                    }
-                };
+            // One allocation for the object, its first handle's tracer and
+            // its ObjectEntry (see alloc_object_block). No emergency
+            // collection on failure: the STW read lock is held here, and a
+            // collection takes the write lock - the old retry could only
+            // deadlock this thread.
+            let (gc_ptr, gc_cell_inter_ptr, oe_ptr, block_layout) =
+                alloc_object_block::<RefCell<GcPtr<T>>, GcCellInternal<T>>()
+                    .ok_or(crate::gc::GcAllocError)?;
             // SAFETY: Pointer was just allocated via try_alloc_mem_with_gc and is properly aligned for RefCell<GcPtr<T>>.
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
@@ -1101,21 +1150,21 @@ impl GlobalGarbageCollector {
                 as *const AtomicUsize as *const Cell<usize>
                 as usize
                 - gc_ptr as usize) as u16;
-            let oe_ptr = Box::into_raw(Box::new(ObjectEntry {
-                ptr: gc_ptr as *const dyn Trace,
-                mem: mem_info_gc_ptr.0,
-                layout: CompactLayout::from_layout(mem_info_gc_ptr.1),
-                gen_survive_region: region.0 & 0xFFFF,
-                tracers: TracerList::new(TracerInfo {
-                    tracer_ptr: gc_cell_inter_ptr as *const dyn Trace,
-                    mem: mem_info_internal_ptr.0,
-                    layout: mem_info_internal_ptr.1,
-                }),
-                handle_count: 0,
-                root_count: 0,
-                root_ref_count_offset,
-                entry_block: std::ptr::null_mut(),
-            }));
+            std::ptr::write(
+                oe_ptr,
+                ObjectEntry {
+                    ptr: gc_ptr as *const dyn Trace,
+                    // Frees the whole block, entry and first tracer included.
+                    mem: GcObjMem::Mem,
+                    layout: CompactLayout::from_layout(block_layout),
+                    gen_survive_region: region.0 & 0xFFFF,
+                    tracers: TracerList::new_inline(gc_cell_inter_ptr as *const dyn Trace),
+                    handle_count: 0,
+                    root_count: 0,
+                    root_ref_count_offset,
+                    entry_block: crate::gc::ENTRY_EMBEDDED,
+                },
+            );
             // Shard-scoped registration: insert into this thread's own shard so
             // concurrent allocation does not serialize on one global lock.
             // ptr_to_object, region stats, and card table are populated lazily
@@ -1127,7 +1176,7 @@ impl GlobalGarbageCollector {
                 std::ptr::write(gc_cell_inter_ptr, GcCellInternal::new(gc_ptr, obj_id));
                 obj_id
             });
-            self.core.track_alloc(mem_info_gc_ptr.1.size());
+            self.core.track_alloc(block_layout.size());
             self.core.note_new_object_during_marking(obj_id);
             let gc = GcCell {
                 internal_ptr: gc_cell_inter_ptr,
@@ -1602,7 +1651,7 @@ lazy_static! {
 
 #[cfg(test)]
 mod tests {
-    use crate::gc::sync::{GLOBAL_GC, Gc};
+    use crate::gc::sync::{GLOBAL_GC, Gc, GcCell};
     use std::sync::Mutex;
 
     // Serialize sync GC tests since they share GLOBAL_GC.
@@ -2392,5 +2441,52 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             0
         );
+    }
+
+    // --- One block per object: [object | first tracer | ObjectEntry] ---
+
+    #[test]
+    fn first_handle_dropped_before_clone_keeps_object_block_alive() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let first = Gc::new(vec![1u64, 2, 3]);
+        let clone = first.clone();
+        // The first handle's tracer lives inside the object's block; dropping
+        // that handle must not free the block while the clone is alive.
+        drop(first);
+        assert_eq!(live_objects(), before + 1);
+        assert_eq!(***clone, vec![1, 2, 3]);
+        // Last handle gone: the whole block (object, both tracers' records,
+        // entry) is released.
+        drop(clone);
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn many_clones_dropped_in_mixed_order_free_the_block_once() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let a = Gc::new(7u64);
+        let clones: Vec<_> = (0..5).map(|_| a.clone()).collect();
+        drop(a);
+        for (i, c) in clones.into_iter().enumerate().rev() {
+            assert_eq!(**c, 7, "clone {i} must still read the live object");
+            drop(c);
+        }
+        assert_eq!(live_objects(), before);
+    }
+
+    #[test]
+    fn try_new_allocates_one_block() {
+        let (_guard, _baseline) = setup();
+        let before = live_objects();
+        let g = Gc::try_new(11u64).expect("allocation succeeds");
+        let c = GcCell::try_new(12u64).expect("allocation succeeds");
+        assert_eq!(**g, 11);
+        assert_eq!(**c.borrow(), 12);
+        assert_eq!(live_objects(), before + 2);
+        drop(g);
+        drop(c);
+        assert_eq!(live_objects(), before);
     }
 }
