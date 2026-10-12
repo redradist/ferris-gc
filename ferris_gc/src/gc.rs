@@ -49,6 +49,13 @@ thread_local! {
     /// - `ptr` (bit 0 clear)  → allocation-time cascade (only decrement if is_root)
     /// - `ptr | 1` (bit 0 set)→ collection cascade (always decrement root_count)
     pub(crate) static GC_MAPS_CTX: Cell<*mut CascadeVisited> = const { Cell::new(std::ptr::null_mut()) };
+
+    /// The global collector's root-discovery cascade buffer while that
+    /// collector discovers roots on this thread; null otherwise. Sync handles
+    /// act only on this (`sync::cascade_handle`), so a thread-local
+    /// collection that reaches a sync handle stored in a local object leaves
+    /// the sync object's counts alone.
+    pub(crate) static SYNC_CASCADE: Cell<*mut CascadeVisited> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Buffer of cascade guard cells set during root discovery (see
@@ -1162,16 +1169,15 @@ pub(crate) struct ObjectEntry {
     pub(crate) layout: CompactLayout,
     /// Packed generation (bits 31:30) + survive_count (bits 29:16, 14 bits) + region (bits 15:0).
     pub(crate) gen_survive_region: u32,
-    /// Tracer list: still used by sync.rs (global GC). Thread-local GC uses handle_count/root_count.
-    pub(crate) tracers: TracerList,
     /// Total number of live Gc<T>/GcCell<T> handles pointing to this object.
     /// RC hybrid: when handle_count reaches 0, the object is eagerly deallocated.
-    /// Used by thread-local GC; sync GC still uses tracers.
+    /// Thread-local GC only: sync handles count themselves atomically in the
+    /// object header (`SyncGcInfo::handle_count`).
     pub(crate) handle_count: u32,
     /// Number of handles that are currently roots (stack-owned, not yet reset by cascade).
     /// During collection: initialized to handle_count, then decremented by reset_root cascade.
     /// Objects with root_count > 0 after cascade are reachable from the stack.
-    /// Used by thread-local GC; sync GC still uses tracers.
+    /// Both collectors (the sync one copies it from `SyncGcInfo::root_count`).
     pub(crate) root_count: u32,
     /// Offset from the thin pointer to the object's `root_ref_count` Cell inside GcInfo.
     /// Allows inline mark-bit checks (is_traceable / clear_trace) without
@@ -1184,6 +1190,40 @@ pub(crate) struct ObjectEntry {
     /// allocation (the sync collector's single `[object | tracer | entry]`
     /// block): it is freed together with the object, never on its own.
     pub(crate) entry_block: *mut crate::tlab::TlabBlock,
+}
+
+/// Header at the start of every sync collector object (`sync::GcPtr<T>`,
+/// `sync::GcCellBox<T>`). `ObjectEntry::root_ref_count_offset` points at its
+/// first field, so the collector reaches it without knowing `T`.
+#[repr(C)]
+pub(crate) struct SyncGcInfo {
+    /// Mark bit and cascade visit guard, as in the thread-local `GcInfo`.
+    pub(crate) root_ref_count: AtomicUsize,
+    /// Live handles (`sync::Gc`, `sync::GcCell`). A clone adds one, a drop
+    /// subtracts one, and the drop that reaches zero frees the object - unless
+    /// a collection freed it first (dead cycle), which the drop then finds
+    /// gone from the object map.
+    pub(crate) handle_count: AtomicU32,
+    /// Collector only (root discovery, under the STW write lock): the handle
+    /// count minus the handles found inside scanned objects. Above zero, some
+    /// handle lives outside the heap - the object is a root.
+    pub(crate) root_count: AtomicU32,
+    /// The object's id. Written once at creation, under its shard's lock and
+    /// before any handle exists; never written again.
+    pub(crate) object_id: ObjectId,
+}
+
+impl SyncGcInfo {
+    #[inline]
+    pub(crate) fn new() -> SyncGcInfo {
+        SyncGcInfo {
+            root_ref_count: AtomicUsize::new(0),
+            handle_count: AtomicU32::new(1),
+            root_count: AtomicU32::new(0),
+            // Replaced by the real id before the object is published.
+            object_id: <ObjectId as crate::slot_map::SlotKey>::from_raw(u32::MAX, u32::MAX),
+        }
+    }
 }
 
 /// A pointer to an ObjectEntry allocated in the TLAB (or heap).
@@ -1251,6 +1291,17 @@ impl ObjectEntry {
         RegionId(self.gen_survive_region & 0xFFFF)
     }
 
+    /// The sync collector's object header. Only for entries of the global
+    /// (sharded) collector, whose objects all start their header with
+    /// `root_ref_count`.
+    /// SAFETY: The ObjectEntry's ptr must be valid.
+    #[inline]
+    pub(crate) unsafe fn sync_info(&self) -> &SyncGcInfo {
+        unsafe {
+            &*((self.ptr.get_thin_ptr() + self.root_ref_count_offset as usize) as *const SyncGcInfo)
+        }
+    }
+
     /// Get a reference to root_ref_count by deriving from the thin pointer + offset.
     /// SAFETY: The ObjectEntry's ptr must be valid.
     #[inline]
@@ -1275,164 +1326,6 @@ impl ObjectEntry {
                 - std::mem::offset_of!(GcInfo, root_ref_count)
                 + std::mem::offset_of!(GcInfo, root_count);
             &*((self.ptr.get_thin_ptr() + offset) as *const Cell<u32>)
-        }
-    }
-}
-
-// --- Tracer types: still used by sync.rs (global GC), not by thread-local GC. ---
-
-#[allow(dead_code)]
-pub(crate) struct TracerInfo {
-    pub(crate) tracer_ptr: *const dyn Trace,
-    pub(crate) mem: GcObjMem,
-    pub(crate) layout: Layout,
-}
-
-/// Inline-optimized tracer list: stores the first tracer pointer inline (16B),
-/// boxing full TracerInfo only for non-inline or clone tracers.
-#[allow(dead_code)]
-pub(crate) enum TracerList {
-    Inline(*const dyn Trace),
-    One(Box<TracerInfo>),
-    #[allow(clippy::box_collection)]
-    Many(Box<Vec<TracerInfo>>),
-    Empty,
-}
-
-#[allow(dead_code)]
-impl TracerList {
-    #[inline]
-    pub(crate) fn new(t: TracerInfo) -> Self {
-        TracerList::One(Box::new(t))
-    }
-
-    #[inline]
-    pub(crate) fn new_inline(ptr: *const dyn Trace) -> Self {
-        TracerList::Inline(ptr)
-    }
-
-    #[inline]
-    pub(crate) fn push(&mut self, t: TracerInfo) {
-        *self = match std::mem::replace(self, TracerList::Empty) {
-            TracerList::Inline(ptr) => {
-                let first = TracerInfo {
-                    tracer_ptr: ptr,
-                    mem: GcObjMem::Inline,
-                    layout: Layout::new::<()>(),
-                };
-                TracerList::Many(Box::new(vec![first, t]))
-            }
-            TracerList::One(first) => TracerList::Many(Box::new(vec![*first, t])),
-            TracerList::Many(mut v) => {
-                v.push(t);
-                TracerList::Many(v)
-            }
-            TracerList::Empty => TracerList::One(Box::new(t)),
-        };
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            TracerList::Inline(_) | TracerList::One(_) => 1,
-            TracerList::Many(v) => v.len(),
-            TracerList::Empty => 0,
-        }
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        matches!(self, TracerList::Empty)
-    }
-
-    #[inline]
-    pub(crate) fn for_each_tracer<F: FnMut(*const dyn Trace)>(&self, mut f: F) {
-        match self {
-            TracerList::Inline(ptr) => f(*ptr),
-            TracerList::One(t) => f(t.tracer_ptr),
-            TracerList::Many(v) => {
-                for t in v.iter() {
-                    f(t.tracer_ptr);
-                }
-            }
-            TracerList::Empty => {}
-        }
-    }
-
-    #[inline]
-    pub(crate) fn remove_by_ptr(&mut self, ptr: *const u8) -> Option<TracerInfo> {
-        match self {
-            TracerList::Inline(t) => {
-                if (*t as *const u8) == ptr {
-                    let t = *t;
-                    *self = TracerList::Empty;
-                    Some(TracerInfo {
-                        tracer_ptr: t,
-                        mem: GcObjMem::Inline,
-                        layout: Layout::new::<()>(),
-                    })
-                } else {
-                    None
-                }
-            }
-            TracerList::One(t) => {
-                if (t.tracer_ptr as *const u8) == ptr {
-                    if let TracerList::One(t) = std::mem::replace(self, TracerList::Empty) {
-                        Some(*t)
-                    } else {
-                        unreachable!()
-                    }
-                } else {
-                    None
-                }
-            }
-            TracerList::Many(v) => {
-                if let Some(pos) = v.iter().position(|t| (t.tracer_ptr as *const u8) == ptr) {
-                    let removed = v.swap_remove(pos);
-                    if v.len() == 1 {
-                        if let TracerList::Many(mut v) = std::mem::replace(self, TracerList::Empty)
-                        {
-                            let last = v.pop().unwrap();
-                            *self = TracerList::One(Box::new(last));
-                        }
-                    }
-                    Some(removed)
-                } else {
-                    None
-                }
-            }
-            TracerList::Empty => None,
-        }
-    }
-
-    pub(crate) fn drain(&mut self) -> TracerDrain {
-        match std::mem::replace(self, TracerList::Empty) {
-            TracerList::Inline(ptr) => TracerDrain::One(Some(TracerInfo {
-                tracer_ptr: ptr,
-                mem: GcObjMem::Inline,
-                layout: Layout::new::<()>(),
-            })),
-            TracerList::One(t) => TracerDrain::One(Some(*t)),
-            TracerList::Many(v) => TracerDrain::Many(v.into_iter()),
-            TracerList::Empty => TracerDrain::One(None),
-        }
-    }
-}
-
-/// Iterator returned by TracerList::drain().
-#[allow(dead_code)]
-pub(crate) enum TracerDrain {
-    One(Option<TracerInfo>),
-    Many(std::vec::IntoIter<TracerInfo>),
-}
-
-impl Iterator for TracerDrain {
-    type Item = TracerInfo;
-    fn next(&mut self) -> Option<TracerInfo> {
-        match self {
-            TracerDrain::One(opt) => opt.take(),
-            TracerDrain::Many(it) => it.next(),
         }
     }
 }
@@ -1744,7 +1637,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 cascade_visited: Vec::new(),
             }),
             gc_maps_lock: Mutex::new(()),
-            shard_locks: (0..shards.clamp(1, crate::sharded_map::MAX_SHARDS))
+            shard_locks: (0..crate::sharded_map::shard_count_for(shards))
                 .map(|_| crate::sharded_map::CachePadded(Mutex::new(())))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -1861,7 +1754,14 @@ impl<O: ObjectMap> GarbageCollector<O> {
             live_tracers: gc_maps
                 .objects
                 .values()
-                .map(|e| e.handle_count as usize)
+                .map(|e| {
+                    if O::SHARDED {
+                        // SAFETY: registered objects are valid while the maps are locked.
+                        unsafe { e.sync_info().handle_count.load(Ordering::Relaxed) as usize }
+                    } else {
+                        e.handle_count as usize
+                    }
+                })
                 .sum::<usize>(),
             gen0_objects: gen0,
             gen1_objects: gen1,
@@ -1962,23 +1862,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
         let mem = unsafe { std::ptr::read(&(*oe_ptr).mem) };
         let entry_block = unsafe { (*oe_ptr).entry_block };
 
-        // Free tracer allocations still registered on the entry (sync GC:
-        // dead cycle members keep each other's GcInternal tracers, whose
-        // handle Drops were lookup-miss no-ops during the drop phase — nobody
-        // else frees them). drain() also drops the TracerList's own heap
-        // storage (Many variant). Runs in the free phase, strictly after ALL
-        // destructors, so no handle can still read its GcInternal.
-        // Thread-local objects always have an empty list — this is a no-op.
-        for tracer in unsafe { (*oe_ptr).tracers.drain() } {
-            unsafe {
-                Self::dealloc_tracer_mem(
-                    tracer.tracer_ptr.get_thin_ptr() as *mut u8,
-                    tracer.mem,
-                    tracer.layout,
-                )
-            };
-        }
-
         let mem_ptr = fat_ptr.get_thin_ptr() as *mut u8;
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
         unsafe { Self::dealloc_gc_mem(mem_ptr, mem, layout) };
@@ -2069,14 +1952,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
     {
         let layout = Layout::new::<T>();
         // SAFETY: Layout is non-zero-sized and properly aligned for T; alloc returns a valid pointer or null.
-        let mem = unsafe {
-            if O::SHARDED {
-                // Sync handles' tracers come from the per-thread pool.
-                alloc_sync_mem(layout)
-            } else {
-                alloc(layout)
-            }
-        };
+        let mem = unsafe { alloc(layout) };
         if mem.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -2247,68 +2123,27 @@ impl<O: ObjectMap> GarbageCollector<O> {
         None
     }
 
-    // --- Tracer-based removal: used by sync.rs (global GC) only. ---
-
-    #[inline]
-    fn remove_tracer_inner(
+    /// Full-lock variant of `release_object` (weak references present).
+    fn release_object_inner(
         gc_maps: &mut GcMaps<O>,
         card_table: &CardTable,
         object_id: ObjectId,
-        tracer_ptr: *const u8,
-    ) -> (Option<(*mut u8, GcObjMem, Layout)>, Option<ObjectEntryRef>) {
-        let mut tracer_dealloc = None;
-        let mut object_dealloc = None;
-
-        if let Some(obj_entry) = gc_maps.objects.get_mut(object_id) {
-            if let Some(removed) = obj_entry.tracers.remove_by_ptr(tracer_ptr) {
-                tracer_dealloc = Some((
-                    removed.tracer_ptr.get_thin_ptr() as *mut u8,
-                    removed.mem,
-                    removed.layout,
-                ));
-
-                if obj_entry.tracers.is_empty() {
-                    let obj_gen = obj_entry.generation();
-                    let obj_entry = unsafe { gc_maps.objects.remove_unchecked(object_id) };
-                    if obj_gen != Generation::Gen0 {
-                        let thin = obj_entry.ptr.get_thin_ptr();
-                        card_table.remove_object(thin, object_id);
-                    }
-                    if !gc_maps.weak_alive_map.is_empty() {
-                        if let Some(alive) = gc_maps.weak_alive_map.remove(&object_id) {
-                            alive.store(false, Ordering::Release);
-                        }
-                    }
-                    object_dealloc = Some(obj_entry);
-                }
+    ) -> Option<ObjectEntryRef> {
+        let obj_gen = gc_maps.objects.get(object_id)?.generation();
+        // SAFETY: `object_id` was just found occupied.
+        let entry = unsafe { gc_maps.objects.remove_unchecked(object_id) };
+        if obj_gen != Generation::Gen0 {
+            card_table.remove_object(entry.ptr.get_thin_ptr(), object_id);
+        }
+        if !gc_maps.weak_alive_map.is_empty() {
+            if let Some(alive) = gc_maps.weak_alive_map.remove(&object_id) {
+                alive.store(false, Ordering::Release);
             }
         }
-
-        (tracer_dealloc, object_dealloc)
+        Some(entry)
     }
 
-    #[inline]
-    fn finalize_remove_tracer(
-        &self,
-        tracer_dealloc: Option<(*mut u8, GcObjMem, Layout)>,
-        object_dealloc: Option<ObjectEntryRef>,
-    ) {
-        if let Some((ptr, mem, layout)) = tracer_dealloc {
-            unsafe { Self::dealloc_tracer_mem(ptr, mem, layout) };
-        }
-        if let Some(obj_entry) = object_dealloc {
-            self.track_dealloc(obj_entry.layout.size());
-            unsafe { Self::dealloc_object_entry(obj_entry) };
-        }
-    }
-
-    /// Deallocate tracer memory (GcInternal/GcCellInternal allocation).
-    /// Used by sync.rs (global GC) only.
-    unsafe fn dealloc_tracer_mem(ptr: *mut u8, mem: GcObjMem, layout: Layout) {
-        unsafe { Self::dealloc_gc_mem(ptr, mem, layout) };
-    }
-
-    /// Release object or tracer memory. The sync collector's `GcObjMem::Mem`
+    /// Release object memory. The sync collector's `GcObjMem::Mem`
     /// came from [`alloc_sync_mem`] (possibly its pool); the constant gate
     /// keeps the thread-local paths exactly `dealloc_mem`.
     #[inline(always)]
@@ -2349,6 +2184,59 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
+    /// Handles a dead object still holds when a collection frees it (for
+    /// `CollectionStats::tracers_collected`): sync handles live inside other
+    /// dead objects and are counted in the header.
+    #[inline(always)]
+    unsafe fn handles_held(entry: &ObjectEntry) -> usize {
+        if O::SHARDED {
+            unsafe { entry.sync_info().handle_count.load(Ordering::Relaxed) as usize }
+        } else {
+            // Thread-local handles die with their owner before the object
+            // can be unreachable.
+            0
+        }
+    }
+
+    /// Root discovery, phase 1, for one object: its root count starts at its
+    /// number of handles, and its cascade guard is cleared. Thread-local
+    /// handles are counted in the entry; sync handles in the object header.
+    #[inline(always)]
+    unsafe fn init_root_count(entry: &mut ObjectEntry) {
+        unsafe {
+            if O::SHARDED {
+                let info = entry.sync_info();
+                let hc = info.handle_count.load(Ordering::Acquire);
+                info.root_count.store(hc, Ordering::Relaxed);
+                entry.root_count = hc;
+            } else {
+                let hc = entry.handle_count;
+                if hc > 0 {
+                    entry.gc_info_root_count().set(hc);
+                }
+                entry.root_count = hc;
+            }
+            entry.root_ref_count().set(0);
+        }
+    }
+
+    /// Root discovery, phase 3, for one object: take back the root count the
+    /// cascade left in the header (handles minus those found inside scanned
+    /// objects) and clear the cascade guard.
+    #[inline(always)]
+    unsafe fn finish_root_count(entry: &mut ObjectEntry) {
+        unsafe {
+            if O::SHARDED {
+                entry.root_count = entry.sync_info().root_count.load(Ordering::Relaxed);
+            } else if entry.handle_count > 0 {
+                entry.root_count = entry.gc_info_root_count().get();
+            } else {
+                entry.root_count = 0;
+            }
+            entry.root_ref_count().set(0);
+        }
+    }
+
     /// Root discovery: given gc_maps (as raw pointer), initialize root_count = handle_count
     /// for in-scope objects, then cascade reset_root through the object graph to decrement
     /// root_count for internal references. After this, objects with root_count > 0 are
@@ -2379,47 +2267,20 @@ impl<O: ObjectMap> GarbageCollector<O> {
             match scope {
                 None => {
                     for (_id, entry) in (*gc_maps_raw).objects.iter_mut() {
-                        let hc = if entry.handle_count > 0 {
-                            entry.handle_count
-                        } else {
-                            entry.tracers.len() as u32
-                        };
-                        if entry.handle_count > 0 {
-                            entry.gc_info_root_count().set(hc);
-                        }
-                        entry.root_count = hc;
-                        entry.root_ref_count().set(0);
+                        Self::init_root_count(entry);
                     }
                 }
                 Some(_max_gen) if use_gen0_ids => {
                     for &obj_id in &(*gc_maps_raw).gen0_ids {
                         if let Some(entry) = (*gc_maps_raw).objects.get_mut(obj_id) {
-                            let hc = if entry.handle_count > 0 {
-                                entry.handle_count
-                            } else {
-                                entry.tracers.len() as u32
-                            };
-                            if entry.handle_count > 0 {
-                                entry.gc_info_root_count().set(hc);
-                            }
-                            entry.root_count = hc;
-                            entry.root_ref_count().set(0);
+                            Self::init_root_count(entry);
                         }
                     }
                 }
                 Some(max_gen) => {
                     for (_id, entry) in (*gc_maps_raw).objects.iter_mut() {
                         if entry.generation() <= max_gen {
-                            let hc = if entry.handle_count > 0 {
-                                entry.handle_count
-                            } else {
-                                entry.tracers.len() as u32
-                            };
-                            if entry.handle_count > 0 {
-                                entry.gc_info_root_count().set(hc);
-                            }
-                            entry.root_count = hc;
-                            entry.root_ref_count().set(0);
+                            Self::init_root_count(entry);
                         }
                     }
                 }
@@ -2442,6 +2303,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
             GC_MAPS_CTX.set(gc_ctx_tag_collecting(
                 &raw mut (*gc_maps_raw).cascade_visited,
             ));
+            if O::SHARDED {
+                SYNC_CASCADE.set(&raw mut (*gc_maps_raw).cascade_visited);
+            }
             match scope {
                 None => {
                     for entry in (*gc_maps_raw).objects.values() {
@@ -2471,59 +2335,27 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
             }
             GC_MAPS_CTX.set(std::ptr::null_mut());
+            SYNC_CASCADE.set(std::ptr::null_mut());
 
             // Phase 3: Sync root_count from GcInfo back + re-count sync roots + clear cycle guards.
             // Combined into one pass to avoid 3 extra iterations.
             match scope {
                 None => {
                     for (_id, entry) in (*gc_maps_raw).objects.iter_mut() {
-                        if entry.handle_count > 0 {
-                            entry.root_count = entry.gc_info_root_count().get();
-                        } else {
-                            let mut roots = 0u32;
-                            entry.tracers.for_each_tracer(|t| {
-                                if (&*t).is_root() {
-                                    roots += 1;
-                                }
-                            });
-                            entry.root_count = roots;
-                        }
-                        entry.root_ref_count().set(0);
+                        Self::finish_root_count(entry);
                     }
                 }
                 Some(_max_gen) if use_gen0_ids => {
                     for &obj_id in &(*gc_maps_raw).gen0_ids {
                         if let Some(entry) = (*gc_maps_raw).objects.get_mut(obj_id) {
-                            if entry.handle_count > 0 {
-                                entry.root_count = entry.gc_info_root_count().get();
-                            } else {
-                                let mut roots = 0u32;
-                                entry.tracers.for_each_tracer(|t| {
-                                    if (&*t).is_root() {
-                                        roots += 1;
-                                    }
-                                });
-                                entry.root_count = roots;
-                            }
-                            entry.root_ref_count().set(0);
+                            Self::finish_root_count(entry);
                         }
                     }
                 }
                 Some(max_gen) => {
                     for (_id, entry) in (*gc_maps_raw).objects.iter_mut() {
                         if entry.generation() <= max_gen {
-                            if entry.handle_count > 0 {
-                                entry.root_count = entry.gc_info_root_count().get();
-                            } else {
-                                let mut roots = 0u32;
-                                entry.tracers.for_each_tracer(|t| {
-                                    if (&*t).is_root() {
-                                        roots += 1;
-                                    }
-                                });
-                                entry.root_count = roots;
-                            }
-                            entry.root_ref_count().set(0);
+                            Self::finish_root_count(entry);
                         }
                     }
                 }
@@ -2747,7 +2579,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        stats.tracers_collected += entry.tracers.len();
+                        stats.tracers_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -2898,7 +2730,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        stats.tracers_collected += entry.tracers.len();
+                        stats.tracers_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -3069,7 +2901,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        stats.tracers_collected += entry.tracers.len();
+                        stats.tracers_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -3348,7 +3180,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        stats.tracers_collected += entry.tracers.len();
+                        stats.tracers_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -3729,7 +3561,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         gc_maps.ptr_to_object.remove(&thin);
                         self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
-                        stats.tracers_collected += entry.tracers.len();
+                        stats.tracers_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
                             alive.store(false, Ordering::Release);
                         }
@@ -3874,7 +3706,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                             gc_maps.ptr_to_object.remove(&thin);
                             self.card_table.remove_object(thin, *obj_id);
                             stats.bytes_freed += entry.layout.size();
-                            stats.tracers_collected += entry.tracers.len();
+                            stats.tracers_collected += Self::handles_held(&entry);
                             if let Some(alive) = gc_maps.weak_alive_map.remove(obj_id) {
                                 alive.store(false, Ordering::Release);
                             }
@@ -4149,10 +3981,21 @@ impl GarbageCollector<SyncObjects> {
         f(map)
     }
 
-    /// RC-hybrid drop of one tracer (handle). Takes only the object's shard
-    /// lock in the common case. Keeping this on the full-map lock made
-    /// concurrent workloads ~18x slower once that lock had to take every shard.
-    pub(crate) unsafe fn remove_tracer(&self, object_id: ObjectId, tracer_ptr: *const u8) {
+    /// Free an object whose last handle was just dropped (the header's
+    /// handle count reached zero). Takes only the object's shard lock in the
+    /// common case; keeping this on the full-map lock made concurrent
+    /// workloads ~18x slower once that lock had to take every shard.
+    ///
+    /// Finding the object already gone is normal: a collection that ran
+    /// after the count reached zero freed it as unreachable.
+    ///
+    /// `unique` is the header count when the caller's handle is the only one
+    /// and was not decremented. With weak references present an upgrade may
+    /// have added a handle since; that is re-checked under the full lock
+    /// (upgrades hold the object's shard lock), and then the caller's handle
+    /// is just taken off the count. Without weak references nothing can add
+    /// one, so the count is left as it is - the object is freed.
+    pub(crate) unsafe fn release_object(&self, object_id: ObjectId, unique: Option<&AtomicU32>) {
         use crate::slot_map::SlotKey;
         let fast = self.with_shard_of(object_id, |shard| {
             // Re-check the weak hint *under* the shard lock: a weak ref is
@@ -4164,40 +4007,34 @@ impl GarbageCollector<SyncObjects> {
                 return None;
             }
             let key = object_id.strip_shard();
-            let mut tracer_dealloc = None;
-            let mut object_dealloc = None;
-            if let Some(obj_entry) = shard.get_mut(key) {
-                if let Some(removed) = obj_entry.tracers.remove_by_ptr(tracer_ptr) {
-                    tracer_dealloc = Some((
-                        removed.tracer_ptr.get_thin_ptr() as *mut u8,
-                        removed.mem,
-                        removed.layout,
-                    ));
-                    if obj_entry.tracers.is_empty() {
-                        let obj_gen = obj_entry.generation();
-                        // SAFETY: `key` was just found occupied in this shard.
-                        let obj_entry = unsafe { shard.remove_unchecked(key) };
-                        if obj_gen != Generation::Gen0 {
-                            // CardTable synchronizes itself.
-                            self.card_table
-                                .remove_object(obj_entry.ptr.get_thin_ptr(), object_id);
-                        }
-                        object_dealloc = Some(obj_entry);
-                    }
-                }
+            let Some(entry) = shard.get(key) else {
+                return Some(None);
+            };
+            let obj_gen = entry.generation();
+            // SAFETY: `key` was just found occupied in this shard.
+            let entry = unsafe { shard.remove_unchecked(key) };
+            if obj_gen != Generation::Gen0 {
+                // CardTable synchronizes itself.
+                self.card_table
+                    .remove_object(entry.ptr.get_thin_ptr(), object_id);
             }
-            Some((tracer_dealloc, object_dealloc))
+            Some(Some(entry))
         });
-        let (tracer_dealloc, object_dealloc) = match fast {
+        let released = match fast {
             Some(r) => r,
             None => {
                 let mut gc_maps = self.lock_gc_maps();
-                let r = Self::remove_tracer_inner(
-                    &mut gc_maps,
-                    &self.card_table,
-                    object_id,
-                    tracer_ptr,
-                );
+                if let Some(count) = unique {
+                    if count
+                        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        // A weak upgrade added a handle: this one only leaves.
+                        count.fetch_sub(1, Ordering::Release);
+                        return;
+                    }
+                }
+                let r = Self::release_object_inner(&mut gc_maps, &self.card_table, object_id);
                 // Re-sync the hint while every shard is held, so a program that
                 // used weak refs only briefly returns to the fast path.
                 self.weak_alive_len
@@ -4205,7 +4042,10 @@ impl GarbageCollector<SyncObjects> {
                 r
             }
         };
-        Self::finalize_remove_tracer(self, tracer_dealloc, object_dealloc);
+        if let Some(entry) = released {
+            self.track_dealloc(entry.layout.size());
+            unsafe { Self::dealloc_object_entry(entry) };
+        }
     }
 }
 
@@ -4557,7 +4397,6 @@ impl LocalGarbageCollector {
                     mem: obj_mem,
                     layout: CompactLayout::from_layout(obj_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
@@ -4650,7 +4489,6 @@ impl LocalGarbageCollector {
                     mem: obj_mem,
                     layout: CompactLayout::from_layout(obj_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
@@ -4744,7 +4582,6 @@ impl LocalGarbageCollector {
                     mem: obj_mem,
                     layout: CompactLayout::from_layout(obj_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
@@ -4821,7 +4658,6 @@ impl LocalGarbageCollector {
                     mem: obj_mem,
                     layout: CompactLayout::from_layout(obj_layout),
                     gen_survive_region: region.0 & 0xFFFF,
-                    tracers: TracerList::Empty,
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
