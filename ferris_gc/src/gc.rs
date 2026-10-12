@@ -1930,7 +1930,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
         // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
         unsafe { mem.dealloc_mem(mem_ptr, layout) };
         // Free the ObjectEntry memory itself.
-        if entry_block == ENTRY_EMBEDDED {
+        // Only the sync (sharded) collector embeds entries; the constant gate
+        // compiles the check out of the thread-local drop path.
+        if O::SHARDED && entry_block == ENTRY_EMBEDDED {
             // Lives inside the object's own block, which `dealloc_mem` above
             // just freed; every field was read before that.
         } else if !entry_block.is_null() {
