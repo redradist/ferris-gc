@@ -31,32 +31,29 @@ pub use local::*;
 pub(crate) use maps::*;
 pub use trace::*;
 
-thread_local! {
-    /// Tagged context pointer for reset_root cascade.
-    ///
-    /// Encodes *both* a pointer to the active collector's `cascade_visited`
-    /// buffer and the collecting flag in a single thread-local, eliminating one
-    /// TLS read per node in the cascade hot path. It points at the buffer, not at
-    /// `GcMaps`, because that buffer is the only state the cascade touches - so
-    /// the context does not depend on which object-map type a collector uses.
-    ///
-    /// Encoding (bit 0 of the pointer, which is always free due to alignment):
-    /// - `null`               → no cascade context
-    /// - `ptr` (bit 0 clear)  → allocation-time cascade (only decrement if is_root)
-    /// - `ptr | 1` (bit 0 set)→ collection cascade (always decrement root_count)
-    pub(crate) static GC_MAPS_CTX: Cell<*mut CascadeVisited> = const { Cell::new(std::ptr::null_mut()) };
-
-    /// The global collector's root-discovery cascade buffer while that
-    /// collector discovers roots on this thread; null otherwise. Sync handles
-    /// act only on this (`sync::cascade_handle`), so a thread-local
-    /// collection that reaches a sync handle stored in a local object leaves
-    /// the sync object's counts alone.
-    pub(crate) static SYNC_CASCADE: Cell<*mut CascadeVisited> = const { Cell::new(std::ptr::null_mut()) };
+/// What a thread-local handle's `reset_root` does on this thread.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CascadeMode {
+    /// No cascade: `reset_root` does nothing.
+    Off,
+    /// A handle was just created: clear the root flag of the handles stored
+    /// inside its object (they are not roots).
+    Allocation,
+    /// Root discovery: take each handle inside a walked object off its
+    /// target's root count, and walk the target once (see `CASCADE_PENDING`).
+    Collecting,
 }
 
-/// Buffer of cascade guard cells set during root discovery (see
-/// `GcMaps::cascade_visited`).
-pub(crate) type CascadeVisited = Vec<*const Cell<usize>>;
+thread_local! {
+    /// The cascade the thread-local handles' `reset_root` runs, if any.
+    pub(crate) static CASCADE_MODE: Cell<CascadeMode> = const { Cell::new(CascadeMode::Off) };
+
+    /// Whether the global collector is discovering roots on this thread.
+    /// Sync handles cascade only then (`sync::cascade_handle`), so a
+    /// thread-local collection that reaches a sync handle stored in a local
+    /// object leaves the sync object's counts alone.
+    pub(crate) static SYNC_CASCADE: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Cascade guard (`root_ref_count`) of an object in the collection's scope
 /// that root discovery has not walked yet. Discovery phase 1 sets the
@@ -70,25 +67,6 @@ pub(crate) type CascadeVisited = Vec<*const Cell<usize>>;
 /// edge made before the older object was promoted, which no card records)
 /// would be freed while still reachable.
 pub(crate) const CASCADE_PENDING: usize = usize::MAX;
-
-/// Tag a cascade-context pointer as "collecting" by setting bit 0.
-#[inline(always)]
-fn gc_ctx_tag_collecting(ptr: *mut CascadeVisited) -> *mut CascadeVisited {
-    (ptr as usize | 1) as *mut CascadeVisited
-}
-
-/// Extract the raw GcMaps pointer (strip tag bit).
-#[inline(always)]
-#[allow(dead_code)]
-fn gc_ctx_ptr(tagged: *mut CascadeVisited) -> *mut CascadeVisited {
-    (tagged as usize & !1usize) as *mut CascadeVisited
-}
-
-/// Check if the tagged pointer indicates collection mode.
-#[inline(always)]
-fn gc_ctx_is_collecting(tagged: *mut CascadeVisited) -> bool {
-    (tagged as usize & 1) != 0
-}
 
 /// Error returned when a GC allocation fails due to memory exhaustion.
 #[derive(Debug, Clone, Copy)]
@@ -202,7 +180,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 ptr_to_object: FxHashMap::default(),
                 weak_alive_map: FxHashMap::default(),
                 gen0_ids: Vec::new(),
-                cascade_visited: Vec::new(),
                 garbage_possible: 0,
             }),
             gc_maps_lock: Mutex::new(()),
@@ -827,7 +804,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
     /// root_count for internal references. After this, objects with root_count > 0 are
     /// reachable from the stack (roots).
     ///
-    /// Sets GC_COLLECTING=true so Gc::reset_root() always decrements (ignoring is_root).
+    /// Sets `CASCADE_MODE` to `Collecting` so `Gc::reset_root()` always decrements (ignoring is_root).
     /// Uses root_ref_count as a cycle guard to prevent infinite recursion.
     ///
     /// `scope`: determines which objects are in scope.
@@ -871,13 +848,10 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
             }
 
-            // Phase 2: Cascade reset_root through the object graph.
-            // Tagged pointer with bit 0 set → collection mode (always decrement LocalGcInfo.root_count).
-            // root_ref_count serves as cycle guard (0=unvisited, 1=visited).
-            // Discard stale entries from a cascade that unwound mid-way (e.g.
-            // a panicking user Trace impl): those pointers may reference
-            // since-freed objects and must never be dereferenced.
-            (*gc_maps_raw).cascade_visited.clear();
+            // Phase 2: Cascade reset_root through the object graph, in
+            // collection mode (always decrement the root count).
+            // root_ref_count is the cycle guard (CASCADE_PENDING = not walked
+            // yet, 1 = walked).
 
             // Each object's fields must be walked EXACTLY once: the guard is
             // checked-and-set here (outer loop) and in the cascade (handle
@@ -885,11 +859,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
             // this loop and by a cascade edge had its outgoing edges
             // decremented twice — a rooted self-referencing object (or a
             // rooted cycle) lost its stack-root status and was swept alive.
-            GC_MAPS_CTX.set(gc_ctx_tag_collecting(
-                &raw mut (*gc_maps_raw).cascade_visited,
-            ));
+            CASCADE_MODE.set(CascadeMode::Collecting);
             if O::SHARDED {
-                SYNC_CASCADE.set(&raw mut (*gc_maps_raw).cascade_visited);
+                SYNC_CASCADE.set(true);
             }
             match scope {
                 None => {
@@ -921,8 +893,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
             }
-            GC_MAPS_CTX.set(std::ptr::null_mut());
-            SYNC_CASCADE.set(std::ptr::null_mut());
+            CASCADE_MODE.set(CascadeMode::Off);
+            SYNC_CASCADE.set(false);
 
             // Phase 3: Sync root_count from LocalGcInfo back + re-count sync roots + clear cycle guards.
             // Combined into one pass to avoid 3 extra iterations.
@@ -946,14 +918,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         }
                     }
                 }
-            }
-
-            // Clear the cascade guards it recorded. The cascade walks only
-            // objects in scope (CASCADE_PENDING), whose guards phase 3 above
-            // already cleared, so this is a second pass over the same cells
-            // (see GcMaps::cascade_visited).
-            for cell in (*gc_maps_raw).cascade_visited.drain(..) {
-                (*cell).set(0);
             }
         }
     }

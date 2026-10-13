@@ -411,13 +411,13 @@ where
 
     #[inline(always)]
     fn reset_root(&self) {
-        let tagged = GC_MAPS_CTX.get();
-        if tagged.is_null() {
+        let mode = CASCADE_MODE.get();
+        if mode == CascadeMode::Off {
             return;
         }
         unsafe {
             let gc_ptr = &*self.gc_ptr();
-            if gc_ctx_is_collecting(tagged) {
+            if mode == CascadeMode::Collecting {
                 // Collection mode: decrement LocalGcInfo.root_count directly (no SlotMap lookup).
                 // root_ref_count as cycle guard: walk only objects in the
                 // collection's scope not walked yet (see CASCADE_PENDING).
@@ -425,8 +425,6 @@ where
                 gc_ptr.info.root_count.set(rc.saturating_sub(1));
                 if gc_ptr.info.root_ref_count.get() == CASCADE_PENDING {
                     gc_ptr.info.root_ref_count.set(1);
-                    // Record the visit (see GcMaps::cascade_visited).
-                    (*gc_ctx_ptr(tagged)).push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
                     gc_ptr.reset_root();
                 }
             } else if self.is_root_flag() {
@@ -686,8 +684,8 @@ where
 
     #[inline(always)]
     fn reset_root(&self) {
-        let tagged = GC_MAPS_CTX.get();
-        if tagged.is_null() {
+        let mode = CASCADE_MODE.get();
+        if mode == CascadeMode::Off {
             return;
         }
         unsafe {
@@ -701,14 +699,12 @@ where
                 return;
             };
             let gc_ptr: &GcPtr<T> = &borrow;
-            if gc_ctx_is_collecting(tagged) {
+            if mode == CascadeMode::Collecting {
                 let rc = gc_ptr.info.root_count.get();
                 gc_ptr.info.root_count.set(rc.saturating_sub(1));
                 // Walk only in-scope objects not walked yet (CASCADE_PENDING).
                 if gc_ptr.info.root_ref_count.get() == CASCADE_PENDING {
                     gc_ptr.info.root_ref_count.set(1);
-                    // Record the visit (see GcMaps::cascade_visited).
-                    (*gc_ctx_ptr(tagged)).push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
                     gc_ptr.t.reset_root();
                 }
             } else if self.is_root_flag() {
@@ -1248,10 +1244,9 @@ impl LocalGarbageCollector {
 
             let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
-            let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
+            CASCADE_MODE.set(CascadeMode::Allocation);
             (*gc_ptr).reset_root();
-            GC_MAPS_CTX.set(std::ptr::null_mut());
+            CASCADE_MODE.set(CascadeMode::Off);
             self.core.allocation_count.add(1);
             gc
         }
@@ -1270,10 +1265,9 @@ impl LocalGarbageCollector {
                 entry.root_count += 1;
             }
             let new_gc = Gc::from_parts(gc_ptr, true);
-            let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
+            CASCADE_MODE.set(CascadeMode::Allocation);
             (*gc_ptr).reset_root();
-            GC_MAPS_CTX.set(std::ptr::null_mut());
+            CASCADE_MODE.set(CascadeMode::Off);
             new_gc
         }
     }
@@ -1339,10 +1333,9 @@ impl LocalGarbageCollector {
 
             let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
-            let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
+            CASCADE_MODE.set(CascadeMode::Allocation);
             (*gc_ptr).reset_root();
-            GC_MAPS_CTX.set(std::ptr::null_mut());
+            CASCADE_MODE.set(CascadeMode::Off);
             self.core.allocation_count.add(1);
             gc
         }
@@ -1361,10 +1354,9 @@ impl LocalGarbageCollector {
                 entry.root_count += 1;
             }
             let new_gc = GcCell::from_parts(refcell_ptr, true);
-            let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
+            CASCADE_MODE.set(CascadeMode::Allocation);
             (*refcell_ptr).reset_root();
-            GC_MAPS_CTX.set(std::ptr::null_mut());
+            CASCADE_MODE.set(CascadeMode::Off);
             new_gc
         }
     }
@@ -1431,10 +1423,9 @@ impl LocalGarbageCollector {
 
             let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
-            let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
+            CASCADE_MODE.set(CascadeMode::Allocation);
             (*gc_ptr).reset_root();
-            GC_MAPS_CTX.set(std::ptr::null_mut());
+            CASCADE_MODE.set(CascadeMode::Off);
             self.core.allocation_count.add(1);
             Ok(gc)
         }
@@ -1506,10 +1497,9 @@ impl LocalGarbageCollector {
 
             let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
-            let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
+            CASCADE_MODE.set(CascadeMode::Allocation);
             (*gc_ptr).reset_root();
-            GC_MAPS_CTX.set(std::ptr::null_mut());
+            CASCADE_MODE.set(CascadeMode::Off);
             self.core.allocation_count.add(1);
             Ok(gc)
         }
@@ -1528,10 +1518,9 @@ impl LocalGarbageCollector {
                 entry.root_count += 1;
             }
             let gc = Gc::from_parts(weak.ptr, true);
-            let gc_maps_raw = gc_maps as *mut GcMaps;
-            GC_MAPS_CTX.set(&raw mut (*gc_maps_raw).cascade_visited);
+            CASCADE_MODE.set(CascadeMode::Allocation);
             (*weak.ptr).reset_root();
-            GC_MAPS_CTX.set(std::ptr::null_mut());
+            CASCADE_MODE.set(CascadeMode::Off);
             gc
         }
     }
