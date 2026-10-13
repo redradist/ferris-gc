@@ -2398,23 +2398,13 @@ impl Finalize for CellNode {
 fn no_garbage_while_flag_clear_under_random_mutation() {
     // Random graph mutation (edges, moves, drops, cycles) with the
     // allocation trigger firing often and collections of every scope (so
-    // each bit gets cleared alone). Whenever a scope's bit says no garbage
-    // is possible, a collection of that scope must indeed free nothing.
-    //
-    // Promotion is off: with it, mutation plus partial collections can
-    // currently free a live young object that an object promoted while it
-    // still pointed at it reaches (no card records that edge), which is a
-    // separate bug.
-    use crate::generation::{Generation, PromotionConfig};
+    // survivors are promoted, and each bit gets cleared alone). Whenever a
+    // scope's bit says no garbage is possible, a collection of that scope
+    // must indeed free nothing. Any live object freed by a partial
+    // collection (see CASCADE_PENDING) shows up as a use-after-free.
+    use crate::generation::Generation;
     clean_gc_state();
-    LOCAL_GC.with(|gc| {
-        let g = gc.borrow();
-        g.core.alloc_threshold.store(8, Ordering::Relaxed);
-        g.core.set_promotion_config(PromotionConfig {
-            gen0_threshold: u32::MAX,
-            gen1_threshold: u32::MAX,
-        });
-    });
+    LOCAL_GC.with(|gc| gc.borrow().core.alloc_threshold.store(8, Ordering::Relaxed));
     let node = || {
         GcCell::new(CellNode {
             children: Vec::new(),
@@ -2484,4 +2474,42 @@ fn no_garbage_while_flag_clear_under_random_mutation() {
     for r in &roots {
         r.borrow_mut().children.clear();
     }
+}
+
+#[test]
+fn partial_collection_keeps_young_object_reached_only_from_promoted_one() {
+    // Regression: X gets an edge to Y while both are in Gen0 (the write
+    // barrier marks no card), then X is promoted and Y is not. A Gen0
+    // collection whose root-discovery cascade reached X through a dead Gen0
+    // cycle Z subtracted X's handle to Y; X itself is out of scope and its
+    // card clean, so nothing traced it, and Y was freed while X still
+    // pointed at it.
+    use crate::generation::Generation;
+    clean_gc_state();
+    let gen0 =
+        || LOCAL_GC.with(|gc| unsafe { gc.borrow().core.collect_generation(Generation::Gen0) });
+    let node = || {
+        GcCell::new(CellNode {
+            children: Vec::new(),
+        })
+    };
+
+    let x = node();
+    gen0();
+    gen0();
+    let y = node();
+    x.borrow_mut().children.push(y.clone());
+    drop(y);
+    // X's third survival promotes it; Y has survived once.
+    assert_eq!(gen0().objects_promoted, 1);
+
+    let z = node();
+    let (z_self, z_to_x) = (z.clone(), x.clone());
+    z.borrow_mut().children.extend([z_self, z_to_x]);
+    drop(z);
+
+    let stats = gen0();
+    assert_eq!(stats.objects_collected, 1, "only the dead cycle is freed");
+    assert_eq!(x.borrow().children.len(), 1);
+    assert!(x.borrow().children[0].borrow().children.is_empty());
 }

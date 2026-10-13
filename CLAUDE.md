@@ -80,6 +80,7 @@ Raw allocations use TLAB bump allocation (thread-local arena blocks) with system
 - **RC-hybrid deallocation:** Objects freed immediately when their last handle is dropped (no waiting for GC cycle). GC only handles cyclic references.
 - **Skipping futile collections (thread-local):** Unreachable objects that still have handles can only appear when a handle is dropped while its object keeps others. `GcMaps::garbage_possible` has one bit per collection scope. Such a drop sets every bit, and a collection clears its scope's bits when it starts. The allocation triggers skip a collection whose bit is clear, grow the threshold as if it had freed nothing, and trim `gen0_ids`.
 - **Generational collection:** Gen0/Gen1/Gen2 with adaptive threshold scaling (GOGC-style: threshold proportional to live set size when <5% garbage collected).
+- **Root discovery in partial collections:** phase 1 marks the objects in scope with `CASCADE_PENDING`, and the cascade walks only those. Handles inside older objects therefore stay counted, and every young object an older one points at is a root. Cards are not needed for correctness here, so the write barrier only saves marking work.
 - **gen0_ids:** Fast Vec of Gen0 ObjectIds for O(Gen0) partial collections, with heuristic fallback to full iteration when stale entries exceed live objects.
 
 ### Procedural Macros (`ferris_gc_proc_macro`)
@@ -122,6 +123,7 @@ Release profile uses `lto = "thin"` for cross-crate devirtualization.
 
 ## Known Issues
 
+- A sync Gen0 collection scans no objects: only the thread-local collector keeps `gen0_ids`, so `use_gen0_ids` walks an empty list. Sync Gen1/Gen2 collections iterate every object and work.
 - `compact()` / `_compact()` is currently **disabled** — always returns 0 without moving objects (asserted by `compact_is_disabled_returns_zero`). Re-enabling requires a `relocate()` cascade through all Trace impls (derive macro + default_trace) plus pinning of rooted objects, since stack handles cannot be discovered after the GcInternal elimination.
 - Some sync tests are flaky due to shared global GC state (test ordering sensitive). Run individual tests with `cargo test -- <test_name>` if a sync test fails in batch.
 - `tree_bench` with `--strategy=adaptive` may collect live objects during build phase (node count mismatch). Use default `basic` strategy.

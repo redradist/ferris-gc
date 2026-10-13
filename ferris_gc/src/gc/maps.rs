@@ -105,13 +105,11 @@ pub(crate) struct GcMaps<O: ObjectMap = LocalObjects> {
     /// Fast Gen0 object list for O(Gen0) partial collections.
     /// Avoids iterating all objects during Gen0 mark/sweep.
     pub(crate) gen0_ids: Vec<ObjectId>,
-    /// Guard cells set by the phase-2 root-discovery cascade, cleared in
-    /// phase 3. Tracked explicitly because a partial (Gen0/Gen1) cascade can
-    /// cross into out-of-scope old-generation objects that the per-scope
-    /// clearing passes never touch — and `root_ref_count` doubles as the mark
-    /// bit during trace, so a leaked guard makes the mark phase skip the
-    /// object's children and sweep live objects. Buffer is reused across
-    /// collections.
+    /// Guard cells set by the phase-2 root-discovery cascade, cleared after
+    /// phase 3; the cascade context points at it. The cascade walks only
+    /// objects in the collection's scope (see `CASCADE_PENDING`), whose
+    /// guards phase 3 clears anyway, so the recorded cells are cleared
+    /// twice. Buffer is reused across collections.
     pub(crate) cascade_visited: CascadeVisited,
     /// Which collections could free anything (thread-local collector): bit
     /// `g` is set if a collection of generations `0..=g` could.

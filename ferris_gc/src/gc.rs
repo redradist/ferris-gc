@@ -58,6 +58,19 @@ thread_local! {
 /// `GcMaps::cascade_visited`).
 pub(crate) type CascadeVisited = Vec<*const Cell<usize>>;
 
+/// Cascade guard (`root_ref_count`) of an object in the collection's scope
+/// that root discovery has not walked yet. Discovery phase 1 sets the
+/// objects in scope to this value, and the cascade walks only objects
+/// holding it (setting 1). Objects outside the scope hold 0, or a mark count
+/// an earlier partial collection's trace left on them - never this value,
+/// which no count reaches. So the cascade never walks an object outside the
+/// scope: the handles inside older objects stay counted, and the young
+/// objects they reach stay roots. Walking them would subtract those handles,
+/// and a young object reachable only from an untraced older one (e.g. an
+/// edge made before the older object was promoted, which no card records)
+/// would be freed while still reachable.
+pub(crate) const CASCADE_PENDING: usize = usize::MAX;
+
 /// Tag a cascade-context pointer as "collecting" by setting bit 0.
 #[inline(always)]
 fn gc_ctx_tag_collecting(ptr: *mut CascadeVisited) -> *mut CascadeVisited {
@@ -770,7 +783,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
     }
 
     /// Root discovery, phase 1, for one object: its root count starts at its
-    /// number of handles, and its cascade guard is cleared. Thread-local
+    /// number of handles, and its cascade guard marks it in scope and not yet
+    /// walked (`CASCADE_PENDING`). Thread-local
     /// handles are counted in the entry; sync handles in the object header.
     #[inline(always)]
     unsafe fn init_root_count(entry: &mut ObjectEntry) {
@@ -787,7 +801,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
                 entry.root_count = hc;
             }
-            entry.root_ref_count().set(0);
+            entry.root_ref_count().set(CASCADE_PENDING);
         }
     }
 
@@ -880,7 +894,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
             match scope {
                 None => {
                     for entry in (*gc_maps_raw).objects.values() {
-                        if entry.root_ref_count().get() == 0 {
+                        if entry.root_ref_count().get() == CASCADE_PENDING {
                             entry.root_ref_count().set(1);
                             (&*entry.ptr).reset_root();
                         }
@@ -889,7 +903,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 Some(_max_gen) if use_gen0_ids => {
                     for &obj_id in &(*gc_maps_raw).gen0_ids {
                         if let Some(entry) = (*gc_maps_raw).objects.get(obj_id) {
-                            if entry.root_ref_count().get() == 0 {
+                            if entry.root_ref_count().get() == CASCADE_PENDING {
                                 entry.root_ref_count().set(1);
                                 (&*entry.ptr).reset_root();
                             }
@@ -898,7 +912,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
                 Some(max_gen) => {
                     for (_id, entry) in (*gc_maps_raw).objects.iter() {
-                        if entry.generation() <= max_gen && entry.root_ref_count().get() == 0 {
+                        if entry.generation() <= max_gen
+                            && entry.root_ref_count().get() == CASCADE_PENDING
+                        {
                             entry.root_ref_count().set(1);
                             (&*entry.ptr).reset_root();
                         }
@@ -932,12 +948,10 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
             }
 
-            // Clear cascade guards on every object the cascade visited —
-            // including out-of-scope Gen1/Gen2 objects the per-scope passes
-            // above never touch. root_ref_count doubles as the mark bit in
-            // the trace phase, so a leaked guard would make the mark phase
-            // treat the object as already marked, skip its children, and
-            // sweep live young objects reachable only through it.
+            // Clear the cascade guards it recorded. The cascade walks only
+            // objects in scope (CASCADE_PENDING), whose guards phase 3 above
+            // already cleared, so this is a second pass over the same cells
+            // (see GcMaps::cascade_visited).
             for cell in (*gc_maps_raw).cascade_visited.drain(..) {
                 (*cell).set(0);
             }
