@@ -2002,12 +2002,11 @@ mod tests {
 
     #[test]
     fn sync_partial_collection_keeps_young_object_reached_only_from_promoted_one() {
-        // As the thread-local test of the same name, one generation up (a
-        // sync Gen0 collection scans no objects: only the thread-local
-        // collector keeps `gen0_ids`). X gets an edge to Y while both are in
-        // Gen0 (no card); Gen1 collections then promote X to Gen2 while Y
-        // only reaches Gen1, and a Gen1 collection reaches X through a dead
-        // cycle Z. Y must survive: X still points at it.
+        // As the thread-local test of the same name, one generation up. X
+        // gets an edge to Y while both are in Gen0 (no card); Gen1
+        // collections then promote X to Gen2 while Y only reaches Gen1, and
+        // a Gen1 collection reaches X through a dead cycle Z. Y must
+        // survive: X still points at it.
         use crate::generation::Generation;
         let (_guard, _) = setup();
         let _paused = PauseBackgroundCollector::new();
@@ -2045,6 +2044,32 @@ mod tests {
         );
         assert_eq!(x.children.borrow().len(), 1);
         assert!(x.children.borrow()[0].children.borrow().is_empty());
+    }
+
+    #[test]
+    fn sync_gen0_collection_frees_new_dead_cycle() {
+        // A Gen0 collection must see objects allocated since the last
+        // wider collection: the thread-local `gen0_ids` list is never
+        // filled by sync allocations.
+        use crate::generation::Generation;
+        let (_guard, _) = setup();
+        let _paused = PauseBackgroundCollector::new();
+        WATCHED_DROPPED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let a = Gc::new(SyncVecNode {
+            children: GcCell::new(Vec::new()),
+            watched: true,
+        });
+        let a_self = a.clone();
+        a.children.borrow_mut().push(a_self);
+        drop(a);
+
+        let stats = unsafe { (*GLOBAL_GC).core.collect_generation(Generation::Gen0) };
+        assert!(
+            WATCHED_DROPPED.load(std::sync::atomic::Ordering::SeqCst),
+            "the dead cycle survived a Gen0 collection (scanned {}, freed {})",
+            stats.objects_scanned,
+            stats.objects_collected
+        );
     }
 
     #[test]

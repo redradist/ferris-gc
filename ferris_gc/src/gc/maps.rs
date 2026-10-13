@@ -103,7 +103,9 @@ pub(crate) struct GcMaps<O: ObjectMap = LocalObjects> {
     /// out of ObjectEntry saves 8B per object on the hot path.
     pub(crate) weak_alive_map: FxHashMap<ObjectId, Arc<AtomicBool>>,
     /// Fast Gen0 object list for O(Gen0) partial collections.
-    /// Avoids iterating all objects during Gen0 mark/sweep.
+    /// Avoids iterating all objects during Gen0 mark/sweep. Thread-local
+    /// collector only: sync allocations cannot append to it (see
+    /// `collect_generation`), so it stays empty there.
     pub(crate) gen0_ids: Vec<ObjectId>,
     /// Guard cells set by the phase-2 root-discovery cascade, cleared after
     /// phase 3; the cascade context points at it. The cascade walks only
