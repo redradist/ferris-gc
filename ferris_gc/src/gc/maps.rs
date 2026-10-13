@@ -107,12 +107,6 @@ pub(crate) struct GcMaps<O: ObjectMap = LocalObjects> {
     /// collector only: sync allocations cannot append to it (see
     /// `collect_generation`), so it stays empty there.
     pub(crate) gen0_ids: Vec<ObjectId>,
-    /// Guard cells set by the phase-2 root-discovery cascade, cleared after
-    /// phase 3; the cascade context points at it. The cascade walks only
-    /// objects in the collection's scope (see `CASCADE_PENDING`), whose
-    /// guards phase 3 clears anyway, so the recorded cells are cleared
-    /// twice. Buffer is reused across collections.
-    pub(crate) cascade_visited: CascadeVisited,
     /// Which collections could free anything (thread-local collector): bit
     /// `g` is set if a collection of generations `0..=g` could.
     ///

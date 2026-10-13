@@ -1,7 +1,7 @@
 use crate::sharded_map::Counter;
 use std::cell::{Cell, UnsafeCell};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -147,8 +147,7 @@ unsafe fn drop_handle(obj: *const u8, info: *const SyncGcInfo) {
 /// `obj` must be a live sync object headed by `info`.
 #[inline]
 unsafe fn cascade_handle(obj: &dyn Trace, info: &SyncGcInfo) {
-    let visited = crate::gc::SYNC_CASCADE.get();
-    if visited.is_null() {
+    if !crate::gc::SYNC_CASCADE.get() {
         return;
     }
     let rc = info.root_count.load(Ordering::Relaxed);
@@ -158,10 +157,6 @@ unsafe fn cascade_handle(obj: &dyn Trace, info: &SyncGcInfo) {
     // collection's scope not walked yet (see CASCADE_PENDING).
     if info.root_ref_count.load(Ordering::Relaxed) == crate::gc::CASCADE_PENDING {
         info.root_ref_count.store(1, Ordering::Relaxed);
-        // Record the visit (see GcMaps::cascade_visited).
-        unsafe {
-            (*visited).push(&info.root_ref_count as *const AtomicUsize as *const Cell<usize>);
-        }
         obj.reset_root();
     }
 }
