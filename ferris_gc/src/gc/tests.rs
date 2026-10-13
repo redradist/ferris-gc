@@ -2211,3 +2211,277 @@ fn tlab_try_new_allocation() {
         gc.borrow_mut().collect();
     });
 }
+
+// --- Allocation trigger skips collections that cannot free anything ---
+
+/// Whether a collection of generations `0..=max_gen` could free anything.
+fn garbage_possible(max_gen: crate::generation::Generation) -> bool {
+    LOCAL_GC.with(|gc| {
+        // SAFETY: thread-local collector, no collection in progress.
+        unsafe { gc.borrow().core.gc_maps_unsync().garbage_possible(max_gen) }
+    })
+}
+
+/// Collections so far, and whether a Gen0 collection could free anything.
+fn trigger_state() -> (usize, bool) {
+    let total = LOCAL_GC.with(|gc| gc.borrow().stats().total_collections);
+    (total, garbage_possible(crate::generation::Generation::Gen0))
+}
+
+fn self_cycle() -> Gc<CyclicNode> {
+    let a = Gc::new(CyclicNode {
+        next: std::cell::RefCell::new(None),
+    });
+    *a.next.borrow_mut() = Some(a.clone());
+    a
+}
+
+#[test]
+fn allocation_trigger_skips_collection_without_garbage() {
+    clean_gc_state();
+    LOCAL_GC.with(|gc| {
+        gc.borrow()
+            .core
+            .alloc_threshold
+            .store(16, Ordering::Relaxed)
+    });
+    let (before, possible) = trigger_state();
+    assert!(!possible, "a collection leaves no garbage behind");
+
+    // Objects kept, moved into other objects, or freed by their last
+    // handle's drop never make garbage: every trigger is skipped.
+    let mut kept = Vec::new();
+    for i in 0..20 {
+        kept.push(Gc::new(i));
+    }
+    let mut chain = Gc::new(CyclicNode {
+        next: std::cell::RefCell::new(None),
+    });
+    for _ in 0..50 {
+        chain = Gc::new(CyclicNode {
+            next: std::cell::RefCell::new(Some(chain)),
+        });
+    }
+    for i in 0..1000 {
+        drop(Gc::new(i));
+    }
+    let (after, possible) = trigger_state();
+    assert!(!possible);
+    assert_eq!(after, before, "no collection could free anything");
+
+    // Skipped triggers still trim the ids of objects freed by their last
+    // handle's drop, which collections otherwise compact: at most twice the
+    // (here constant) objects after the last trigger, plus one id per
+    // allocation since.
+    LOCAL_GC.with(|gc| {
+        let g = gc.borrow();
+        let since_trigger = g.core.allocation_count.load(Ordering::Relaxed);
+        // SAFETY: thread-local collector, no collection in progress.
+        let maps = unsafe { g.core.gc_maps_unsync() };
+        assert!(
+            maps.gen0_ids.len() <= 2 * maps.objects.len() + since_trigger,
+            "gen0_ids grew to {} for {} objects",
+            maps.gen0_ids.len(),
+            maps.objects.len()
+        );
+    });
+    drop(kept);
+    drop(chain);
+}
+
+#[test]
+fn allocation_trigger_collects_cycle_after_handle_drop() {
+    clean_gc_state();
+    LOCAL_GC.with(|gc| {
+        gc.borrow()
+            .core
+            .alloc_threshold
+            .store(16, Ordering::Relaxed)
+    });
+    let live_before = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+    let (before, _) = trigger_state();
+
+    // The stack handle is dropped while the self edge remains: the cycle
+    // is garbage only a collection can free.
+    drop(self_cycle());
+    let (_, possible) = trigger_state();
+    assert!(
+        possible,
+        "dropping a handle its object outlives allows garbage"
+    );
+
+    for i in 0..16 {
+        drop(Gc::new(i));
+    }
+    let (after, possible) = trigger_state();
+    assert!(after > before, "the trigger collected");
+    assert!(!possible);
+    let live = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+    assert_eq!(live, live_before, "the dropped cycle was freed");
+}
+
+#[test]
+fn incremental_trigger_skips_collection_without_garbage() {
+    use crate::generation::CollectionPhase;
+    clean_gc_state();
+    LOCAL_GC.with(|gc| {
+        let g = gc.borrow();
+        g.core.alloc_threshold.store(16, Ordering::Relaxed);
+        g.core.local_incremental_budget.store(4, Ordering::Relaxed);
+    });
+    let phase = || LOCAL_GC.with(|gc| gc.borrow().core.incremental_phase());
+    let live_before = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+
+    let kept: Vec<_> = (0..100).map(Gc::new).collect();
+    assert_eq!(
+        phase(),
+        CollectionPhase::Idle,
+        "no mark cycle without garbage"
+    );
+
+    // A dropped cycle starts a mark cycle at the next trigger, which frees it.
+    drop(self_cycle());
+    for i in 0..200 {
+        drop(Gc::new(i));
+    }
+    assert_eq!(phase(), CollectionPhase::Idle);
+    let live = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+    assert_eq!(
+        live,
+        live_before + kept.len(),
+        "the dropped cycle was freed"
+    );
+
+    LOCAL_GC.with(|gc| {
+        gc.borrow()
+            .core
+            .local_incremental_budget
+            .store(0, Ordering::Relaxed);
+    });
+    drop(kept);
+}
+
+/// A graph node whose edges are mutated through `GcCell` (the write
+/// barrier keeps old-to-young edges visible to partial collections).
+struct CellNode {
+    children: Vec<GcCell<CellNode>>,
+}
+
+impl Trace for CellNode {
+    fn is_root(&self) -> bool {
+        false
+    }
+    fn reset_root(&self) {
+        self.children.iter().for_each(|c| c.reset_root());
+    }
+    fn trace(&self) {
+        self.children.iter().for_each(|c| c.trace());
+    }
+    fn reset(&self) {
+        self.children.iter().for_each(|c| c.reset());
+    }
+    fn is_traceable(&self) -> bool {
+        false
+    }
+    fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
+        self.children
+            .iter()
+            .for_each(|c| c.trace_children(children));
+    }
+}
+
+impl Finalize for CellNode {
+    fn finalize(&self) {}
+}
+
+#[test]
+fn no_garbage_while_flag_clear_under_random_mutation() {
+    // Random graph mutation (edges, moves, drops, cycles) with the
+    // allocation trigger firing often and collections of every scope (so
+    // each bit gets cleared alone). Whenever a scope's bit says no garbage
+    // is possible, a collection of that scope must indeed free nothing.
+    //
+    // Promotion is off: with it, mutation plus partial collections can
+    // currently free a live young object that an object promoted while it
+    // still pointed at it reaches (no card records that edge), which is a
+    // separate bug.
+    use crate::generation::{Generation, PromotionConfig};
+    clean_gc_state();
+    LOCAL_GC.with(|gc| {
+        let g = gc.borrow();
+        g.core.alloc_threshold.store(8, Ordering::Relaxed);
+        g.core.set_promotion_config(PromotionConfig {
+            gen0_threshold: u32::MAX,
+            gen1_threshold: u32::MAX,
+        });
+    });
+    let node = || {
+        GcCell::new(CellNode {
+            children: Vec::new(),
+        })
+    };
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rand = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    let ops = if cfg!(miri) { 300 } else { 5000 };
+    let mut roots: Vec<GcCell<CellNode>> = (0..4).map(|_| node()).collect();
+    let mut checked = 0;
+    for _ in 0..ops {
+        if roots.is_empty() {
+            roots.push(node());
+        }
+        let i = rand(roots.len());
+        match rand(6) {
+            0 => roots.push(node()),
+            // Add an edge (possibly a cycle).
+            1 => {
+                let j = rand(roots.len());
+                let child = roots[j].clone();
+                roots[i].borrow_mut().children.push(child);
+            }
+            // Drop a root handle.
+            2 => drop(roots.swap_remove(i)),
+            // Drop a node's edges.
+            3 => roots[i].borrow_mut().children.clear(),
+            // Move a root handle into another node.
+            4 => {
+                let moved = roots.swap_remove(i);
+                if !roots.is_empty() {
+                    let j = rand(roots.len());
+                    roots[j].borrow_mut().children.push(moved);
+                }
+            }
+            // Take an edge out of a node as a new root.
+            _ => {
+                let taken = roots[i].borrow_mut().children.pop();
+                roots.extend(taken);
+            }
+        }
+        // Check the widest scope whose bit is clear.
+        let scope = [Generation::Gen2, Generation::Gen1, Generation::Gen0]
+            .into_iter()
+            .find(|&g| !garbage_possible(g));
+        if let Some(max_gen) = scope {
+            checked += 1;
+            let stats = LOCAL_GC.with(|gc| unsafe { gc.borrow().core.collect_generation(max_gen) });
+            assert_eq!(
+                stats.objects_collected, 0,
+                "{max_gen:?} collection freed garbage while its bit was clear"
+            );
+        } else if rand(4) == 0 {
+            let max_gen = [Generation::Gen0, Generation::Gen1, Generation::Gen2][rand(3)];
+            LOCAL_GC.with(|gc| unsafe { gc.borrow().core.collect_generation(max_gen) });
+        }
+    }
+    assert!(
+        checked > ops / 10,
+        "a bit was clear in only {checked} states"
+    );
+    for r in &roots {
+        r.borrow_mut().children.clear();
+    }
+}

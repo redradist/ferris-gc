@@ -190,6 +190,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 weak_alive_map: FxHashMap::default(),
                 gen0_ids: Vec::new(),
                 cascade_visited: Vec::new(),
+                garbage_possible: 0,
             }),
             gc_maps_lock: Mutex::new(()),
             shard_locks: (0..crate::sharded_map::shard_count_for(shards))
@@ -666,6 +667,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     Self::unregister_object(gc_maps, card_table, object_id, obj_gen)
                 });
             }
+            // The object outlives this handle: if it was its last path from a
+            // root, it is now garbage only a collection can free.
+            gc_maps.note_garbage_possible();
         }
         None
     }
@@ -736,11 +740,13 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
     /// If marking since `epoch` could not scan a mutably borrowed
     /// `sync::GcCell`, the marks are incomplete: mark every object live so
-    /// this collection's sweep frees nothing; a later collection retries. The
-    /// thread-local collector never blocks a scan.
+    /// this collection's sweep frees nothing; a later collection retries
+    /// (so garbage stays possible). The thread-local collector never blocks
+    /// a scan.
     #[inline]
-    fn keep_all_if_blocked_since(&self, gc_maps: &GcMaps<O>, epoch: usize) {
+    fn keep_all_if_blocked_since(&self, gc_maps: &mut GcMaps<O>, epoch: usize) {
         if self.blocked_scans.load(Ordering::Acquire) != epoch {
+            gc_maps.note_garbage_possible();
             for entry in gc_maps.objects.values() {
                 // SAFETY: every registered object is valid while the maps
                 // are locked.
@@ -951,12 +957,14 @@ impl<O: ObjectMap> GarbageCollector<O> {
             // in-flight on-thread incremental mark is stale — discard it and
             // clear the `marking` gate so grey-at-birth stops feeding a dead
             // cycle. (Only relevant when incremental mode is active.)
+            let mut abandoned_mark = false;
             if self.local_incremental_budget.load(Ordering::Relaxed) > 0 {
                 let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
                 if incr.phase != CollectionPhase::Idle {
                     incr.phase = CollectionPhase::Idle;
                     incr.colors.clear();
                     incr.gray_stack.clear();
+                    abandoned_mark = true;
                 }
                 drop(incr);
                 self.marking.store(false, Ordering::Release);
@@ -968,6 +976,12 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 // STW: block all mutator operations during mark+sweep
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
                 let mut gc_maps = self.lock_gc_maps();
+                // The abandoned cycle's scope may still hold garbage; this
+                // collection frees what its own scope holds now.
+                if abandoned_mark {
+                    gc_maps.note_garbage_possible();
+                }
+                gc_maps.start_collecting(max_gen);
 
                 let use_gen0_ids =
                     max_gen == Generation::Gen0 && gc_maps.gen0_ids.len() <= gc_maps.objects.len();
@@ -1015,7 +1029,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
 
                 // A mutably borrowed sync::GcCell left the mark incomplete.
-                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
+                self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 // Combined pass: sweep + count + clear_trace + promotion in a single
                 // iteration over objects. Avoids 3 extra full iterations and uses
@@ -1248,7 +1262,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
 
                 // A mutably borrowed sync::GcCell left the mark incomplete.
-                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
+                self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 // Count in-scope objects directly (no HashSet allocation)
                 stats.objects_scanned = gc_maps
@@ -1411,7 +1425,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
 
                 // A mutably borrowed sync::GcCell left the mark incomplete.
-                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
+                self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 // Count in-scope objects directly
                 stats.objects_scanned = gc_maps
@@ -1509,6 +1523,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
         let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
         let mut gc_maps = self.lock_gc_maps();
+        // Drops from here on (mid-mark included) set the bits again.
+        gc_maps.start_collecting(max_gen);
 
         // Lazily rebuild ptr_to_object for mark_step's trace_children resolution.
         gc_maps.rebuild_ptr_to_object();
@@ -1670,7 +1686,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
 
                 // A mutably borrowed sync::GcCell left the mark incomplete.
-                self.keep_all_if_blocked_since(&gc_maps, incr.scan_epoch);
+                self.keep_all_if_blocked_since(&mut gc_maps, incr.scan_epoch);
 
                 let mut stats = CollectionStats::new(max_gen);
 
@@ -2059,7 +2075,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
 
                 // A mutably borrowed sync::GcCell left the mark incomplete.
-                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
+                self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 // Combined pass: sweep + count + clear_trace in a single iteration.
                 let mut collected_objects: Vec<ObjectId> = Vec::new();
@@ -2167,7 +2183,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
 
                 // A mutably borrowed sync::GcCell left the mark incomplete.
-                self.keep_all_if_blocked_since(&gc_maps, scan_epoch);
+                self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 stats.objects_scanned = gc_maps.objects.len();
 
