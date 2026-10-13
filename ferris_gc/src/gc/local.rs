@@ -419,13 +419,13 @@ where
             let gc_ptr = &*self.gc_ptr();
             if gc_ctx_is_collecting(tagged) {
                 // Collection mode: decrement LocalGcInfo.root_count directly (no SlotMap lookup).
-                // root_ref_count as cycle guard: 0 = unvisited, 1 = visited.
+                // root_ref_count as cycle guard: walk only objects in the
+                // collection's scope not walked yet (see CASCADE_PENDING).
                 let rc = gc_ptr.info.root_count.get();
                 gc_ptr.info.root_count.set(rc.saturating_sub(1));
-                if gc_ptr.info.root_ref_count.get() == 0 {
+                if gc_ptr.info.root_ref_count.get() == CASCADE_PENDING {
                     gc_ptr.info.root_ref_count.set(1);
-                    // Record the visit so discover_roots phase 3 clears this
-                    // guard even when the target is out of collection scope.
+                    // Record the visit (see GcMaps::cascade_visited).
                     (*gc_ctx_ptr(tagged)).push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
                     gc_ptr.reset_root();
                 }
@@ -704,10 +704,10 @@ where
             if gc_ctx_is_collecting(tagged) {
                 let rc = gc_ptr.info.root_count.get();
                 gc_ptr.info.root_count.set(rc.saturating_sub(1));
-                if gc_ptr.info.root_ref_count.get() == 0 {
+                // Walk only in-scope objects not walked yet (CASCADE_PENDING).
+                if gc_ptr.info.root_ref_count.get() == CASCADE_PENDING {
                     gc_ptr.info.root_ref_count.set(1);
-                    // Record the visit so discover_roots phase 3 clears this
-                    // guard even when the target is out of collection scope.
+                    // Record the visit (see GcMaps::cascade_visited).
                     (*gc_ctx_ptr(tagged)).push(&gc_ptr.info.root_ref_count as *const Cell<usize>);
                     gc_ptr.t.reset_root();
                 }

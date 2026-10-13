@@ -154,11 +154,11 @@ unsafe fn cascade_handle(obj: &dyn Trace, info: &SyncGcInfo) {
     let rc = info.root_count.load(Ordering::Relaxed);
     info.root_count
         .store(rc.saturating_sub(1), Ordering::Relaxed);
-    // root_ref_count is the cycle guard: 0 = unvisited, 1 = visited.
-    if info.root_ref_count.load(Ordering::Relaxed) == 0 {
+    // root_ref_count is the cycle guard: walk only objects in the
+    // collection's scope not walked yet (see CASCADE_PENDING).
+    if info.root_ref_count.load(Ordering::Relaxed) == crate::gc::CASCADE_PENDING {
         info.root_ref_count.store(1, Ordering::Relaxed);
-        // Recorded so root discovery clears the guard even when the target
-        // is out of the collection's scope.
+        // Record the visit (see GcMaps::cascade_visited).
         unsafe {
             (*visited).push(&info.root_ref_count as *const AtomicUsize as *const Cell<usize>);
         }
@@ -1960,6 +1960,91 @@ mod tests {
     }
     impl crate::gc::Finalize for SyncCyclicNode {
         fn finalize(&self) {}
+    }
+
+    /// A node with any number of edges; `watched` nodes record their drop.
+    struct SyncVecNode {
+        children: GcCell<Vec<Gc<SyncVecNode>>>,
+        watched: bool,
+    }
+    impl crate::gc::Trace for SyncVecNode {
+        fn is_root(&self) -> bool {
+            false
+        }
+        fn reset_root(&self) {
+            self.children.reset_root();
+        }
+        fn trace(&self) {
+            self.children.trace();
+        }
+        fn reset(&self) {
+            self.children.reset();
+        }
+        fn is_traceable(&self) -> bool {
+            false
+        }
+        fn trace_children(&self, children: &mut Vec<*const dyn crate::gc::Trace>) {
+            self.children.trace_children(children);
+        }
+    }
+    impl crate::gc::Finalize for SyncVecNode {
+        fn finalize(&self) {}
+    }
+    static WATCHED_DROPPED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    impl Drop for SyncVecNode {
+        fn drop(&mut self) {
+            if self.watched {
+                WATCHED_DROPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn sync_partial_collection_keeps_young_object_reached_only_from_promoted_one() {
+        // As the thread-local test of the same name, one generation up (a
+        // sync Gen0 collection scans no objects: only the thread-local
+        // collector keeps `gen0_ids`). X gets an edge to Y while both are in
+        // Gen0 (no card); Gen1 collections then promote X to Gen2 while Y
+        // only reaches Gen1, and a Gen1 collection reaches X through a dead
+        // cycle Z. Y must survive: X still points at it.
+        use crate::generation::Generation;
+        let (_guard, _) = setup();
+        let _paused = PauseBackgroundCollector::new();
+        let gen1 = |n| {
+            for _ in 0..n {
+                unsafe { (*GLOBAL_GC).core.collect_generation(Generation::Gen1) };
+            }
+        };
+        let node = |watched| {
+            Gc::new(SyncVecNode {
+                children: GcCell::new(Vec::new()),
+                watched,
+            })
+        };
+        WATCHED_DROPPED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let x = node(false);
+        gen1(2);
+        let y = node(true);
+        x.children.borrow_mut().push(y.clone());
+        drop(y);
+        // X reaches Gen1 after 3 survivals and Gen2 after 5 more; Y, two
+        // collections younger, is in Gen1.
+        gen1(6);
+
+        let z = node(false);
+        let (z_self, z_to_x) = (z.clone(), x.clone());
+        z.children.borrow_mut().extend([z_self, z_to_x]);
+        drop(z);
+
+        gen1(1);
+        assert!(
+            !WATCHED_DROPPED.load(std::sync::atomic::Ordering::SeqCst),
+            "a Gen1 collection freed an object a live promoted object points at"
+        );
+        assert_eq!(x.children.borrow().len(), 1);
+        assert!(x.children.borrow()[0].children.borrow().is_empty());
     }
 
     #[test]
