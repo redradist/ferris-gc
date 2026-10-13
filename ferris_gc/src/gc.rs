@@ -997,8 +997,13 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
                 gc_maps.start_collecting(max_gen);
 
-                let use_gen0_ids =
-                    max_gen == Generation::Gen0 && gc_maps.gen0_ids.len() <= gc_maps.objects.len();
+                // Only the thread-local collector keeps `gen0_ids`: a sync
+                // allocation holds just its shard's lock and cannot append to
+                // a shared list, so a sync Gen0 collection iterates every
+                // object (filtered by generation), as Gen1 does.
+                let use_gen0_ids = !O::SHARDED
+                    && max_gen == Generation::Gen0
+                    && gc_maps.gen0_ids.len() <= gc_maps.objects.len();
                 let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
                 let scope = if max_gen >= Generation::Gen2 {
                     None
@@ -1072,7 +1077,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                                 entry.set_generation(next_gen);
                                 stats.objects_promoted += 1;
                             }
-                        } else if cur_gen == Generation::Gen0 {
+                        } else if !O::SHARDED && cur_gen == Generation::Gen0 {
                             new_gen0_ids.push(id);
                         }
                         entry.root_ref_count().set(0);
@@ -1121,7 +1126,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         let cur_gen = entry.generation();
                         if cur_gen > max_gen {
                             // Out of scope — but track Gen0 objects for gen0_ids
-                            if cur_gen == Generation::Gen0 {
+                            if !O::SHARDED && cur_gen == Generation::Gen0 {
                                 new_gen0_ids.push(id);
                             }
                             continue;
@@ -1147,7 +1152,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                             }
                         }
                         // Still in same generation — track Gen0 objects
-                        if cur_gen == Generation::Gen0 {
+                        if !O::SHARDED && cur_gen == Generation::Gen0 {
                             new_gen0_ids.push(id);
                         }
                         entry.root_ref_count().set(0);
