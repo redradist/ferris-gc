@@ -39,6 +39,10 @@ Every change, performance work included, should follow these:
 - **KISS (Keep It Simple).** Prefer the simplest design that is correct and fast enough: plain data and functions over layers of indirection, one clear protocol over clever special cases. Unsafe and concurrent code especially should be easy to reason about. A simpler invariant beats a few saved instructions unless the benchmark says otherwise.
 - **YAGNI (You Aren't Gonna Need It).** Build what the current task needs, not what might be needed later: no speculative options, hooks, generic parameters or feature flags without a present use. Remove dead code (unused functions, variants, fields) instead of keeping it "just in case".
 - **Refactors are behaviour- and performance-neutral.** Verify with callgrind (same instruction counts on all benchmarks, local GC included), all tests, clippy (stable and nightly), and Miri. Do not mix refactors with functional or performance changes in one PR.
+- **A cleanup pass every five working branches.** After about five feature/fix/perf branches, do a small refactor PR before the next phase:
+  - look for what those changes made stale: comments and docs (this file included), dead code, workarounds whose reason is gone, Known Issues that are fixed;
+  - keep it behaviour-neutral, as any refactor;
+  - list what you found but did not fix (too big, or a functional change) for the next phases.
 
 ## Architecture
 
@@ -51,24 +55,24 @@ Every change, performance work included, should follow these:
 
 Both share the same API surface but differ in synchronization:
 
-| | Thread-local (`gc.rs`) | Thread-safe (`gc/sync.rs`) |
+| | Thread-local (`gc/local.rs`) | Thread-safe (`gc/sync.rs`) |
 |---|---|---|
 | Pointer type | `Gc<T>` | `sync::Gc<T>` |
 | Mutable cell | `GcCell<T>` | `sync::GcCell<T>` |
 | Collector | `LocalGarbageCollector` (thread_local!) | `GlobalGarbageCollector` (lazy_static + Mutex/RwLock) |
-| Ref counting | `Cell<usize>` | `AtomicUsize` |
+| Handle count | `ObjectEntry::handle_count` (`u32`) | `SyncGcInfo::handle_count` (`AtomicU32`, object header) |
 | Strategy | `LocalStrategy` | `GlobalStrategy` |
 
 Internal type hierarchy differs per GC:
 
-- **Thread-local:** `Gc<T>`/`GcCell<T>` is a single tagged pointer (8B `Cell<NonZeroUsize>`: bit 0 = root flag, bits 1.. = `*const GcPtr<T>`) straight to `GcPtr<T>` (`GcInfo` + `object_id` + data). Handle metadata (`handle_count`/`root_count`) lives in `ObjectEntry`. Both types are `!Send`/`!Sync`.
+- **Thread-local:** `Gc<T>`/`GcCell<T>` is a single tagged pointer (8B `Cell<NonZeroUsize>`: bit 0 = root flag, bits 1.. = `*const GcPtr<T>`) straight to `GcPtr<T>` (`LocalGcInfo` + `object_id` + data). Handle metadata (`handle_count`/`root_count`) lives in `ObjectEntry`. Both types are `!Send`/`!Sync`.
 - **Sync (global):** `sync::Gc<T>` is one pointer to `GcPtr<T>`, whose header (`SyncGcInfo`) holds an atomic `handle_count`, the collector's `root_count`, and the `object_id`. As with `Arc`:
   - clone is a relaxed `fetch_add`;
   - drop is a `fetch_sub`, or for the only handle just a load;
   - the last drop frees the object through `release_object`, which takes the object's shard lock.
 
   Root discovery starts each root count at the handle count, and the cascade subtracts the handles found inside scanned objects. It does this only while `SYNC_CASCADE` is set, i.e. during the global collector's own discovery. `sync::Gc`/`GcCell`/`GcWeak` need `T: Send + Sync` (like `Arc`), because the collector thread reaches every value.
-- **`sync::GcCell<T>`** → `GcCellBox<T>` (`GcInfo` header + `RwLock<()>` + `UnsafeCell<T>`), with reader-writer semantics. `borrow`/`borrow_mut` block, and the `try_` variants return `None`. The collector never blocks on a cell: it only uses `try_read`. If a scan is blocked by a held `borrow_mut`, `blocked_scans` is bumped, and every sweep path calls `keep_all_if_blocked_since`, so that collection frees nothing.
+- **`sync::GcCell<T>`** → `GcCellBox<T>` (`SyncGcInfo` header + `RwLock<()>` + `UnsafeCell<T>`), with reader-writer semantics. `borrow`/`borrow_mut` block, and the `try_` variants return `None`. The collector never blocks on a cell: it only uses `try_read`. If a scan is blocked by a held `borrow_mut`, `blocked_scans` is bumped, and every sweep path calls `keep_all_if_blocked_since`, so that collection frees nothing.
 
 Raw allocations use TLAB bump allocation (thread-local arena blocks) with system allocator fallback. During a sweep, destructors of all dead objects run before any memory is freed (two-phase dealloc) and a dying-address registry makes interior handle drops no-ops — required for Miri/Stacked Borrows soundness of the tagged-pointer handles.
 
@@ -119,13 +123,12 @@ cd benchmarks/rust && cargo run --release --bin <bench_name>
 
 Available: `alloc_bench`, `churn_bench`, `generational_bench`, `tree_bench`, `concurrent_bench`.
 
-Release profile uses `lto = "thin"` for cross-crate devirtualization.
+The benchmark crate's release profile uses `lto = "fat"` for cross-crate inlining.
 
 ## Known Issues
 
 - `compact()` / `_compact()` is currently **disabled** — always returns 0 without moving objects (asserted by `compact_is_disabled_returns_zero`). Re-enabling requires a `relocate()` cascade through all Trace impls (derive macro + default_trace) plus pinning of rooted objects, since stack handles cannot be discovered after the GcInternal elimination.
 - Some sync tests are flaky due to shared global GC state (test ordering sensitive). Run individual tests with `cargo test -- <test_name>` if a sync test fails in batch.
-- `tree_bench` with `--strategy=adaptive` may collect live objects during build phase (node count mismatch). Use default `basic` strategy.
 - Benchmark variance is high (2-5x between runs) due to system load, cache effects, and TLAB block reuse patterns.
 
 ## graphify

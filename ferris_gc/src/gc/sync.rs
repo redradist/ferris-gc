@@ -2435,7 +2435,7 @@ mod tests {
         );
     }
 
-    // --- One block per object: [object | first tracer | ObjectEntry] ---
+    // --- One block per object: [object | ObjectEntry] ---
 
     #[test]
     fn first_handle_dropped_before_clone_keeps_object_block_alive() {
@@ -2443,13 +2443,12 @@ mod tests {
         let before = live_objects();
         let first = Gc::new(vec![1u64, 2, 3]);
         let clone = first.clone();
-        // The first handle's tracer lives inside the object's block; dropping
-        // that handle must not free the block while the clone is alive.
+        // The handles are counted in the object's block; dropping the first
+        // one must not free the block while the clone is alive.
         drop(first);
         assert_eq!(live_objects(), before + 1);
         assert_eq!(***clone, vec![1, 2, 3]);
-        // Last handle gone: the whole block (object, both tracers' records,
-        // entry) is released.
+        // Last handle gone: the whole block (object and entry) is released.
         drop(clone);
         assert_eq!(live_objects(), before);
     }
@@ -2532,8 +2531,8 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(live_objects(), before + 2 * n + 6);
-        // Clones (their tracers from a second thread's pool) outlive the
-        // originals, which die here, on a third thread.
+        // Clones (taken on a second thread) outlive the originals, which die
+        // here, on a third thread.
         let clones = std::thread::scope(|s| {
             s.spawn(|| {
                 (

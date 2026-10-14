@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **`sync::Gc<T>` / `sync::GcCell<T>` are one pointer wide.** Handles are counted in the object header, so a clone is one atomic increment. Sync objects are allocated as one block from a per-thread size-class pool, and objects are sharded by allocating thread. Concurrent allocation is ~10× faster than 0.2.0 overall.
+- **`sync::GcCell<T>` is a reader-writer cell.** `borrow`/`borrow_mut` block like `RwLock`, and `try_borrow`/`try_borrow_mut` return `None` instead of blocking. The collector never blocks on a cell.
+- **`ObjectEntry` is 64 bytes** (was 88) in both collectors.
+- **Thread-local collections that cannot free anything are skipped.** Garbage that only a collection frees (a cycle) appears only when a handle is dropped while its object keeps others; until then the allocation trigger skips the collection. `tree_bench` is ~2.5× faster, and its build phase no longer pauses.
+- Thread-local background/G1 strategies collect incrementally on the owning thread.
+
+### Deprecated
+- `CollectionStats::tracers_collected` → `handles_collected`, and `GcStats::live_tracers` → `live_handles`. The old fields stay as aliases holding the same values.
+
+### Fixed
+- **Use-after-free in partial collections.** A Gen0/Gen1 collection could free a young object that only an older, untraced object pointed at (for example an edge made before the older object was promoted). This affected the thread-local allocation trigger and sync Gen1 collections.
+- Sync Gen0 collections now see the objects allocated since the last wider collection.
+- Data race between `sync::GcCell` mutation and a concurrent collection scan.
+- Undefined behaviour (Stacked Borrows) when an allocation-triggered collection freed a cycle.
+- Heap and allocation counters use atomic read-modify-write.
+
 ## [0.2.0] - 2026-07-22
 
 ### Added
