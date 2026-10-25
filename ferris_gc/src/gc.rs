@@ -118,9 +118,9 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     /// Cheap gate: true between `begin_collection` and `finish_collection` so
     /// the allocation hot path can skip locking `incremental` unless an
     /// incremental mark cycle is actually in progress. When set, newly created
-    /// objects must be greyed into the incremental worklist (see
-    /// `note_new_object_during_marking`) so the colors-based sweep in
-    /// `finish_collection` does not reclaim live objects born mid-mark.
+    /// objects must be greyed (see `note_new_object_during_marking`) so the
+    /// marks-based sweep in `finish_collection` does not reclaim them, and
+    /// weak upgrades grey their object (`note_handle_during_marking`).
     pub(crate) marking: AtomicBool,
     /// When non-zero, the thread-local collector runs **on-thread incremental**
     /// Gen2 collection instead of a stop-the-world Gen0 collect: each allocation
@@ -564,8 +564,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
     /// Write barrier: if the object is in Gen1+, mark its card dirty in the
     /// card table so that young-generation collections trace through it.
-    /// During incremental marking, also re-grays Black objects to maintain
-    /// the tri-color invariant (no Black->White edges).
+    /// Incremental marking needs no barrier (see [`IncrementalState`]).
     pub(crate) fn write_barrier(&self, obj_id: ObjectId, obj_ptr: *const dyn Trace) {
         let thin = obj_ptr.get_thin_ptr();
         let gc_maps = self.lock_gc_maps();
@@ -574,28 +573,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 self.card_table.mark_dirty(thin);
             }
         }
-        drop(gc_maps);
-
-        // During incremental marking, re-gray Black objects so their
-        // new children are discovered in subsequent mark steps.
-        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        if incr.phase == CollectionPhase::Marking {
-            if let Some(color) = incr.colors.get_mut(&obj_id) {
-                if *color == MarkColor::Black {
-                    *color = MarkColor::Gray;
-                    incr.gray_stack.push(obj_id);
-                }
-            }
-        }
     }
 
-    /// Grey a freshly-allocated object into the incremental worklist when a
-    /// mark cycle is in progress. Without this, an object born mid-mark is
-    /// absent from `colors`, and the colors-based sweep in `finish_collection`
-    /// would reclaim it (and never scan its children — which may include White
-    /// objects reachable only through it). Greying it makes the sweep keep it
-    /// and the drain scan its children. Cheap-gated on `self.marking` so the
-    /// allocation hot path pays nothing outside a mark cycle.
     /// Current phase of the incremental collector (`Idle`/`Marking`/`Sweeping`).
     #[inline]
     pub(crate) fn incremental_phase(&self) -> CollectionPhase {
@@ -605,6 +584,13 @@ impl<O: ObjectMap> GarbageCollector<O> {
             .phase
     }
 
+    /// Grey an object born while a mark cycle is in progress, so it is live.
+    /// Without this it is absent from `marks`, and the marks-based sweep in
+    /// `finish_collection` would reclaim it. It has no snapshot, so its mark
+    /// step just blackens it: the handles it holds point at objects the
+    /// snapshot reaches or that were born since. Cheap-gated on
+    /// `self.marking` so the allocation hot path pays nothing outside a mark
+    /// cycle.
     #[inline]
     pub(crate) fn note_new_object_during_marking(&self, obj_id: ObjectId) {
         if !self.marking.load(Ordering::Acquire) {
@@ -612,8 +598,22 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
         if incr.phase == CollectionPhase::Marking {
-            incr.colors.insert(obj_id, MarkColor::Gray);
-            incr.gray_stack.push(obj_id);
+            incr.grey_born(obj_id);
+        }
+    }
+
+    /// Grey the object a weak upgrade just made a handle to, while a mark
+    /// cycle is in progress. The object may have been unreachable when the
+    /// mark began (a dead cycle not yet swept), so the snapshot need not
+    /// reach it, nor the objects only it reaches.
+    #[inline]
+    pub(crate) fn note_handle_during_marking(&self, obj_id: ObjectId) {
+        if !self.marking.load(Ordering::Acquire) {
+            return;
+        }
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+        if incr.phase == CollectionPhase::Marking {
+            incr.grey(obj_id);
         }
     }
 
@@ -940,8 +940,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
                 if incr.phase != CollectionPhase::Idle {
                     incr.phase = CollectionPhase::Idle;
-                    incr.colors.clear();
-                    incr.gray_stack.clear();
+                    incr.clear();
                     abandoned_mark = true;
                 }
                 drop(incr);
@@ -1499,9 +1498,12 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
-    /// Begin an incremental collection cycle.
-    /// Short STW: snapshots roots, initializes tri-color marks (all in-scope objects White,
-    /// root-reachable objects Gray), and sets phase to Marking.
+    /// Begin an incremental collection cycle (see [`IncrementalState`] for
+    /// the snapshot-at-the-beginning mark).
+    /// Short STW: discovers the roots, records every in-scope object White
+    /// with its children, greys the roots and sets phase to Marking.
+    /// A partial scope discovers roots as `collect_generation` does, so a
+    /// young object an older one points at is a root.
     pub unsafe fn begin_collection(&self, max_gen: Generation) {
         let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
@@ -1509,92 +1511,59 @@ impl<O: ObjectMap> GarbageCollector<O> {
         // Drops from here on (mid-mark included) set the bits again.
         gc_maps.start_collecting(max_gen);
 
-        // Lazily rebuild ptr_to_object for mark_step's trace_children resolution.
+        // Resolves the snapshot's child pointers to ObjectIds.
         gc_maps.rebuild_ptr_to_object();
 
         incr.phase = CollectionPhase::Marking;
         incr.max_gen = max_gen;
         incr.scan_epoch = self.scan_epoch();
-        incr.colors.clear();
-        incr.gray_stack.clear();
+        incr.clear();
         // Gate for the allocation hot path: objects born from here until
-        // finish_collection must be greyed (see note_new_object_during_marking).
+        // finish_collection are greyed (see note_new_object_during_marking).
         self.marking.store(true, Ordering::Release);
 
+        let scope = if max_gen >= Generation::Gen2 {
+            None
+        } else {
+            Some(max_gen)
+        };
         let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
         unsafe {
-            Self::discover_roots(gc_maps_raw, None, false);
+            Self::discover_roots(gc_maps_raw, scope, false);
         }
 
-        // Initialize all in-scope objects as White
+        incr.marks.reserve(gc_maps.objects.len());
+        let mut children_buf = Vec::new();
         for (obj_id, entry) in gc_maps.objects.iter() {
             if entry.generation() <= max_gen {
-                incr.colors.insert(obj_id, MarkColor::White);
+                children_buf.clear();
+                // SAFETY: the object is valid while gc_maps is locked.
+                unsafe { (&*entry.ptr).trace_children(&mut children_buf) };
+                let ptr_to_object = &gc_maps.ptr_to_object;
+                incr.snapshot(
+                    obj_id,
+                    children_buf
+                        .iter()
+                        .filter_map(|&ptr| ptr_to_object.get(&ptr.get_thin_ptr()).copied()),
+                );
             }
         }
 
-        // Gray objects reachable from roots (root_count > 0)
-        for (obj_id, obj_entry) in gc_maps.objects.iter() {
-            if obj_entry.root_count > 0 {
-                if let Some(color) = incr.colors.get_mut(&obj_id) {
-                    if *color == MarkColor::White {
-                        *color = MarkColor::Gray;
-                        incr.gray_stack.push(obj_id);
-                    }
-                }
+        for (obj_id, entry) in gc_maps.objects.iter() {
+            if entry.generation() <= max_gen && entry.root_count > 0 {
+                incr.grey(obj_id);
             }
         }
     }
 
-    /// Process a batch of gray objects from the worklist.
-    /// Short STW per batch. Returns `true` when the gray stack is empty (marking complete).
-    /// Each step discovers immediate children of `budget` objects via `trace_children`.
+    /// Process up to `budget` grey objects from the worklist. Returns `true`
+    /// when marking is complete. The same step as `concurrent_mark_step`.
     pub unsafe fn mark_step(&self, budget: usize) -> bool {
-        let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let gc_maps = self.lock_gc_maps();
-
-        let mut processed = 0;
-        let mut children_buf = Vec::new();
-
-        while processed < budget {
-            let obj_id = match incr.gray_stack.pop() {
-                Some(id) => id,
-                None => break,
-            };
-
-            // Discover immediate children via trace_children
-            children_buf.clear();
-            if let Some(entry) = gc_maps.objects.get(obj_id) {
-                unsafe {
-                    // SAFETY: Object pointer is valid while gc_maps lock is held.
-                    (&*entry.ptr).trace_children(&mut children_buf);
-                }
-            }
-
-            // Convert child raw ptrs to ObjectIds and gray any White children
-            for &child_ptr in &children_buf {
-                let thin = child_ptr.get_thin_ptr();
-                if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin) {
-                    if let Some(color) = incr.colors.get_mut(&child_id) {
-                        if *color == MarkColor::White {
-                            *color = MarkColor::Gray;
-                            incr.gray_stack.push(child_id);
-                        }
-                    }
-                }
-            }
-
-            // This object is now fully scanned
-            incr.colors.insert(obj_id, MarkColor::Black);
-            processed += 1;
-        }
-
-        incr.gray_stack.is_empty()
+        self.concurrent_mark_step(budget)
     }
 
-    /// Finish an incremental collection: re-mark from card table dirty entries, sweep White objects,
-    /// promote survivors, and reset state.
+    /// Finish an incremental collection: blacken the remaining grey objects,
+    /// sweep White objects, promote survivors, and reset state.
     /// Short STW.
     pub unsafe fn finish_collection(&self) -> CollectionStats {
         unsafe {
@@ -1611,59 +1580,17 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 // allocations (there won't be any while the world is stopped).
                 self.marking.store(false, Ordering::Release);
 
-                // Finish marking by draining the worklist to a fixpoint instead
-                // of re-marking the whole heap from scratch. The concurrent mark
-                // steps + the write barrier (which re-greys mutated objects) and
-                // grey-at-birth for objects allocated mid-mark mean `colors`
-                // already reflects everything except the still-grey remainder;
-                // draining it completes the tri-color mark. This is the pause
-                // reduction: work is proportional to the leftover grey set, not
-                // to the live heap.
-
-                // For partial collections, old->young references originate from
-                // out-of-scope old objects; seed the worklist from dirty cards so
-                // the young objects they keep alive are marked.
-                if max_gen < Generation::Gen2 {
-                    let dirty_ids = self.card_table.dirty_objects();
-                    for &obj_id in &dirty_ids {
-                        if let Some(color) = incr.colors.get_mut(&obj_id) {
-                            if *color == MarkColor::White {
-                                *color = MarkColor::Gray;
-                                incr.gray_stack.push(obj_id);
-                            }
-                        }
-                    }
-                }
-
-                let mut children_buf: Vec<*const dyn Trace> = Vec::new();
-                while let Some(obj_id) = incr.gray_stack.pop() {
-                    children_buf.clear();
-                    if let Some(entry) = gc_maps.objects.get(obj_id) {
-                        // SAFETY: object pointer valid while gc_maps lock held.
-                        (&*entry.ptr).trace_children(&mut children_buf);
-                    }
-                    for &child_ptr in &children_buf {
-                        let thin = child_ptr.get_thin_ptr();
-                        if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin) {
-                            if let Some(color) = incr.colors.get_mut(&child_id) {
-                                if *color == MarkColor::White {
-                                    *color = MarkColor::Gray;
-                                    incr.gray_stack.push(child_id);
-                                }
-                            }
-                        }
-                    }
-                    incr.colors.insert(obj_id, MarkColor::Black);
-                }
+                // Finish marking: blacken what is still grey.
+                incr.mark(|| true);
 
                 // Project the tri-color result onto root_ref_count, the mark bit
                 // the sweep below reads: Black => reachable, White => garbage.
-                // Every in-scope object is present in `colors` (begin_collection
+                // Every in-scope object is present in `marks` (begin_collection
                 // seeds all of them White, and mid-mark allocations are greyed),
                 // so absence can only mean out-of-scope, which the sweep skips.
                 for (id, entry) in gc_maps.objects.iter() {
                     if entry.generation() <= max_gen {
-                        let live = matches!(incr.colors.get(&id), Some(MarkColor::Black));
+                        let live = incr.is_black(id);
                         entry.root_ref_count().set(usize::from(live));
                     }
                 }
@@ -1727,8 +1654,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
                 // Reset incremental state
                 incr.phase = CollectionPhase::Idle;
-                incr.colors.clear();
-                incr.gray_stack.clear();
+                incr.clear();
 
                 (object_deallocs, stats)
             };
@@ -1760,8 +1686,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
     }
 
     /// Convenience: run a complete incremental collection.
-    /// Breaks the mark phase into steps of `step_budget` objects each,
-    /// releasing the STW lock between steps to reduce pause times.
+    /// Breaks the mark phase into steps of `step_budget` objects each; only
+    /// the begin and the finish stop the world.
     pub unsafe fn collect_incremental(
         &self,
         max_gen: Generation,
@@ -1780,54 +1706,11 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
-    /// Time-budgeted incremental mark step.
-    /// Processes gray objects until `max_duration` elapses or the gray stack is empty.
-    /// Returns `true` when marking is complete.
-    ///
-    /// Unlike `mark_step` which limits by object count, this limits by wall-clock
-    /// time, making pause times predictable regardless of object graph shape.
+    /// Time-budgeted incremental mark step: processes grey objects until
+    /// `max_duration` elapses or none is left. Returns `true` when marking is
+    /// complete. The same step as `concurrent_mark_step_timed`.
     pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
-        let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let gc_maps = self.lock_gc_maps();
-
-        let deadline = Instant::now() + max_duration;
-        let mut children_buf = Vec::new();
-
-        loop {
-            if Instant::now() >= deadline {
-                break;
-            }
-
-            let obj_id = match incr.gray_stack.pop() {
-                Some(id) => id,
-                None => break,
-            };
-
-            children_buf.clear();
-            if let Some(entry) = gc_maps.objects.get(obj_id) {
-                // SAFETY: entry.ptr is valid for the lifetime of the GcMaps<O> lock.
-                unsafe {
-                    (&*entry.ptr).trace_children(&mut children_buf);
-                }
-            }
-
-            for &child_ptr in &children_buf {
-                let thin = child_ptr.get_thin_ptr();
-                if let Some(&child_id) = gc_maps.ptr_to_object.get(&thin) {
-                    if let Some(color) = incr.colors.get_mut(&child_id) {
-                        if *color == MarkColor::White {
-                            *color = MarkColor::Gray;
-                            incr.gray_stack.push(child_id);
-                        }
-                    }
-                }
-            }
-
-            incr.colors.insert(obj_id, MarkColor::Black);
-        }
-
-        incr.gray_stack.is_empty()
+        self.concurrent_mark_step_timed(max_duration)
     }
 
     /// Run a complete incremental collection with time-budgeted mark steps.
@@ -1853,110 +1736,35 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
     // ---- Concurrent marking (Strategy 21) ----
 
-    /// Begin a concurrent collection cycle.
-    /// Short STW: snapshots roots AND object graph edges so that subsequent
-    /// `concurrent_mark_step` calls can traverse the graph without STW.
+    /// Begin a concurrent collection cycle: the same snapshot as
+    /// `begin_collection`, which lets the mark steps run without STW.
     pub unsafe fn begin_concurrent_collection(&self, max_gen: Generation) {
-        let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let mut gc_maps = self.lock_gc_maps();
-
-        // Lazily rebuild ptr_to_object for edge snapshot resolution.
-        gc_maps.rebuild_ptr_to_object();
-
-        incr.phase = CollectionPhase::Marking;
-        incr.max_gen = max_gen;
-        incr.scan_epoch = self.scan_epoch();
-        incr.colors.clear();
-        incr.gray_stack.clear();
-        incr.edges.clear();
-
-        let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
-        unsafe {
-            Self::discover_roots(gc_maps_raw, None, false);
-        }
-
-        // Initialize all in-scope objects as White and snapshot their edges
-        let mut children_buf = Vec::new();
-        for (obj_id, entry) in gc_maps.objects.iter() {
-            if entry.generation() <= max_gen {
-                incr.colors.insert(obj_id, MarkColor::White);
-                children_buf.clear();
-                unsafe {
-                    (&*entry.ptr).trace_children(&mut children_buf);
-                }
-                let child_ids: Vec<ObjectId> = children_buf
-                    .iter()
-                    .filter_map(|&ptr| gc_maps.ptr_to_object.get(&ptr.get_thin_ptr()).copied())
-                    .collect();
-                incr.edges.insert(obj_id, child_ids);
-            }
-        }
-
-        // Gray objects reachable from roots (root_count > 0)
-        for (obj_id, obj_entry) in gc_maps.objects.iter() {
-            if obj_entry.root_count > 0 {
-                if let Some(color) = incr.colors.get_mut(&obj_id) {
-                    if *color == MarkColor::White {
-                        *color = MarkColor::Gray;
-                        incr.gray_stack.push(obj_id);
-                    }
-                }
-            }
-        }
+        unsafe { self.begin_collection(max_gen) }
     }
 
-    /// Process gray objects using the edge snapshot. NO STW lock required.
-    /// Safe to call concurrently with mutators because edges were snapshotted.
+    /// Process up to `budget` grey objects using the edge snapshot. NO STW
+    /// lock required: the snapshot is all it reads.
     /// Returns `true` when marking is complete (gray stack empty).
+    // Out of line: inlined into the allocation trigger's incremental step,
+    // it made the common no-step path pay a larger prologue.
+    #[inline(never)]
     pub fn concurrent_mark_step(&self, budget: usize) -> bool {
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
         let mut processed = 0;
-
-        while processed < budget {
-            let obj_id = match incr.gray_stack.pop() {
-                Some(id) => id,
-                None => break,
-            };
-
-            // Use snapshotted edges instead of following live pointers
-            if let Some(children) = incr.edges.get(&obj_id).cloned() {
-                for child_id in children {
-                    if let Some(color) = incr.colors.get_mut(&child_id) {
-                        if *color == MarkColor::White {
-                            *color = MarkColor::Gray;
-                            incr.gray_stack.push(child_id);
-                        }
-                    }
-                }
-            }
-
-            incr.colors.insert(obj_id, MarkColor::Black);
+        incr.mark(|| {
             processed += 1;
-        }
-
-        incr.gray_stack.is_empty()
+            processed <= budget
+        })
     }
 
-    /// Convenience: run a complete concurrent collection.
-    /// begin = short STW (snapshot), mark = no STW, finish = short STW (re-mark + sweep).
+    /// Convenience: run a complete concurrent collection, the same cycle as
+    /// `collect_incremental`.
     pub unsafe fn collect_concurrent(
         &self,
         max_gen: Generation,
         step_budget: usize,
     ) -> CollectionStats {
-        // SAFETY: Caller upholds the safety contract; delegates to begin_concurrent_collection, concurrent_mark_step, finish_collection.
-        unsafe {
-            self.begin_concurrent_collection(max_gen);
-            loop {
-                let done = self.concurrent_mark_step(step_budget);
-                if done {
-                    break;
-                }
-            }
-            // finish_collection handles re-graying from card table + new roots
-            self.finish_collection()
-        }
+        unsafe { self.collect_incremental(max_gen, step_budget) }
     }
 
     /// Time-budgeted concurrent mark step. NO STW lock required.
@@ -1965,52 +1773,17 @@ impl<O: ObjectMap> GarbageCollector<O> {
     pub fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
         let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + max_duration;
-
-        loop {
-            if Instant::now() >= deadline {
-                break;
-            }
-
-            let obj_id = match incr.gray_stack.pop() {
-                Some(id) => id,
-                None => break,
-            };
-
-            if let Some(children) = incr.edges.get(&obj_id).cloned() {
-                for child_id in children {
-                    if let Some(color) = incr.colors.get_mut(&child_id) {
-                        if *color == MarkColor::White {
-                            *color = MarkColor::Gray;
-                            incr.gray_stack.push(child_id);
-                        }
-                    }
-                }
-            }
-
-            incr.colors.insert(obj_id, MarkColor::Black);
-        }
-
-        incr.gray_stack.is_empty()
+        incr.mark(|| Instant::now() < deadline)
     }
 
-    /// Run a complete concurrent collection with time-budgeted mark steps.
-    /// Each mark step runs for at most `max_step_duration` with no STW overhead.
+    /// Run a complete concurrent collection with time-budgeted mark steps,
+    /// the same cycle as `collect_incremental_timed`.
     pub unsafe fn collect_concurrent_timed(
         &self,
         max_gen: Generation,
         max_step_duration: Duration,
     ) -> CollectionStats {
-        // SAFETY: Caller upholds the safety contract; delegates to begin_concurrent_collection, concurrent_mark_step_timed, finish_collection.
-        unsafe {
-            self.begin_concurrent_collection(max_gen);
-            loop {
-                let done = self.concurrent_mark_step_timed(max_step_duration);
-                if done {
-                    break;
-                }
-            }
-            self.finish_collection()
-        }
+        unsafe { self.collect_incremental_timed(max_gen, max_step_duration) }
     }
 
     // ---- Region-based collection (Strategy 22) ----

@@ -243,6 +243,11 @@ impl Trace for CyclicNode {
     fn is_traceable(&self) -> bool {
         false
     }
+    fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
+        if let Some(ref gc) = *self.next.borrow() {
+            gc.trace_children(children);
+        }
+    }
 }
 
 impl Finalize for CyclicNode {
@@ -1566,7 +1571,7 @@ fn on_thread_incremental_preserves_live_linked_structure() {
     // On-thread incremental Gen2 collection (local background/g1 strategies)
     // advances a bounded mark step per allocation, interleaved with mutation.
     // A live linked structure built while collection is in progress must
-    // survive: this exercises grey-at-birth + the colors-based drain across
+    // survive: this exercises grey-at-birth + the marks-based drain across
     // many begin/mark_step/finish cycles. Regression for the class of bug
     // where interleaved incremental marking freed live nodes (which also
     // required VecNode to implement trace_children — the incremental
@@ -1622,9 +1627,9 @@ fn on_thread_incremental_preserves_live_linked_structure() {
 
 #[test]
 fn object_allocated_during_incremental_mark_survives() {
-    // Regression: the colors-based sweep in finish_collection reclaims any
+    // Regression: the marks-based sweep in finish_collection reclaims any
     // object not marked Black. An object allocated *after* begin_collection
-    // is absent from the initial `colors` snapshot, so without grey-at-birth
+    // is absent from the initial `marks` snapshot, so without grey-at-birth
     // (note_new_object_during_marking) it would be swept while still live.
     clean_gc_state();
     let _root: Vec<Gc<i32>> = (0..10).map(|i| Gc::new(i)).collect();
@@ -1639,7 +1644,7 @@ fn object_allocated_during_incremental_mark_survives() {
     // Allocate DURING the mark cycle. Must be greyed at birth and survive.
     let born_mid_mark = Gc::new(999i32);
 
-    // Drain + colors-based sweep.
+    // Drain + marks-based sweep.
     let stats = LOCAL_GC.with(|gc| unsafe { gc.borrow().core.finish_collection() });
 
     // The mid-mark object is still rooted and must not have been collected.
@@ -2512,4 +2517,99 @@ fn partial_collection_keeps_young_object_reached_only_from_promoted_one() {
     assert_eq!(stats.objects_collected, 1, "only the dead cycle is freed");
     assert_eq!(x.borrow().children.len(), 1);
     assert!(x.borrow().children[0].borrow().children.is_empty());
+}
+/// Run an incremental mark of `max_gen` with `mutate` between its begin and
+/// its steps, then finish it.
+fn incremental_cycle_with(
+    max_gen: crate::generation::Generation,
+    mutate: impl FnOnce(),
+) -> crate::generation::CollectionStats {
+    LOCAL_GC.with(|gc| unsafe { gc.borrow().core.begin_collection(max_gen) });
+    mutate();
+    LOCAL_GC.with(|gc| unsafe {
+        let gc = gc.borrow();
+        while !gc.core.mark_step(1) {}
+        gc.core.finish_collection()
+    })
+}
+
+#[test]
+fn handle_cloned_during_incremental_mark_survives() {
+    // Regression: the mark followed the live graph, so an object whose only
+    // in-graph handle went away mid-mark stayed White although a handle
+    // cloned after the mark began still pointed at it - and was freed.
+    clean_gc_state();
+    let holder: GcCell<Option<Gc<i32>>> = GcCell::new(Some(Gc::new(7)));
+    let mut taken = None;
+    let stats = incremental_cycle_with(crate::generation::Generation::Gen2, || {
+        taken = (**holder.borrow()).clone();
+        **holder.borrow_mut() = None;
+    });
+    assert_eq!(stats.objects_collected, 0, "a live object was freed");
+    assert_eq!(**taken.unwrap(), 7);
+}
+
+#[test]
+fn handle_moved_out_during_incremental_mark_survives() {
+    // As above, with the handle moved out of the cell (no new handle).
+    clean_gc_state();
+    let holder: GcCell<Option<Gc<i32>>> = GcCell::new(Some(Gc::new(7)));
+    let mut taken = None;
+    let stats = incremental_cycle_with(crate::generation::Generation::Gen2, || {
+        taken = (**holder.borrow_mut()).take();
+    });
+    assert_eq!(stats.objects_collected, 0, "a live object was freed");
+    assert_eq!(**taken.unwrap(), 7);
+}
+
+#[test]
+fn partial_incremental_mark_keeps_young_objects_held_by_old_ones() {
+    // Regression: a partial incremental mark discovered roots over the whole
+    // heap, so the handle inside an old object did not make the young object
+    // it points at a root; and the old object is out of scope, so nothing
+    // reached the young one - it was freed while the old one held it.
+    use crate::generation::Generation;
+    clean_gc_state();
+    let holder: GcCell<Option<Gc<i32>>> = GcCell::new(None);
+    // Gen0 promotes after 3 survivals.
+    for _ in 0..3 {
+        LOCAL_GC.with(|gc| unsafe { gc.borrow().core.collect_generation(Generation::Gen0) });
+    }
+    **holder.borrow_mut() = Some(Gc::new(7));
+    let stats = incremental_cycle_with(Generation::Gen0, || {});
+    assert_eq!(
+        stats.objects_collected, 0,
+        "a young object an old one holds was freed"
+    );
+    assert_eq!(***(**holder.borrow()).as_ref().unwrap(), 7);
+}
+
+#[test]
+fn weak_upgrade_during_incremental_mark_keeps_what_it_reaches() {
+    // A weak upgrade can reach an object that was unreachable when the mark
+    // began (a dead cycle not yet swept): the mark must keep it and what it
+    // reaches.
+    clean_gc_state();
+    let a = Gc::new(CyclicNode {
+        next: std::cell::RefCell::new(None),
+    });
+    let b = Gc::new(CyclicNode {
+        next: std::cell::RefCell::new(Some(a.clone())),
+    });
+    *a.next.borrow_mut() = Some(b.clone());
+    let weak = Gc::downgrade(&a);
+    drop(a);
+    drop(b);
+    let mut upgraded = None;
+    let stats = incremental_cycle_with(crate::generation::Generation::Gen2, || {
+        upgraded = weak.upgrade();
+    });
+    assert_eq!(stats.objects_collected, 0, "a resurrected object was freed");
+    let a = upgraded.expect("the cycle is not swept yet");
+    let b = a.next.borrow().clone().unwrap();
+    assert!(b.next.borrow().is_some());
+    drop(b);
+    drop(a);
+    clean_gc_state();
+    assert!(!weak.is_alive(), "the dead cycle is freed later");
 }

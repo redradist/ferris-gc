@@ -171,6 +171,7 @@ impl<O: ObjectMap> GcMaps<O> {
     /// pointer-to-ObjectId resolution.
     pub(crate) fn rebuild_ptr_to_object(&mut self) {
         self.ptr_to_object.clear();
+        self.ptr_to_object.reserve(self.objects.len());
         for (id, entry) in self.objects.iter() {
             let thin = entry.ptr.get_thin_ptr();
             self.ptr_to_object.insert(thin, id);
@@ -178,16 +179,34 @@ impl<O: ObjectMap> GcMaps<O> {
     }
 }
 
+/// An in-scope object's mark: its color, and where its snapshot children
+/// are in [`IncrementalState::children`].
+#[derive(Clone, Copy)]
+pub(crate) struct Mark {
+    pub(crate) color: MarkColor,
+    first_child: u32,
+    child_count: u32,
+}
+
 /// State for incremental tri-color marking.
+///
+/// Marking is snapshot-at-the-beginning: `begin_collection` records each
+/// in-scope object's children as they are then, and the mark follows only
+/// that snapshot. Mutations made while the mark runs therefore cannot hide an
+/// object from it, so no write barrier is needed: every object reachable when
+/// marking began is marked, and an object born since is greyed, so it is
+/// live (`note_new_object_during_marking`). A handle a weak upgrade creates
+/// is the one way to reach an object that was not reachable then, so the
+/// upgrade greys it (`note_handle_during_marking`).
 pub(crate) struct IncrementalState {
     pub(crate) phase: CollectionPhase,
     pub(crate) max_gen: Generation,
-    pub(crate) colors: FxHashMap<ObjectId, MarkColor>,
+    /// The mark of every in-scope object and every object born mid-mark.
+    pub(crate) marks: FxHashMap<ObjectId, Mark>,
     pub(crate) gray_stack: Vec<ObjectId>,
-    /// Snapshot of object graph edges for concurrent marking.
-    /// Populated during begin_concurrent_collection so that mark steps
-    /// can traverse the graph without following live pointers.
-    pub(crate) edges: FxHashMap<ObjectId, Vec<ObjectId>>,
+    /// The snapshot's children of all objects, one run per object (one
+    /// buffer rather than a `Vec` per object).
+    children: Vec<ObjectId>,
     /// `blocked_scans` when this cycle's marking began.
     pub(crate) scan_epoch: usize,
 }
@@ -197,11 +216,82 @@ impl IncrementalState {
         IncrementalState {
             phase: CollectionPhase::Idle,
             max_gen: Generation::Gen0,
-            colors: FxHashMap::default(),
+            marks: FxHashMap::default(),
             gray_stack: Vec::new(),
-            edges: FxHashMap::default(),
+            children: Vec::new(),
             scan_epoch: 0,
         }
+    }
+
+    /// Forget the cycle's marks, worklist and snapshot.
+    pub(crate) fn clear(&mut self) {
+        self.marks.clear();
+        self.gray_stack.clear();
+        self.children.clear();
+    }
+
+    /// Record an in-scope object White, with its children now. Children out
+    /// of scope get no mark, so `grey` skips them.
+    pub(crate) fn snapshot(&mut self, id: ObjectId, children: impl Iterator<Item = ObjectId>) {
+        let first = self.children.len();
+        self.children.extend(children);
+        let mark = Mark {
+            color: MarkColor::White,
+            first_child: u32::try_from(first).expect("snapshot over 2^32 edges"),
+            child_count: (self.children.len() - first) as u32,
+        };
+        self.marks.insert(id, mark);
+    }
+
+    /// Grey an object born mid-mark. It has no snapshot, so its step only
+    /// blackens it. Out of line: inlined, it changed the code of the
+    /// allocation fast path that only checks the `marking` gate.
+    #[inline(never)]
+    pub(crate) fn grey_born(&mut self, id: ObjectId) {
+        let mark = Mark {
+            color: MarkColor::Gray,
+            first_child: 0,
+            child_count: 0,
+        };
+        self.marks.insert(id, mark);
+        self.gray_stack.push(id);
+    }
+
+    /// Grey `id` if it is in scope and not yet reached.
+    #[inline]
+    pub(crate) fn grey(&mut self, id: ObjectId) {
+        if let Some(mark) = self.marks.get_mut(&id) {
+            if mark.color == MarkColor::White {
+                mark.color = MarkColor::Gray;
+                self.gray_stack.push(id);
+            }
+        }
+    }
+
+    /// Whether marking reached `id`.
+    #[inline]
+    pub(crate) fn is_black(&self, id: ObjectId) -> bool {
+        matches!(self.marks.get(&id), Some(mark) if mark.color == MarkColor::Black)
+    }
+
+    /// Blacken grey objects while `keep_going()` allows, greying their
+    /// snapshot children. Returns `true` when no grey object is left.
+    pub(crate) fn mark(&mut self, mut keep_going: impl FnMut() -> bool) -> bool {
+        while keep_going() {
+            let Some(id) = self.gray_stack.pop() else {
+                break;
+            };
+            let Some(mark) = self.marks.get_mut(&id) else {
+                continue;
+            };
+            mark.color = MarkColor::Black;
+            let first = mark.first_child as usize;
+            for i in first..first + mark.child_count as usize {
+                let child = self.children[i];
+                self.grey(child);
+            }
+        }
+        self.gray_stack.is_empty()
     }
 }
 
