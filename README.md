@@ -265,9 +265,11 @@ Internally uses slot-map arenas (`SlotMap<ObjectId, ObjectEntry>`) for O(1) inse
 
 FerrisGC provides five macro-level strategies that control **when** and **how** garbage collection happens automatically. Each strategy is configured via `#[ferris_gc_main(strategy = "...")]`.
 
+The thread-safe collector (`sync::Gc<T>`) runs these strategies on background threads. A thread-local collector (`Gc<T>`) is only ever collected on its own thread, since its handles use non-atomic counts. For it, each strategy configures the **allocation trigger** instead: a collection runs inside an allocation once the threshold is reached, and no threads are started (`poll_interval_ms` does not apply). That trigger widens every `gen0_collections_per_gen1`-th collection to Gen1 and every `gen1_collections_per_gen2`-th of those to Gen2 (5 and 5 by default, also without a strategy), so dead cycles in older generations are freed too. `background` and `g1` mark Gen2 incrementally there instead, a bounded step per allocation.
+
 ### Basic (default)
 
-A simple periodic strategy. A background thread wakes every `poll_interval_ms` (default: 50ms) and runs collection on all registered collectors. Minimal configuration, good for prototypes and small applications.
+A simple periodic strategy. A background thread wakes every `poll_interval_ms` (default: 50ms) and collects the thread-safe collector; thread-local collectors use the default allocation trigger (GOGC-style threshold). Minimal configuration, good for prototypes and small applications.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -280,7 +282,7 @@ Triggers collection when the number of allocations since the last Gen0 collectio
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `gen0_threshold` | 100 | Allocations before triggering Gen0 collection |
-| `gen0_collections_per_gen1` | 10 | Gen0 cycles before triggering Gen1 |
+| `gen0_collections_per_gen1` | 5 | Gen0 cycles before triggering Gen1 |
 | `gen1_collections_per_gen2` | 5 | Gen1 cycles before triggering Gen2 |
 | `poll_interval_ms` | 50 | Strategy thread wake interval (ms) |
 
@@ -293,9 +295,9 @@ Self-tuning strategy that adjusts the Gen0 threshold based on the ratio of colle
 | `initial_gen0_threshold` | 100 | Starting Gen0 allocation threshold |
 | `min_threshold` | 50 | Minimum Gen0 threshold (lower bound) |
 | `max_threshold` | 10000 | Maximum Gen0 threshold (upper bound) |
-| `high_ratio` | 0.7 | Garbage ratio above which threshold decreases |
-| `low_ratio` | 0.3 | Garbage ratio below which threshold increases |
-| `adjust_factor` | 0.5 | Multiplicative factor for threshold adjustment |
+| `high_ratio` | 0.5 | Garbage ratio above which threshold decreases |
+| `low_ratio` | 0.1 | Garbage ratio below which threshold increases |
+| `adjust_factor` | 1.5 | Multiplicative factor for threshold adjustment |
 | `poll_interval_ms` | 50 | Strategy thread wake interval (ms) |
 
 ### Background (.NET-style)
@@ -339,7 +341,7 @@ Best for large heaps where predictable pause times are critical.
 | Variable workloads | **adaptive** | Auto-tunes to changing allocation rates |
 | Long-lived large heaps | **background** | Concurrent Gen2 avoids long pauses |
 | Latency-sensitive with large heap | **g1** | Pause-target + garbage-first region selection |
-| Maximum throughput | **threshold** or **adaptive** | Minimal overhead, no concurrent threads |
+| Maximum throughput | **threshold** or **adaptive** | Minimal overhead |
 
 ## Performance Features
 

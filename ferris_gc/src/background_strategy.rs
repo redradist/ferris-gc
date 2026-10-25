@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::gc::LocalGarbageCollector;
 use crate::gc::sync::GlobalGarbageCollector;
+use crate::gc::{LocalGarbageCollector, TriggerPolicy};
 use crate::generation::Generation;
 
 /// Configuration for the background (.NET-style) GC strategy.
@@ -34,8 +34,8 @@ impl Default for BackgroundConfig {
     fn default() -> Self {
         BackgroundConfig {
             gen0_threshold: 100,
-            gen0_collections_per_gen1: 5,
-            gen1_collections_per_gen2: 5,
+            gen0_collections_per_gen1: crate::gc::DEFAULT_GEN0_PER_GEN1,
+            gen1_collections_per_gen2: crate::gc::DEFAULT_GEN1_PER_GEN2,
             poll_interval: Duration::from_millis(50),
             gen2_occupancy_trigger: 0.75,
             gen2_mark_step_budget: 64,
@@ -70,12 +70,11 @@ pub fn background_local_strategy(
         // Gen2 mark by one bounded step (see LocalGarbageCollector::
         // maybe_collect). No collector thread is spawned. True parallel
         // background collection is available on the thread-safe global GC.
-        gc.core
-            .alloc_threshold
-            .store(config.gen0_threshold, Ordering::Relaxed);
-        gc.core
-            .local_incremental_budget
-            .store(config.gen2_mark_step_budget.max(1), Ordering::Relaxed);
+        gc.configure_trigger(
+            config.gen0_threshold,
+            config.gen2_mark_step_budget.max(1),
+            TriggerPolicy::default(),
+        );
         None
     }
 }

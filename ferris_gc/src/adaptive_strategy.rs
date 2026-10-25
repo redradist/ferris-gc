@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::gc::LocalGarbageCollector;
 use crate::gc::sync::GlobalGarbageCollector;
+use crate::gc::{LocalGarbageCollector, ThresholdRule, TriggerPolicy};
 use crate::generation::Generation;
 
 /// Configuration for the adaptive GC strategy.
@@ -29,7 +29,8 @@ pub struct AdaptiveConfig {
     pub gen0_collections_per_gen1: u32,
     /// Number of Gen1 collections between each Gen2 collection.
     pub gen1_collections_per_gen2: u32,
-    /// Polling interval for the background thread.
+    /// Polling interval for the background thread (global strategy only:
+    /// the thread-local strategy collects on allocation).
     pub poll_interval: Duration,
 }
 
@@ -42,10 +43,67 @@ impl Default for AdaptiveConfig {
             high_ratio: 0.5,
             low_ratio: 0.1,
             adjust_factor: 1.5,
-            gen0_collections_per_gen1: 5,
-            gen1_collections_per_gen2: 5,
+            gen0_collections_per_gen1: crate::gc::DEFAULT_GEN0_PER_GEN1,
+            gen1_collections_per_gen2: crate::gc::DEFAULT_GEN1_PER_GEN2,
             poll_interval: Duration::from_millis(50),
         }
+    }
+}
+
+/// The adaptive threshold rule: lower the threshold while much of what a
+/// collection scans is garbage, raise it while little is, within bounds.
+/// Shared by the global strategy's thread and the thread-local allocation
+/// trigger.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdaptiveThreshold {
+    min_threshold: usize,
+    max_threshold: usize,
+    high_ratio: f64,
+    low_ratio: f64,
+    adjust_factor: f64,
+}
+
+impl AdaptiveThreshold {
+    pub(crate) fn of(config: &AdaptiveConfig) -> AdaptiveThreshold {
+        AdaptiveThreshold {
+            min_threshold: config.min_threshold,
+            max_threshold: config.max_threshold,
+            high_ratio: config.high_ratio,
+            low_ratio: config.low_ratio,
+            adjust_factor: config.adjust_factor,
+        }
+    }
+
+    /// The threshold after a collection that freed `collected` of the
+    /// `scanned` objects.
+    pub(crate) fn after_collection(
+        &self,
+        current: usize,
+        collected: usize,
+        scanned: usize,
+    ) -> usize {
+        if scanned == 0 {
+            return current;
+        }
+        let ratio = collected as f64 / scanned as f64;
+        if ratio > self.high_ratio {
+            // Many dead objects — keep threshold low (collect often)
+            self.bounded(current as f64 / self.adjust_factor)
+        } else if ratio < self.low_ratio {
+            self.after_nothing_freed(current)
+        } else {
+            current.clamp(self.min_threshold, self.max_threshold)
+        }
+    }
+
+    /// The threshold after a collection that freed (or would have freed)
+    /// next to nothing: collect less often.
+    pub(crate) fn after_nothing_freed(&self, current: usize) -> usize {
+        self.bounded(current as f64 * self.adjust_factor)
+    }
+
+    fn bounded(&self, threshold: f64) -> usize {
+        (threshold as usize).clamp(self.min_threshold, self.max_threshold)
     }
 }
 
@@ -55,72 +113,36 @@ fn adapt_threshold(
     collected: usize,
     scanned: usize,
 ) -> usize {
-    if scanned == 0 {
-        return current;
-    }
-    let ratio = collected as f64 / scanned as f64;
-    let new = if ratio > config.high_ratio {
-        // Many dead objects — keep threshold low (collect often)
-        (current as f64 / config.adjust_factor) as usize
-    } else if ratio < config.low_ratio {
-        // Few dead objects — increase threshold (collect less often)
-        (current as f64 * config.adjust_factor) as usize
-    } else {
-        current
-    };
-    new.clamp(config.min_threshold, config.max_threshold)
+    AdaptiveThreshold::of(config).after_collection(current, collected, scanned)
 }
 
 /// Creates a strategy closure for a local adaptive collector.
 ///
-/// The returned closure, when called, spawns a background thread that auto-tunes
-/// the Gen0 threshold based on collection effectiveness.
+/// A thread-local collector is collected on its own thread, by the
+/// allocation trigger (see [`LocalGarbageCollector`]): this strategy starts
+/// it at `initial_gen0_threshold`, tunes the threshold after each
+/// collection with the adaptive rule, and widens every
+/// `gen0_collections_per_gen1`-th collection to Gen1 and every
+/// `gen1_collections_per_gen2`-th of those to Gen2. No thread is spawned;
+/// `poll_interval` applies to the global strategy only.
 #[allow(clippy::type_complexity)]
 pub fn adaptive_local_strategy(
     config: AdaptiveConfig,
 ) -> impl FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>> + 'static
 {
-    let config = std::sync::Arc::new(config);
     move |gc: &'static LocalGarbageCollector,
-          is_active: &'static AtomicBool|
+          _is_active: &'static AtomicBool|
           -> Option<JoinHandle<()>> {
-        let config = config.clone();
-        Some(thread::spawn(move || {
-            let mut threshold = config.initial_gen0_threshold;
-            let mut gen0_count: u32 = 0;
-            let mut gen1_count: u32 = 0;
-            while is_active.load(Ordering::Acquire) {
-                thread::sleep(config.poll_interval);
-                let allocs = gc.core.allocation_count.load(Ordering::Relaxed);
-                if allocs >= threshold {
-                    let stats = unsafe { gc.core.collect_generation(Generation::Gen0) };
-                    threshold = adapt_threshold(
-                        &config,
-                        threshold,
-                        stats.objects_collected,
-                        stats.objects_scanned,
-                    );
-                    gen0_count += 1;
-                    if gen0_count >= config.gen0_collections_per_gen1 {
-                        gen0_count = 0;
-                        unsafe {
-                            gc.core.collect_generation(Generation::Gen1);
-                        }
-                        gen1_count += 1;
-                        if gen1_count >= config.gen1_collections_per_gen2 {
-                            gen1_count = 0;
-                            unsafe {
-                                gc.core.collect_generation(Generation::Gen2);
-                            }
-                        }
-                    }
-                }
-            }
-            // Final full collection on shutdown
-            unsafe {
-                gc.core.collect_generation(Generation::Gen2);
-            }
-        }))
+        gc.configure_trigger(
+            config.initial_gen0_threshold,
+            0,
+            TriggerPolicy {
+                gen0_per_gen1: config.gen0_collections_per_gen1,
+                gen1_per_gen2: config.gen1_collections_per_gen2,
+                threshold: ThresholdRule::Adaptive(AdaptiveThreshold::of(&config)),
+            },
+        );
+        None
     }
 }
 

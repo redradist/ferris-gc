@@ -888,6 +888,52 @@ where
 /// on non-atomic Cell/RefCell internals.
 pub(crate) const LOCAL_GC_ALLOC_THRESHOLD: usize = 1_000;
 
+/// While no collection could free anything, skipped triggers double the
+/// GOGC threshold, up to this many times the live set.
+const GOGC_IDLE_MAX_FACTOR: usize = 8;
+
+/// Default schedule of the allocation trigger (and of the strategies'
+/// configs): every 5th triggered collection covers Gen1 too, and every 5th
+/// of those Gen2.
+pub(crate) const DEFAULT_GEN0_PER_GEN1: u32 = 5;
+pub(crate) const DEFAULT_GEN1_PER_GEN2: u32 = 5;
+
+/// How the thread-local allocation trigger widens and spaces its
+/// collections. The local strategies set it through
+/// [`LocalGarbageCollector::configure_trigger`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TriggerPolicy {
+    /// Every `gen0_per_gen1`-th triggered collection covers Gen1 too, so
+    /// dead cycles that were promoted are freed as well.
+    pub(crate) gen0_per_gen1: u32,
+    /// Every `gen1_per_gen2`-th of those covers Gen2 (a full collection).
+    pub(crate) gen1_per_gen2: u32,
+    /// How the threshold changes after each triggered collection.
+    pub(crate) threshold: ThresholdRule,
+}
+
+impl Default for TriggerPolicy {
+    fn default() -> TriggerPolicy {
+        TriggerPolicy {
+            gen0_per_gen1: DEFAULT_GEN0_PER_GEN1,
+            gen1_per_gen2: DEFAULT_GEN1_PER_GEN2,
+            threshold: ThresholdRule::Gogc,
+        }
+    }
+}
+
+/// How the allocation trigger's threshold changes after a collection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ThresholdRule {
+    /// GOGC-style (the default): grow while collections free little, shrink
+    /// while they free a lot.
+    Gogc,
+    /// Keep the threshold the strategy set (threshold strategy).
+    Fixed,
+    /// The adaptive strategy's bounded rule.
+    Adaptive(crate::adaptive_strategy::AdaptiveThreshold),
+}
+
 /// Thread-local garbage collector.
 ///
 /// Each thread gets its own instance via the [`LOCAL_GC`] thread-local.
@@ -895,18 +941,28 @@ pub(crate) const LOCAL_GC_ALLOC_THRESHOLD: usize = 1_000;
 /// are single-threaded — for cross-thread GC, use [`sync::GlobalGarbageCollector`].
 ///
 /// Collection is triggered automatically after every `LOCAL_GC_ALLOC_THRESHOLD`
-/// allocations, or manually via `collect()` / `collect_generation()`.
+/// allocations, on the owning thread, or manually via `collect()` /
+/// `collect_generation()`. The collector is neither `Send` nor `Sync`: its
+/// objects' handles use non-atomic counts and its maps are reached without
+/// locks, so only its own thread may collect it. The local strategies
+/// therefore configure the allocation trigger instead of spawning a thread.
+///
+/// ```compile_fail
+/// fn shared_with_other_threads<T: Sync>() {}
+/// shared_with_other_threads::<ferris_gc::LocalGarbageCollector>();
+/// ```
 pub struct LocalGarbageCollector {
     pub(crate) core: GarbageCollector,
     /// Thread-local allocation buffer for fast bump-pointer allocation.
     /// Lazily initialized on first allocation.
     pub(crate) tlab: Option<crate::tlab::Tlab>,
+    /// How the allocation trigger widens and spaces its collections.
+    trigger: Cell<TriggerPolicy>,
+    /// Triggered collections since the last one that covered Gen1, and
+    /// Gen1-covering ones since the last full one (see `next_trigger_scope`).
+    gen0_since_gen1: Cell<u32>,
+    gen1_since_gen2: Cell<u32>,
 }
-
-// SAFETY: Delegates to GarbageCollector which protects all state with Mutex/atomics.
-// The Tlab is only accessed from the owning thread (thread_local).
-unsafe impl Sync for LocalGarbageCollector {}
-unsafe impl Send for LocalGarbageCollector {}
 
 #[allow(dead_code)]
 impl LocalGarbageCollector {
@@ -914,7 +970,32 @@ impl LocalGarbageCollector {
         LocalGarbageCollector {
             core: GarbageCollector::new(),
             tlab: None,
+            trigger: Cell::new(TriggerPolicy::default()),
+            gen0_since_gen1: Cell::new(0),
+            gen1_since_gen2: Cell::new(0),
         }
+    }
+
+    /// Configure the allocation trigger: collect every `alloc_threshold`
+    /// allocations by the given policy, or, with a non-zero
+    /// `incremental_budget`, advance an incremental Gen2 mark by that many
+    /// objects per allocation. This is how the local strategies act: a
+    /// thread-local collector is only ever collected on its own thread.
+    pub(crate) fn configure_trigger(
+        &self,
+        alloc_threshold: usize,
+        incremental_budget: usize,
+        policy: TriggerPolicy,
+    ) {
+        self.core
+            .alloc_threshold
+            .store(alloc_threshold, Ordering::Relaxed);
+        self.core
+            .local_incremental_budget
+            .store(incremental_budget, Ordering::Relaxed);
+        self.trigger.set(policy);
+        self.gen0_since_gen1.set(0);
+        self.gen1_since_gen2.set(0);
     }
 
     /// Try to allocate A and B in a single TLAB bump (combined allocation).
@@ -1040,13 +1121,11 @@ impl LocalGarbageCollector {
         unsafe { self.core.try_alloc_mem_with_gc::<T>() }
     }
 
-    /// Check allocation count and trigger Gen0 collection if threshold exceeded
-    /// and a collection could free anything (see
-    /// `skip_collection_without_garbage`). The threshold adapts based on
-    /// collection efficiency: if a collection frees little garbage, the
-    /// threshold doubles to avoid wasteful scans of a mostly-live heap. If a
-    /// collection frees a lot, the threshold shrinks (down to 1K) to reclaim
-    /// memory promptly.
+    /// Check allocation count and trigger a collection if the threshold is
+    /// exceeded and a collection could free anything (see
+    /// `skip_collection_without_garbage`): Gen0, widened on the trigger
+    /// policy's schedule (`next_trigger_scope`). The threshold then changes
+    /// by the policy's rule (`adapt_alloc_threshold`).
     ///
     /// # Safety
     /// No borrow of the collector may be live: see [`Self::allocate`].
@@ -1068,7 +1147,7 @@ impl LocalGarbageCollector {
         let count = this.core.allocation_count.load(Ordering::Relaxed);
         let threshold = this.core.alloc_threshold.load(Ordering::Relaxed);
         if count >= threshold {
-            unsafe { gc.borrow().collect_gen0_and_adapt() };
+            unsafe { gc.borrow().collect_due() };
         }
     }
 
@@ -1119,22 +1198,47 @@ impl LocalGarbageCollector {
 
     #[cold]
     #[inline(never)]
-    unsafe fn collect_gen0_and_adapt(&self) {
-        if unsafe { self.skip_collection_without_garbage(Generation::Gen0) } {
+    unsafe fn collect_due(&self) {
+        let max_gen = self.next_trigger_scope();
+        if unsafe { self.skip_collection_without_garbage(max_gen) } {
             return;
         }
-        let stats = unsafe { self.core.collect_generation(Generation::Gen0) };
+        let stats = unsafe { self.core.collect_generation(max_gen) };
         self.adapt_alloc_threshold(&stats);
+    }
+
+    /// The scope of the collection the trigger is due for: Gen0, or on the
+    /// policy's schedule Gen1 or Gen2, so dead cycles that were promoted
+    /// are freed too. Skipped collections count, so the schedule keeps its
+    /// pace while only older generations may hold garbage.
+    fn next_trigger_scope(&self) -> Generation {
+        let policy = self.trigger.get();
+        let since_gen1 = self.gen0_since_gen1.get() + 1;
+        if since_gen1 < policy.gen0_per_gen1 {
+            self.gen0_since_gen1.set(since_gen1);
+            return Generation::Gen0;
+        }
+        self.gen0_since_gen1.set(0);
+        let since_gen2 = self.gen1_since_gen2.get() + 1;
+        if since_gen2 < policy.gen1_per_gen2 {
+            self.gen1_since_gen2.set(since_gen2);
+            return Generation::Gen1;
+        }
+        self.gen1_since_gen2.set(0);
+        Generation::Gen2
     }
 
     /// The allocation trigger fired for a collection of generations
     /// `0..=max_gen`. If no handle has been dropped while its object kept
     /// others since the last collection of that scope, the scope holds no
     /// garbage (see `GcMaps::garbage_possible`) and the collection would
-    /// free nothing: skip it, and treat it like a collection that freed
-    /// nothing (restart the trigger's count and grow its threshold). Also
-    /// trim `gen0_ids` of objects already freed by their last handle's drop,
-    /// which collections otherwise do. Returns whether it was skipped.
+    /// free nothing: skip it and restart the trigger's count. If no
+    /// collection could free anything, treat it like one that freed
+    /// nothing (the threshold grows by the policy's rule); while older
+    /// generations may still hold garbage, keep the threshold, so the
+    /// schedule reaches them at its usual pace. Also trim `gen0_ids` of
+    /// objects already freed by their last handle's drop, which collections
+    /// otherwise do. Returns whether it was skipped.
     unsafe fn skip_collection_without_garbage(&self, max_gen: Generation) -> bool {
         // SAFETY: thread-local collector, no concurrent access.
         let gc_maps = unsafe { self.core.gc_maps_unsync() };
@@ -1142,40 +1246,98 @@ impl LocalGarbageCollector {
             return false;
         }
         self.core.allocation_count.store(0, Ordering::Relaxed);
-        self.grow_alloc_threshold(0);
+        let no_garbage_anywhere = !gc_maps.garbage_possible(Generation::Gen2);
         // Trimming when more than half the ids are stale keeps it amortized
-        // O(1) per freed object.
+        // O(1) per freed object. Filtering the list costs a lookup per id,
+        // rebuilding it from the object map a pass over its slots: take the
+        // cheaper (the slots are fewer when objects are freed and replaced,
+        // as in a sliding window).
         if gc_maps.gen0_ids.len() > 2 * gc_maps.objects.len() {
             let objects = &gc_maps.objects;
-            gc_maps.gen0_ids.retain(|&id| objects.get(id).is_some());
+            if objects.slot_count() < gc_maps.gen0_ids.len() {
+                gc_maps.gen0_ids.clear();
+                gc_maps.gen0_ids.extend(
+                    objects
+                        .iter()
+                        .filter(|(_, entry)| entry.generation() == Generation::Gen0)
+                        .map(|(id, _)| id),
+                );
+            } else {
+                gc_maps.gen0_ids.retain(|&id| objects.get(id).is_some());
+            }
+        }
+        // After the last use of `gc_maps`: this reads the maps again.
+        if no_garbage_anywhere {
+            self.adapt_alloc_threshold_after_nothing_freed();
         }
         true
     }
 
-    /// GOGC-style adaptive threshold: grow when almost nothing was collected
-    /// (don't re-collect until the live set has roughly doubled), shrink when a
-    /// lot was garbage (collect sooner).
+    /// Change the threshold by the trigger policy's rule after a collection.
+    /// GOGC-style: when almost nothing was collected, don't collect again
+    /// before the heap has grown by its live size (`live_threshold`); when
+    /// a lot was garbage, collect sooner.
     fn adapt_alloc_threshold(&self, stats: &CollectionStats) {
-        if stats.objects_scanned == 0 {
-            return;
-        }
         let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
-        let collected_ratio = stats.objects_collected as f64 / stats.objects_scanned as f64;
-        if collected_ratio < 0.05 {
-            self.grow_alloc_threshold(stats.objects_scanned);
-        } else if collected_ratio > 0.25 {
-            let new = (threshold / 2).max(LOCAL_GC_ALLOC_THRESHOLD);
-            self.core.alloc_threshold.store(new, Ordering::Relaxed);
+        match self.trigger.get().threshold {
+            ThresholdRule::Gogc => {
+                if stats.objects_scanned == 0 {
+                    return;
+                }
+                let collected_ratio = stats.objects_collected as f64 / stats.objects_scanned as f64;
+                if collected_ratio < 0.05 {
+                    self.core
+                        .alloc_threshold
+                        .store(self.live_threshold(), Ordering::Relaxed);
+                } else if collected_ratio > 0.25 {
+                    let new = (threshold / 2).max(LOCAL_GC_ALLOC_THRESHOLD);
+                    self.core.alloc_threshold.store(new, Ordering::Relaxed);
+                }
+            }
+            ThresholdRule::Fixed => {}
+            ThresholdRule::Adaptive(rule) => {
+                let new = rule.after_collection(
+                    threshold,
+                    stats.objects_collected,
+                    stats.objects_scanned,
+                );
+                self.core.alloc_threshold.store(new, Ordering::Relaxed);
+            }
         }
     }
 
-    /// Almost nothing was garbage: double the threshold, and make it at
-    /// least the `scanned` live set, so the next collection waits until the
-    /// live set has roughly doubled.
-    fn grow_alloc_threshold(&self, scanned: usize) {
-        let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
-        let new = scanned.max(threshold * 2);
-        self.core.alloc_threshold.store(new, Ordering::Relaxed);
+    /// Change the threshold by the trigger policy's rule after a skipped
+    /// collection, which would have freed nothing.
+    fn adapt_alloc_threshold_after_nothing_freed(&self) {
+        match self.trigger.get().threshold {
+            ThresholdRule::Gogc => {
+                // Skips are cheap, so let them space the trigger out, but
+                // within a few heap sizes: the first collection after a
+                // cycle dies still comes soon enough.
+                let live = self.live_threshold();
+                let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
+                let new = (threshold * 2).clamp(live, live * GOGC_IDLE_MAX_FACTOR);
+                self.core.alloc_threshold.store(new, Ordering::Relaxed);
+            }
+            ThresholdRule::Fixed => {}
+            ThresholdRule::Adaptive(rule) => {
+                let threshold = self.core.alloc_threshold.load(Ordering::Relaxed);
+                self.core
+                    .alloc_threshold
+                    .store(rule.after_nothing_freed(threshold), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The GOGC threshold for a heap with little garbage: as many
+    /// allocations as there are live objects (at least
+    /// `LOCAL_GC_ALLOC_THRESHOLD`), so the heap may double before the next
+    /// collection. It follows the live set rather than growing without
+    /// bound, so the trigger's schedule still reaches older generations.
+    fn live_threshold(&self) -> usize {
+        // SAFETY: thread-local collector, no collection in progress.
+        let live = unsafe { self.core.gc_maps_unsync() }.objects.len();
+        live.max(LOCAL_GC_ALLOC_THRESHOLD)
     }
 
     // Forced: master's LLVM inlined this into Gc::new; once GarbageCollector

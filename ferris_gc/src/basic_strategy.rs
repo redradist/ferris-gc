@@ -1,4 +1,3 @@
-use crate::gc::LocalGarbageCollector;
 use crate::gc::sync::GlobalGarbageCollector;
 use std::sync::{Once, RwLock};
 use std::{thread, time};
@@ -17,9 +16,9 @@ pub static BASIC_STRATEGY_DISABLED: AtomicBool = AtomicBool::new(false);
 /// Used by `#[ferris_gc_main(poll_interval_ms = ...)]`.
 pub static BASIC_POLL_INTERVAL_MS: AtomicU64 = AtomicU64::new(50);
 
+// Thread-local collectors are not collected here: only their own thread
+// may collect them (see `LocalGarbageCollector`), on allocation.
 lazy_static! {
-    pub static ref BASIC_STRATEGY_LOCAL_GCS: RwLock<Vec<&'static LocalGarbageCollector>> =
-        RwLock::new(Vec::new());
     pub static ref BASIC_STRATEGY_GLOBAL_GC: RwLock<Option<&'static GlobalGarbageCollector>> =
         RwLock::new(None);
     pub static ref APPLICATION_ACTIVE: AtomicBool = AtomicBool::new(true);
@@ -58,26 +57,10 @@ pub fn basic_strategy_start() {
                         }
                     }
                 }
-                {
-                    let local_gcs_read_guard = (*BASIC_STRATEGY_LOCAL_GCS).read().unwrap();
-                    let local_gcs = &(*local_gcs_read_guard);
-                    unsafe {
-                        for local_gc in local_gcs.iter() {
-                            local_gc.collect();
-                        }
-                    }
-                }
             }
             if let Some(global_gc) = *(*BASIC_STRATEGY_GLOBAL_GC).read().unwrap() {
                 unsafe {
                     global_gc.collect();
-                }
-            }
-            let local_gcs_read_guard = (*BASIC_STRATEGY_LOCAL_GCS).read().unwrap();
-            let local_gcs = &(*local_gcs_read_guard);
-            unsafe {
-                for local_gc in local_gcs.iter() {
-                    local_gc.collect();
                 }
             }
         }));
