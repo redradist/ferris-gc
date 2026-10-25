@@ -2022,6 +2022,12 @@ impl PartialEq for &LocalGarbageCollector {
 
 /// Callback type for a collection strategy. Receives the GC and an "active" flag;
 /// may spawn a background thread and return its `JoinHandle`.
+///
+/// The collector reference is only good for the call: configure the
+/// collector with it (as the built-in strategies do), and do not keep it.
+/// Allocations borrow the collector mutably, after which a kept reference
+/// must not be used, and the collector cannot be shared with another
+/// thread (it is not `Sync`).
 pub type LocalStrategyFn =
     Box<dyn FnMut(&'static LocalGarbageCollector, &'static AtomicBool) -> Option<JoinHandle<()>>>;
 

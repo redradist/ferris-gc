@@ -2596,18 +2596,23 @@ fn gogc_threshold_follows_the_live_set() {
 fn threshold_and_adaptive_local_strategies_collect_on_the_owning_thread() {
     // They used to spawn a thread that collected this thread's collector
     // while this thread mutated it - a data race. Now they only configure
-    // the allocation trigger.
+    // the allocation trigger. (The collector reference a strategy gets is
+    // used right away, as `LocalStrategy::start` does: an allocation's
+    // `borrow_mut` invalidates it.)
     static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     clean_gc_state();
-    let gc = this_thread_gc();
+    let threshold = || LOCAL_GC.with(|gc| gc.borrow().core.alloc_threshold.load(Ordering::Relaxed));
     let live_before = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
 
-    let mut threshold = crate::threshold_local_strategy(crate::ThresholdConfig {
+    let mut strategy = crate::threshold_local_strategy(crate::ThresholdConfig {
         gen0_threshold: 32,
         ..Default::default()
     });
-    assert!(threshold(gc, &ACTIVE).is_none(), "no collector thread");
-    assert_eq!(gc.core.alloc_threshold.load(Ordering::Relaxed), 32);
+    assert!(
+        strategy(this_thread_gc(), &ACTIVE).is_none(),
+        "no collector thread"
+    );
+    assert_eq!(threshold(), 32);
     drop(self_cycle());
     for i in 0..32 {
         drop(Gc::new(i));
@@ -2615,7 +2620,7 @@ fn threshold_and_adaptive_local_strategies_collect_on_the_owning_thread() {
     let live = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
     assert_eq!(live, live_before, "the dead cycle was freed on this thread");
     assert_eq!(
-        gc.core.alloc_threshold.load(Ordering::Relaxed),
+        threshold(),
         32,
         "the threshold strategy keeps its threshold"
     );
@@ -2626,9 +2631,12 @@ fn threshold_and_adaptive_local_strategies_collect_on_the_owning_thread() {
         max_threshold: 80,
         ..Default::default()
     };
-    let mut adaptive = crate::adaptive_local_strategy(config);
-    assert!(adaptive(gc, &ACTIVE).is_none(), "no collector thread");
-    assert_eq!(gc.core.alloc_threshold.load(Ordering::Relaxed), 64);
+    let mut strategy = crate::adaptive_local_strategy(config);
+    assert!(
+        strategy(this_thread_gc(), &ACTIVE).is_none(),
+        "no collector thread"
+    );
+    assert_eq!(threshold(), 64);
     // A collection that frees next to nothing raises the threshold, up to
     // the configured maximum.
     let kept = Gc::new(0);
@@ -2636,7 +2644,7 @@ fn threshold_and_adaptive_local_strategies_collect_on_the_owning_thread() {
     for i in 0..64 {
         drop(Gc::new(i));
     }
-    assert_eq!(gc.core.alloc_threshold.load(Ordering::Relaxed), 80);
+    assert_eq!(threshold(), 80);
     drop(kept);
 }
 
