@@ -869,20 +869,11 @@ where
         if !self.alive.load(Ordering::Acquire) {
             return None;
         }
-        unsafe {
-            // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-            // Acquire STW read lock to prevent collection during upgrade
-            let _stw = GLOBAL_GC
-                .core
-                .stw_lock
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if self.alive.load(Ordering::Acquire) {
-                (*GLOBAL_GC).upgrade_weak(self)
-            } else {
-                None
-            }
-        }
+        // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains
+        // valid for 'static. `upgrade_weak` takes the STW read lock and
+        // re-checks `alive` under it; taking it here too would read-lock it
+        // twice, and a collector waiting between the two would deadlock.
+        unsafe { (*GLOBAL_GC).upgrade_weak(self) }
     }
 }
 
@@ -2889,6 +2880,70 @@ mod tests {
             COUNTED_DROPS.load(std::sync::atomic::Ordering::SeqCst),
             drops + rounds
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // a stress test: its value is in the volume
+    fn weak_upgrade_does_not_deadlock_with_a_waiting_collector() {
+        // Regression: `upgrade` read-locked the STW lock and `upgrade_weak`
+        // read-locked it again. std's `RwLock` makes new readers wait for a
+        // waiting writer, so a collector that started waiting between the
+        // two reads deadlocked with the upgrading thread.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let (_guard, _baseline) = setup();
+        let stop = Arc::new(AtomicBool::new(false));
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let collector = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    unsafe { (*GLOBAL_GC).collect() };
+                }
+            })
+        };
+        let upgraders: Vec<_> = (0..4)
+            .map(|_| {
+                let (stop, upgrades) = (stop.clone(), upgrades.clone());
+                std::thread::spawn(move || {
+                    let g = Gc::new(5u64);
+                    let weak = Gc::downgrade(&g);
+                    while !stop.load(Ordering::Relaxed) {
+                        assert_eq!(**weak.upgrade().unwrap(), 5);
+                        upgrades.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        // Watch for progress instead of joining, so a deadlock fails the test
+        // rather than hanging it.
+        let start = Instant::now();
+        let (mut last, mut last_change) = (0, Instant::now());
+        while start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
+            let n = upgrades.load(Ordering::Relaxed);
+            if n != last {
+                (last, last_change) = (n, Instant::now());
+            }
+            assert!(
+                last_change.elapsed() < Duration::from_secs(2),
+                "weak upgrades stopped making progress after {n}: deadlock"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !(collector.is_finished() && upgraders.iter().all(|t| t.is_finished())) {
+            assert!(
+                Instant::now() < deadline,
+                "weak upgrades did not finish: deadlock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for t in upgraders {
+            t.join().unwrap();
+        }
+        collector.join().unwrap();
     }
 
     #[test]
