@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Changed
+- **Collections after a large free no longer walk the freed slots.** The object map parks long runs of vacant slots, and its passes jump over them; new objects reuse the lowest slots. After a million objects were allocated and dropped, each later full collection took 2–7 ms; it now takes microseconds (one pass of ~5 ms parks the runs).
 - **`sync::Gc<T>` / `sync::GcCell<T>` are one pointer wide.** Handles are counted in the object header, so a clone is one atomic increment. Sync objects are allocated as one block from a per-thread size-class pool, and objects are sharded by allocating thread. Concurrent allocation is ~10× faster than 0.2.0 overall.
 - **`sync::GcCell<T>` is a reader-writer cell.** `borrow`/`borrow_mut` block like `RwLock`, and `try_borrow`/`try_borrow_mut` return `None` instead of blocking. The collector never blocks on a cell.
 - **`ObjectEntry` is 64 bytes** (was 88) in both collectors.
