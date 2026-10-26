@@ -1215,7 +1215,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
                 // Promotion: surviving in-scope objects (already filtered by removal above)
                 let promo_cfg = self.promotion_config();
-                for entry in gc_maps.objects.values_mut() {
+                for (_, entry) in gc_maps.objects.iter_mut() {
                     if entry.generation() > max_gen {
                         continue;
                     }
@@ -1358,7 +1358,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
                 // Promotion: surviving in-scope objects
                 let promo_cfg = self.promotion_config();
-                for entry in gc_maps.objects.values_mut() {
+                for (_, entry) in gc_maps.objects.iter_mut() {
                     if entry.generation() > max_gen {
                         continue;
                     }
