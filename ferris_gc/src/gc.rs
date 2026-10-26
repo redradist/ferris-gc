@@ -1,4 +1,3 @@
-use crate::card_table::CardTable;
 use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::generation::{
     CollectionPhase, CollectionStats, GcStats, Generation, MarkColor, PromotionConfig, RegionId,
@@ -64,8 +63,8 @@ thread_local! {
 /// scope: the handles inside older objects stay counted, and the young
 /// objects they reach stay roots. Walking them would subtract those handles,
 /// and a young object reachable only from an untraced older one (e.g. an
-/// edge made before the older object was promoted, which no card records)
-/// would be freed while still reachable.
+/// edge made before the older object was promoted) would be freed while
+/// still reachable.
 pub(crate) const CASCADE_PENDING: usize = usize::MAX;
 
 /// Error returned when a GC allocation fails due to memory exhaustion.
@@ -112,7 +111,6 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     pub(crate) blocked_scans: AtomicUsize,
     /// Allocation counter for adaptive collection triggering.
     pub(crate) allocation_count: O::Counter,
-    pub(crate) card_table: CardTable,
     pub(crate) stw_lock: crate::sharded_map::StwLock,
     pub(crate) incremental: Mutex<IncrementalState>,
     /// Cheap gate: true between `begin_collection` and `finish_collection` so
@@ -190,7 +188,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
             weak_alive_len: AtomicUsize::new(0),
             blocked_scans: AtomicUsize::new(0),
             allocation_count: <O::Counter as Counter>::with_shards(shards),
-            card_table: CardTable::new(),
             stw_lock: crate::sharded_map::StwLock::with_shards(shards),
             incremental: Mutex::new(IncrementalState::new()),
             marking: AtomicBool::new(false),
@@ -562,19 +559,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
         Arc::new(AtomicBool::new(false))
     }
 
-    /// Write barrier: if the object is in Gen1+, mark its card dirty in the
-    /// card table so that young-generation collections trace through it.
-    /// Incremental marking needs no barrier (see [`IncrementalState`]).
-    pub(crate) fn write_barrier(&self, obj_id: ObjectId, obj_ptr: *const dyn Trace) {
-        let thin = obj_ptr.get_thin_ptr();
-        let gc_maps = self.lock_gc_maps();
-        if let Some(entry) = gc_maps.objects.get(obj_id) {
-            if entry.generation() > Generation::Gen0 {
-                self.card_table.mark_dirty(thin);
-            }
-        }
-    }
-
     /// Current phase of the incremental collector (`Idle`/`Marking`/`Sweeping`).
     #[inline]
     pub(crate) fn incremental_phase(&self) -> CollectionPhase {
@@ -620,7 +604,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
     pub(crate) unsafe fn drop_handle(&self, object_id: ObjectId, is_root: bool) {
         let object_dealloc = {
             let mut gc_maps = self.lock_gc_maps();
-            Self::drop_handle_inner(&mut gc_maps, &self.card_table, object_id, is_root)
+            Self::drop_handle_inner(&mut gc_maps, object_id, is_root)
         };
         if let Some(obj_entry) = object_dealloc {
             self.track_dealloc(obj_entry.layout.size());
@@ -631,7 +615,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
     #[inline]
     pub(crate) unsafe fn drop_handle_unsync(&self, object_id: ObjectId, is_root: bool) {
         let gc_maps = unsafe { self.gc_maps_unsync() };
-        let object_dealloc = Self::drop_handle_inner(gc_maps, &self.card_table, object_id, is_root);
+        let object_dealloc = Self::drop_handle_inner(gc_maps, object_id, is_root);
         if let Some(obj_entry) = object_dealloc {
             self.track_dealloc(obj_entry.layout.size());
             unsafe { Self::dealloc_object_entry(obj_entry) };
@@ -641,7 +625,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
     #[inline]
     fn drop_handle_inner(
         gc_maps: &mut GcMaps<O>,
-        card_table: &CardTable,
         object_id: ObjectId,
         is_root: bool,
     ) -> Option<ObjectEntryRef> {
@@ -651,11 +634,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
             }
             obj_entry.handle_count = obj_entry.handle_count.saturating_sub(1);
             if obj_entry.handle_count == 0 {
-                let obj_gen = obj_entry.generation();
                 // SAFETY: `object_id` was just found occupied.
-                return Some(unsafe {
-                    Self::unregister_object(gc_maps, card_table, object_id, obj_gen)
-                });
+                return Some(unsafe { Self::unregister_object(gc_maps, object_id) });
             }
             // The object outlives this handle: if it was its last path from a
             // root, it is now garbage only a collection can free.
@@ -667,33 +647,24 @@ impl<O: ObjectMap> GarbageCollector<O> {
     /// Full-lock variant of `release_object` (weak references present).
     fn release_object_inner(
         gc_maps: &mut GcMaps<O>,
-        card_table: &CardTable,
         object_id: ObjectId,
     ) -> Option<ObjectEntryRef> {
-        let obj_gen = gc_maps.objects.get(object_id)?.generation();
+        gc_maps.objects.get(object_id)?;
         // SAFETY: `object_id` was just found occupied.
-        Some(unsafe { Self::unregister_object(gc_maps, card_table, object_id, obj_gen) })
+        Some(unsafe { Self::unregister_object(gc_maps, object_id) })
     }
 
     /// Take an object that has no handles left out of the collector's books:
-    /// its entry, its card-table registration and its weak flag. The caller
+    /// its entry and its weak flag. The caller
     /// frees it. Shared by both collectors' release paths (the sync shard
     /// fast path differs only in working on one shard with no weak refs).
     ///
     /// # Safety
-    /// `object_id` must be occupied in `gc_maps`, with generation `obj_gen`.
+    /// `object_id` must be occupied in `gc_maps`.
     #[inline(always)]
-    unsafe fn unregister_object(
-        gc_maps: &mut GcMaps<O>,
-        card_table: &CardTable,
-        object_id: ObjectId,
-        obj_gen: Generation,
-    ) -> ObjectEntryRef {
+    unsafe fn unregister_object(gc_maps: &mut GcMaps<O>, object_id: ObjectId) -> ObjectEntryRef {
         // SAFETY: the caller guarantees `object_id` is occupied.
         let entry = unsafe { gc_maps.objects.remove_unchecked(object_id) };
-        if obj_gen != Generation::Gen0 {
-            card_table.remove_object(entry.ptr.get_thin_ptr(), object_id);
-        }
         if !gc_maps.weak_alive_map.is_empty() {
             if let Some(alive) = gc_maps.weak_alive_map.remove(&object_id) {
                 alive.store(false, Ordering::Release);
@@ -922,8 +893,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
     }
 
     /// Generational collection: collect objects in generations 0..=max_gen.
-    /// For partial collections (< Gen2), traces from in-scope roots + dirty card table entries.
-    /// For full collections (Gen2), traces from ALL roots and clears the card table.
+    /// For partial collections (< Gen2), traces from in-scope roots; a young
+    /// object an older one points at is one (see [`CASCADE_PENDING`]).
+    /// For full collections (Gen2), traces from ALL roots.
     /// Sweep phase only collects objects in target generations.
     /// Surviving objects in gens < max_gen may be promoted.
     pub unsafe fn collect_generation(&self, max_gen: Generation) -> CollectionStats {
@@ -998,17 +970,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                // For partial collections, also trace from dirty card table entries.
-                if max_gen < Generation::Gen2 {
-                    let dirty_ids = self.card_table.dirty_objects();
-                    for obj_id in &dirty_ids {
-                        if let Some(entry) = gc_maps.objects.get(*obj_id) {
-                            // SAFETY: Object pointer is valid while gc_maps lock is held.
-                            (&*entry.ptr).trace();
-                        }
-                    }
-                }
-
                 // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
@@ -1032,10 +993,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
                             entry.set_survive_count(0);
                             if let Some(next_gen) = cur_gen.next() {
-                                if cur_gen == Generation::Gen0 {
-                                    let thin = entry.ptr.get_thin_ptr();
-                                    self.card_table.register_object(thin, id);
-                                }
                                 entry.set_generation(next_gen);
                                 stats.objects_promoted += 1;
                             }
@@ -1065,10 +1022,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
                             entry.set_survive_count(0);
                             if let Some(next_gen) = cur_gen.next() {
-                                if cur_gen == Generation::Gen0 {
-                                    let thin = entry.ptr.get_thin_ptr();
-                                    self.card_table.register_object(thin, obj_id);
-                                }
                                 entry.set_generation(next_gen);
                                 stats.objects_promoted += 1;
                                 // Promoted out of Gen0 — don't add back to gen0_ids
@@ -1103,10 +1056,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
                             entry.set_survive_count(0);
                             if let Some(next_gen) = cur_gen.next() {
-                                if cur_gen == Generation::Gen0 {
-                                    let thin = entry.ptr.get_thin_ptr();
-                                    self.card_table.register_object(thin, id);
-                                }
                                 entry.set_generation(next_gen);
                                 stats.objects_promoted += 1;
                                 entry.root_ref_count().set(0);
@@ -1129,7 +1078,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     if let Some(entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
-                        self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
                         stats.handles_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
@@ -1137,11 +1085,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         }
                         object_deallocs.push(entry);
                     }
-                }
-
-                // On full collection, clear dirty flags in the card table
-                if max_gen >= Generation::Gen2 {
-                    self.card_table.clear_dirty();
                 }
 
                 object_deallocs
@@ -1180,7 +1123,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 // STW: block all mutator operations during cleanup
                 let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
                 let mut gc_maps = self.lock_gc_maps();
-                self.card_table.clear_all();
 
                 let obj_entries = gc_maps.objects.drain();
                 gc_maps.ptr_to_object.clear();
@@ -1232,16 +1174,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                // For partial collections, also trace from dirty card table entries.
-                if max_gen < Generation::Gen2 {
-                    let dirty_ids = self.card_table.dirty_objects();
-                    for obj_id in &dirty_ids {
-                        if let Some(entry) = gc_maps.objects.get(*obj_id) {
-                            (&*entry.ptr).trace();
-                        }
-                    }
-                }
-
                 // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
@@ -1272,7 +1204,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     if let Some(entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
-                        self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
                         stats.handles_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
@@ -1282,14 +1213,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                // On full collection, clear dirty flags in the card table
-                if max_gen >= Generation::Gen2 {
-                    self.card_table.clear_dirty();
-                }
-
                 // Promotion: surviving in-scope objects (already filtered by removal above)
                 let promo_cfg = self.promotion_config();
-                for (obj_id, entry) in gc_maps.objects.iter_mut() {
+                for (_, entry) in gc_maps.objects.iter_mut() {
                     if entry.generation() > max_gen {
                         continue;
                     }
@@ -1298,10 +1224,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
                         entry.set_survive_count(0);
                         if let Some(next_gen) = cur_gen.next() {
-                            if cur_gen == Generation::Gen0 {
-                                let thin = entry.ptr.get_thin_ptr();
-                                self.card_table.register_object(thin, obj_id);
-                            }
                             entry.set_generation(next_gen);
                             stats.objects_promoted += 1;
                         }
@@ -1395,16 +1317,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     (&*stp.0).trace();
                 });
 
-                // Card table entries (serial, typically few entries)
-                if max_gen < Generation::Gen2 {
-                    let dirty_ids = self.card_table.dirty_objects();
-                    for obj_id in &dirty_ids {
-                        if let Some(entry) = gc_maps.objects.get(*obj_id) {
-                            (&*entry.ptr).trace();
-                        }
-                    }
-                }
-
                 // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
@@ -1435,7 +1347,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     if let Some(entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
-                        self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
                         stats.handles_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
@@ -1445,13 +1356,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                if max_gen >= Generation::Gen2 {
-                    self.card_table.clear_dirty();
-                }
-
                 // Promotion: surviving in-scope objects
                 let promo_cfg = self.promotion_config();
-                for (obj_id, entry) in gc_maps.objects.iter_mut() {
+                for (_, entry) in gc_maps.objects.iter_mut() {
                     if entry.generation() > max_gen {
                         continue;
                     }
@@ -1460,10 +1367,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
                         entry.set_survive_count(0);
                         if let Some(next_gen) = cur_gen.next() {
-                            if cur_gen == Generation::Gen0 {
-                                let thin = entry.ptr.get_thin_ptr();
-                                self.card_table.register_object(thin, obj_id);
-                            }
                             entry.set_generation(next_gen);
                             stats.objects_promoted += 1;
                         }
@@ -1617,10 +1520,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
                             entry.set_survive_count(0);
                             if let Some(next_gen) = cur_gen.next() {
-                                if cur_gen == Generation::Gen0 {
-                                    let thin = entry.ptr.get_thin_ptr();
-                                    self.card_table.register_object(thin, id);
-                                }
                                 entry.set_generation(next_gen);
                                 stats.objects_promoted += 1;
                             }
@@ -1636,7 +1535,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     if let Some(entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
-                        self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
                         stats.handles_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
@@ -1644,11 +1542,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         }
                         object_deallocs.push(entry);
                     }
-                }
-
-                // Clear card table dirty flags on full collection
-                if max_gen >= Generation::Gen2 {
-                    self.card_table.clear_dirty();
                 }
 
                 // Reset incremental state
@@ -1821,14 +1714,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                // Also trace from dirty card table entries
-                let dirty_ids = self.card_table.dirty_objects();
-                for obj_id in &dirty_ids {
-                    if let Some(entry) = gc_maps.objects.get(*obj_id) {
-                        (&*entry.ptr).trace();
-                    }
-                }
-
                 // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
@@ -1855,7 +1740,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     if let Some(entry) = gc_maps.objects.remove(obj_id) {
                         let thin = entry.ptr.get_thin_ptr();
                         gc_maps.ptr_to_object.remove(&thin);
-                        self.card_table.remove_object(thin, obj_id);
                         stats.bytes_freed += entry.layout.size();
                         stats.handles_collected += Self::handles_held(&entry);
                         if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
@@ -1992,7 +1876,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                         if let Some(entry) = gc_maps.objects.remove(*obj_id) {
                             let thin = entry.ptr.get_thin_ptr();
                             gc_maps.ptr_to_object.remove(&thin);
-                            self.card_table.remove_object(thin, *obj_id);
                             stats.bytes_freed += entry.layout.size();
                             stats.handles_collected += Self::handles_held(&entry);
                             if let Some(alive) = gc_maps.weak_alive_map.remove(obj_id) {
@@ -2194,10 +2077,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 // Update ptr_to_object mapping (borrows gc_maps, not gc_maps.objects)
                 gc_maps.ptr_to_object.remove(&old_thin);
                 gc_maps.ptr_to_object.insert(new_thin, *id);
-
-                // Update card table
-                self.card_table.remove_object(old_thin, *id);
-                self.card_table.register_object(new_thin, *id);
             }
 
             // TODO: Relocate Gc/GcCell handle pointers after compaction.
@@ -2292,18 +2171,11 @@ impl GarbageCollector<SyncObjects> {
                 return None;
             }
             let key = object_id.strip_shard();
-            let Some(entry) = shard.get(key) else {
+            if shard.get(key).is_none() {
                 return Some(None);
-            };
-            let obj_gen = entry.generation();
-            // SAFETY: `key` was just found occupied in this shard.
-            let entry = unsafe { shard.remove_unchecked(key) };
-            if obj_gen != Generation::Gen0 {
-                // CardTable synchronizes itself.
-                self.card_table
-                    .remove_object(entry.ptr.get_thin_ptr(), object_id);
             }
-            Some(Some(entry))
+            // SAFETY: `key` was just found occupied in this shard.
+            Some(Some(unsafe { shard.remove_unchecked(key) }))
         });
         let released = match fast {
             Some(r) => r,
@@ -2319,7 +2191,7 @@ impl GarbageCollector<SyncObjects> {
                         return;
                     }
                 }
-                let r = Self::release_object_inner(&mut gc_maps, &self.card_table, object_id);
+                let r = Self::release_object_inner(&mut gc_maps, object_id);
                 // Re-sync the hint while every shard is held, so a program that
                 // used weak refs only briefly returns to the fast path.
                 self.weak_alive_len

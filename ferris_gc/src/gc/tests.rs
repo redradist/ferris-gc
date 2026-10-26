@@ -399,102 +399,10 @@ fn allocation_count_tracks_new_objects() {
 }
 
 #[test]
-fn write_barrier_marks_old_gen_object_card_dirty() {
-    clean_gc_state();
-    use crate::gc::GcCell;
-    let cell = GcCell::new(Option::<Gc<i32>>::None);
-
-    // Promote cell's object to Gen1 (survive 3 Gen0 collections)
-    LOCAL_GC.with(|gc| {
-        let gc_ref = gc.borrow();
-        for _ in 0..3 {
-            unsafe {
-                gc_ref
-                    .core
-                    .collect_generation(crate::generation::Generation::Gen0);
-            }
-        }
-        // Verify it's in Gen1 (check by value to avoid fat pointer comparison issues)
-        let gc_maps = gc_ref.core.lock_gc_maps();
-        assert!(
-            gc_maps
-                .objects
-                .values()
-                .any(|e| e.generation() == crate::generation::Generation::Gen1),
-            "cell should be promoted to Gen1 after 3 Gen0 collections"
-        );
-    });
-
-    // Card table should be clean before mutation
-    LOCAL_GC.with(|gc| {
-        assert!(
-            gc.borrow().core.card_table.is_clean(),
-            "card table should be clean before write barrier"
-        );
-    });
-
-    // Mutate via borrow_mut() — triggers write barrier
-    // (must be outside LOCAL_GC.with borrow to avoid RefCell conflict)
-    {
-        let young = Gc::new(42);
-        **cell.borrow_mut() = Some(young);
-    }
-
-    // Verify cell's card is now dirty in the card table
-    LOCAL_GC.with(|gc| {
-        let gc_ref = gc.borrow();
-        assert!(
-            gc_ref.core.card_table.has_dirty(),
-            "write barrier should mark card dirty in card table"
-        );
-    });
-}
-
-#[test]
-fn card_table_cleared_on_full_collection() {
-    clean_gc_state();
-    use crate::gc::GcCell;
-    let cell = GcCell::new(Option::<Gc<i32>>::None);
-
-    // Promote to Gen1
-    LOCAL_GC.with(|gc| {
-        let gc_ref = gc.borrow();
-        for _ in 0..3 {
-            unsafe {
-                gc_ref
-                    .core
-                    .collect_generation(crate::generation::Generation::Gen0);
-            }
-        }
-    });
-
-    // Trigger write barrier (outside LOCAL_GC borrow)
-    **cell.borrow_mut() = Some(Gc::new(99));
-
-    LOCAL_GC.with(|gc| {
-        let gc_ref = gc.borrow();
-        assert!(
-            gc_ref.core.card_table.has_dirty(),
-            "card table should have dirty cards after write barrier"
-        );
-
-        // Full collection (Gen2) should clear card table dirty flags
-        unsafe {
-            gc_ref
-                .core
-                .collect_generation(crate::generation::Generation::Gen2);
-        }
-        assert!(
-            gc_ref.core.card_table.is_clean(),
-            "card table should be clean after full collection"
-        );
-    });
-}
-
-#[test]
-fn write_barrier_preserves_young_object_during_gen0_collection() {
-    // Key correctness test: an old-gen object holds a reference to a young
-    // object. Without write barrier, the young object would be collected.
+fn gen0_collection_keeps_young_object_held_by_old_one() {
+    // An old-gen object holds the only reference to a young object: a Gen0
+    // collection must keep it (root discovery counts the handle inside the
+    // old object, see CASCADE_PENDING).
     clean_gc_state();
     use crate::gc::GcCell;
     let cell = GcCell::new(Option::<Gc<i32>>::None);
@@ -517,7 +425,7 @@ fn write_barrier_preserves_young_object_during_gen0_collection() {
     drop(young); // Drop user handle — only reference is from old-gen cell
 
     // Gen0 collection — the young object must survive because
-    // it's referenced by an old-gen object tracked via the card table
+    // it's referenced by an old-gen object
     LOCAL_GC.with(|gc| {
         let gc_ref = gc.borrow();
         let objs_before = gc_ref.core.lock_gc_maps().objects.len();
@@ -529,7 +437,7 @@ fn write_barrier_preserves_young_object_during_gen0_collection() {
         let objs_after = gc_ref.core.lock_gc_maps().objects.len();
         assert_eq!(
             objs_before, objs_after,
-            "young object referenced from old-gen (via card table) must survive Gen0 collection"
+            "young object referenced from old-gen must survive Gen0 collection"
         );
     });
 }
@@ -571,23 +479,6 @@ fn compact_repeated_iterations() {
         drop(v);
         LOCAL_GC.with(|gc| unsafe { gc.borrow().collect() });
     }
-}
-
-#[test]
-fn no_write_barrier_for_gen0_objects() {
-    clean_gc_state();
-    use crate::gc::GcCell;
-    let cell = GcCell::new(Option::<Gc<i32>>::None);
-
-    // Cell is still in Gen0 — borrow_mut should NOT mark card dirty
-    **cell.borrow_mut() = Some(Gc::new(1));
-
-    LOCAL_GC.with(|gc| {
-        assert!(
-            gc.borrow().core.card_table.is_clean(),
-            "Gen0 objects should not mark cards dirty in card table"
-        );
-    });
 }
 
 #[test]
@@ -2472,12 +2363,12 @@ fn no_garbage_while_flag_clear_under_random_mutation() {
 
 #[test]
 fn partial_collection_keeps_young_object_reached_only_from_promoted_one() {
-    // Regression: X gets an edge to Y while both are in Gen0 (the write
-    // barrier marks no card), then X is promoted and Y is not. A Gen0
-    // collection whose root-discovery cascade reached X through a dead Gen0
-    // cycle Z subtracted X's handle to Y; X itself is out of scope and its
-    // card clean, so nothing traced it, and Y was freed while X still
-    // pointed at it.
+    // Regression: X gets an edge to Y while both are in Gen0, then X is
+    // promoted and Y is not. A Gen0 collection whose root-discovery cascade
+    // reached X through a dead Gen0 cycle Z subtracted X's handle to Y; X
+    // itself is out of scope (and the card table of the time had no card
+    // for it), so nothing traced it, and Y was freed while X still pointed
+    // at it.
     use crate::generation::Generation;
     clean_gc_state();
     let gen0 =
