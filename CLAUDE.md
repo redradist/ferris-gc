@@ -48,7 +48,7 @@ Every change, performance work included, should follow these:
 
 ### Core Traits
 
-- **`Trace`** — Object graph traversal for mark-and-sweep. Methods: `trace()` (mark reachable), `is_traceable()` (check if marked), `reset()` (clear marks), `is_root()`/`reset_root()`.
+- **`Trace`** — Object graph traversal for mark-and-sweep. Methods: `trace()` (mark reachable), `is_traceable()` (check if marked), `reset()` (clear marks), `is_root()`/`reset_root()` (root discovery), `trace_children()` (the incremental mark's snapshot), `clear_trace()`, and `relocate()` (for the disabled `compact()`).
 - **`Finalize`** — Destructor callback (`finalize()`) invoked before deallocation.
 
 ### Two GC Implementations
@@ -89,7 +89,7 @@ Raw allocations use TLAB bump allocation (thread-local arena blocks) with system
 - **Skipping futile collections (thread-local):** Unreachable objects that still have handles can only appear when a handle is dropped while its object keeps others. `GcMaps::garbage_possible` has one bit per collection scope. Such a drop sets every bit, and a collection clears its scope's bits when it starts. The allocation triggers skip a collection whose bit is clear (skips still advance the schedule) and trim `gen0_ids`. When no collection could free anything, the threshold grows (`Gogc`: it doubles, up to 8× the live set); while only older generations may hold garbage, it stays.
 - **Generational collection:** Gen0/Gen1/Gen2. The thread-local trigger widens collections on its schedule; the sync collector's strategies schedule them on their threads.
 - **Root discovery in partial collections:** phase 1 marks the objects in scope with `CASCADE_PENDING`, and the cascade walks only those. Handles inside older objects therefore stay counted, and every young object an older one points at is a root. So there is no card table and no write barrier: `GcCell::borrow_mut` does not touch the collector.
-- **Incremental/concurrent marking:** both are snapshot-at-the-beginning. `begin_collection` records each in-scope object's children (`IncrementalState::children`), and the mark steps follow only that snapshot, so mutations cannot hide an object and the steps need no STW. Objects born mid-mark are greyed (they have no snapshot, so their step only blackens them). A weak upgrade mid-mark greys its object, which may be a dead cycle the snapshot does not reach. The concurrent entry points are the same cycle under other names.
+- **Incremental/concurrent marking:** both are snapshot-at-the-beginning. `begin_collection` records each in-scope object's children (`IncrementalState::children`), and the mark steps follow only that snapshot, so mutations cannot hide an object and the steps need no STW. Objects born mid-mark are greyed (they have no snapshot, so their step only blackens them). A weak upgrade mid-mark greys its object, which may be a dead cycle the snapshot does not reach. Incremental and concurrent marking are one cycle (`begin_collection` → `mark_step` → `finish_collection`): the thread-local trigger runs its steps on the owning thread, the global background/g1 strategies on their own thread while the mutators run.
 - **gen0_ids:** Fast Vec of Gen0 ObjectIds for O(Gen0) partial collections, with heuristic fallback to full iteration when stale entries exceed live objects. Thread-local only: a sync allocation holds just its shard's lock and cannot append to it, so a sync Gen0 collection iterates every object, as Gen1 does.
 
 ### Procedural Macros (`ferris_gc_proc_macro`)
@@ -112,7 +112,8 @@ Pre-built `Trace`/`Finalize` impls for primitives, String, Box, Vec, HashMap, BT
 |---------|---------|-------------|
 | `std` | yes | Full GC runtime (collectors, strategies, threading) |
 | `proc-macro` | no | `#[derive(Trace, Finalize)]` and `#[ferris_gc_main]` |
-| `_internal` | no | Exposes `_collect()`, `_compact()` etc. for benchmarks/integration tests |
+| `parallel` | no | Reserved: `collect_parallel` exists but runs serially (destructors and TLAB frees must stay on the collecting thread) |
+| `_internal` | no | Exposes `_collect()`, `_compact()` etc. for benchmarks, integration tests and the fuzz targets |
 
 With `--no-default-features`, only core traits (`Trace`, `Finalize`) and `generation` types are exported (`no_std` compatible).
 
@@ -134,6 +135,7 @@ The benchmark crate's release profile uses `lto = "fat"` for cross-crate inlinin
 
 - `compact()` / `_compact()` is currently **disabled** — always returns 0 without moving objects (asserted by `compact_is_disabled_returns_zero`). Re-enabling requires a `relocate()` cascade through all Trace impls (derive macro + default_trace) plus pinning of rooted objects, since stack handles cannot be discovered after the GcInternal elimination.
 - Some sync tests are flaky due to shared global GC state (test ordering sensitive). Run individual tests with `cargo test -- <test_name>` if a sync test fails in batch.
+- `pool::tests::blocks_are_distinct_aligned_and_reused` failed once under heavy machine load (its page counts); it has not reproduced in 50 runs since.
 - Benchmark variance is high (2-5x between runs) due to system load, cache effects, and TLAB block reuse patterns.
 
 ## graphify
