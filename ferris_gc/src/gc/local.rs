@@ -261,7 +261,7 @@ pub struct Gc<T>
 where
     T: 'static + Sized + Trace,
 {
-    /// Packed pointer: bit 0 = is_root, bits 1.. = pointer to GcPtr<T>.
+    /// Packed pointer: bit 0 = is_root, bits 1.. = pointer to `GcPtr<T>`.
     ptr: Cell<NonZeroUsize>,
     /// `*const T` keeps `Gc<T>` `!Send`/`!Sync` (thread-local collector).
     _marker: PhantomData<*const T>,
@@ -1209,7 +1209,7 @@ impl LocalGarbageCollector {
                 }
             }
             CollectionPhase::Marking => {
-                let done = unsafe { self.core.mark_step(budget) };
+                let done = self.core.mark_step(budget);
                 if done {
                     let stats = unsafe { self.core.finish_collection() };
                     self.core.allocation_count.store(0, Ordering::Relaxed);
@@ -1749,17 +1749,6 @@ impl LocalGarbageCollector {
         unsafe { self.core.collect_parallel(max_gen) }
     }
 
-    /// Collection with parallel mark AND parallel sweep using rayon.
-    /// Parallelizes root tracing across worker threads for faster marking
-    /// on large heaps with many roots.
-    ///
-    /// # Safety
-    /// Must not be called while any GC references are being dereferenced.
-    #[cfg(feature = "parallel")]
-    pub(crate) unsafe fn collect_parallel_mark(&self, max_gen: Generation) -> CollectionStats {
-        unsafe { self.core.collect_parallel_mark(max_gen) }
-    }
-
     #[inline]
     pub(crate) unsafe fn drop_handle(&self, object_id: ObjectId, is_root: bool) {
         // SAFETY: Thread-local GC, no concurrent access; caller provides valid object_id.
@@ -1779,13 +1768,10 @@ impl LocalGarbageCollector {
         }
     }
 
-    /// Process a batch of gray objects. Returns true when marking is complete.
-    ///
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn mark_step(&self, budget: usize) -> bool {
-        // SAFETY: Caller upholds the safety contract; delegates to core.mark_step().
-        unsafe { self.core.mark_step(budget) }
+    /// Process up to `budget` grey objects. Returns true when marking is
+    /// complete. Needs no STW (see `GarbageCollector::mark_step`).
+    pub(crate) fn mark_step(&self, budget: usize) -> bool {
+        self.core.mark_step(budget)
     }
 
     /// Finish incremental collection: sweep white objects, promote survivors.
@@ -1810,42 +1796,9 @@ impl LocalGarbageCollector {
         unsafe { self.core.collect_incremental(max_gen, step_budget) }
     }
 
-    /// Begin a concurrent collection: short STW to snapshot roots + edges.
-    ///
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn begin_concurrent_collection(&self, max_gen: Generation) {
-        // SAFETY: Caller upholds the safety contract; delegates to core.begin_concurrent_collection().
-        unsafe {
-            self.core.begin_concurrent_collection(max_gen);
-        }
-    }
-
-    /// Process gray objects using edge snapshot. NO STW lock — safe for concurrent use.
-    pub(crate) fn concurrent_mark_step(&self, budget: usize) -> bool {
-        self.core.concurrent_mark_step(budget)
-    }
-
-    /// Run a complete concurrent collection (snapshot → concurrent mark → STW sweep).
-    ///
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn collect_concurrent(
-        &self,
-        max_gen: Generation,
-        step_budget: usize,
-    ) -> CollectionStats {
-        // SAFETY: Caller upholds the safety contract; delegates to core.collect_concurrent().
-        unsafe { self.core.collect_concurrent(max_gen, step_budget) }
-    }
-
-    /// Time-budgeted incremental mark step. See `GarbageCollector::mark_step_timed`.
-    ///
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
-        // SAFETY: Caller upholds the safety contract; delegates to core.mark_step_timed().
-        unsafe { self.core.mark_step_timed(max_duration) }
+    /// Time-budgeted mark step. See `GarbageCollector::mark_step_timed`.
+    pub(crate) fn mark_step_timed(&self, max_duration: Duration) -> bool {
+        self.core.mark_step_timed(max_duration)
     }
 
     /// Run a complete incremental collection with time-budgeted steps.
@@ -1861,27 +1814,6 @@ impl LocalGarbageCollector {
         unsafe {
             self.core
                 .collect_incremental_timed(max_gen, max_step_duration)
-        }
-    }
-
-    /// Time-budgeted concurrent mark step. NO STW lock — safe for concurrent use.
-    pub(crate) fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
-        self.core.concurrent_mark_step_timed(max_duration)
-    }
-
-    /// Run a complete concurrent collection with time-budgeted steps.
-    ///
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn collect_concurrent_timed(
-        &self,
-        max_gen: Generation,
-        max_step_duration: Duration,
-    ) -> CollectionStats {
-        // SAFETY: Caller upholds the safety contract; delegates to core.collect_concurrent_timed().
-        unsafe {
-            self.core
-                .collect_concurrent_timed(max_gen, max_step_duration)
         }
     }
 
@@ -1987,19 +1919,21 @@ impl LocalGarbageCollector {
     ) -> CollectionStats {
         unsafe { self.collect_incremental_timed(max_gen, max_step_duration) }
     }
+    #[deprecated(note = "the same cycle as `_collect_incremental`")]
     pub unsafe fn _collect_concurrent(
         &self,
         max_gen: Generation,
         step_budget: usize,
     ) -> CollectionStats {
-        unsafe { self.collect_concurrent(max_gen, step_budget) }
+        unsafe { self.collect_incremental(max_gen, step_budget) }
     }
+    #[deprecated(note = "the same cycle as `_collect_incremental_timed`")]
     pub unsafe fn _collect_concurrent_timed(
         &self,
         max_gen: Generation,
         max_step_duration: Duration,
     ) -> CollectionStats {
-        unsafe { self.collect_concurrent_timed(max_gen, max_step_duration) }
+        unsafe { self.collect_incremental_timed(max_gen, max_step_duration) }
     }
     pub unsafe fn _collect_region(&self, region: LocalRegionId) -> CollectionStats {
         unsafe { self.collect_region(region) }

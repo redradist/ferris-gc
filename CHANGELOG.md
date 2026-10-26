@@ -17,6 +17,7 @@
 - **The card table and the write barrier.** Partial collections treat every young object an older one points at as a root, and incremental marking follows a snapshot, so neither needed the cards for correctness. `GcCell::borrow_mut` no longer locks the collector, and freeing or promoting an older object no longer locks the card table.
 
 ### Deprecated
+- `_collect_concurrent` / `_collect_concurrent_timed` (`_internal` feature) → `_collect_incremental` / `_collect_incremental_timed`: incremental and concurrent marking are one cycle.
 - `CollectionStats::tracers_collected` → `handles_collected`, and `GcStats::live_tracers` → `live_handles`. The old fields stay as aliases holding the same values.
 
 ### Fixed

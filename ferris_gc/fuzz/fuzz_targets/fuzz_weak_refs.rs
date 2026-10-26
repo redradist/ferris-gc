@@ -68,7 +68,7 @@ fuzz_target!(|data: &[u8]| {
             6 => {
                 // Trigger collection and verify weak invariants
                 ferris_gc::LOCAL_GC.with(|gc| unsafe {
-                    gc.borrow_mut().collect();
+                    gc.borrow()._collect();
                 });
                 // After collection, any weak whose strong was dropped should
                 // report not alive or return None on upgrade.
@@ -88,7 +88,7 @@ fuzz_target!(|data: &[u8]| {
     // Final cleanup: drop all strong handles, collect, verify all weaks are dead
     strongs.clear();
     ferris_gc::LOCAL_GC.with(|gc| unsafe {
-        gc.borrow_mut().collect();
+        gc.borrow()._collect();
     });
     for weak in &weaks {
         assert!(
@@ -98,6 +98,6 @@ fuzz_target!(|data: &[u8]| {
     }
     drop(weaks);
     ferris_gc::LOCAL_GC.with(|gc| unsafe {
-        gc.borrow_mut().collect();
+        gc.borrow()._collect();
     });
 });
