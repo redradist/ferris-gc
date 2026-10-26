@@ -547,9 +547,8 @@ where
 /// variants return `None` instead. A conflicting borrow on the thread that
 /// already holds the cell deadlocks, as with `RwLock`.
 ///
-/// `borrow_mut()` triggers the write barrier for generational collection. The
-/// collector never waits for a borrow: a collection that finds a cell mutably
-/// borrowed frees nothing and is retried later.
+/// The collector never waits for a borrow: a collection that finds a cell
+/// mutably borrowed frees nothing and is retried later.
 pub struct GcCell<T>
 where
     T: 'static + Sized + Trace,
@@ -684,12 +683,6 @@ where
         unsafe { (*GLOBAL_GC).try_create_gc_cell(t, region.0) }
     }
 
-    /// The object's id in the global collector.
-    #[inline]
-    pub(crate) fn object_id(&self) -> ObjectId {
-        self.cell().info.object_id
-    }
-
     #[inline]
     fn cell(&self) -> &GcCellBox<T> {
         // SAFETY: the object is alive while this handle exists.
@@ -723,11 +716,7 @@ where
         })
     }
 
-    /// Mutable borrow with write barrier. Waits while any other borrow of the
-    /// cell is held.
-    ///
-    /// Triggers the write barrier so that if this object is in an older
-    /// generation, its card is marked dirty for young-generation collections.
+    /// Mutable borrow. Waits while any other borrow of the cell is held.
     pub fn borrow_mut(&self) -> GcCellRefMut<'_, T> {
         loop {
             if let Some(borrow) = self.try_borrow_mut() {
@@ -739,8 +728,8 @@ where
         }
     }
 
-    /// Mutable borrow with write barrier, or `None` while any other borrow of
-    /// the cell is held. May wait for a running collection to finish.
+    /// Mutable borrow, or `None` while any other borrow of the cell is held.
+    /// May wait for a running collection to finish.
     pub fn try_borrow_mut(&self) -> Option<GcCellRefMut<'_, T>> {
         let cell = self.cell();
         // Under the STW read lock, so no collection is running while the cell
@@ -757,9 +746,6 @@ where
             Err(TryLockError::Poisoned(e)) => e.into_inner(),
             Err(TryLockError::WouldBlock) => return None,
         };
-        GLOBAL_GC
-            .core
-            .write_barrier(self.object_id(), self.ptr as *const dyn Trace);
         Some(GcCellRefMut {
             // SAFETY: the write lock excludes every other borrow.
             value: unsafe { &mut *cell.value.get() },
@@ -991,8 +977,8 @@ impl GlobalGarbageCollector {
             );
             // Shard-scoped registration: insert into this thread's own shard so
             // concurrent allocation does not serialize on one global lock.
-            // ptr_to_object, region stats, and card table are populated lazily
-            // (during marking/promotion), not on the allocation hot path.
+            // ptr_to_object and region stats are populated lazily (during
+            // marking), not on the allocation hot path.
             let obj_id = self.core.with_own_shard(|shard_map, shard| {
                 let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
                 // Before the shard unlocks: from then on the collector sees it.
@@ -2000,7 +1986,7 @@ mod tests {
     #[test]
     fn sync_partial_collection_keeps_young_object_reached_only_from_promoted_one() {
         // As the thread-local test of the same name, one generation up. X
-        // gets an edge to Y while both are in Gen0 (no card); Gen1
+        // gets an edge to Y while both are in Gen0; Gen1
         // collections then promote X to Gen2 while Y only reaches Gen1, and
         // a Gen1 collection reaches X through a dead cycle Z. Y must
         // survive: X still points at it.

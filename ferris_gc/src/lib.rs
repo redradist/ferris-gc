@@ -28,7 +28,6 @@ mod background_strategy;
 #[cfg(feature = "std")]
 mod basic_strategy;
 #[cfg(feature = "std")]
-mod card_table;
 #[cfg(feature = "std")]
 mod default_trace;
 #[cfg(feature = "std")]

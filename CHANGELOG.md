@@ -14,6 +14,7 @@
 ### Removed
 - `BASIC_STRATEGY_LOCAL_GCS`: the basic strategy's thread no longer collects thread-local collectors; doing so raced their owning thread.
 - `LocalGarbageCollector` is no longer `Send`/`Sync`, so a thread-local collector cannot be handed to another thread.
+- **The card table and the write barrier.** Partial collections treat every young object an older one points at as a root, and incremental marking follows a snapshot, so neither needed the cards for correctness. `GcCell::borrow_mut` no longer locks the collector, and freeing or promoting an older object no longer locks the card table.
 
 ### Deprecated
 - `CollectionStats::tracers_collected` → `handles_collected`, and `GcStats::live_tracers` → `live_handles`. The old fields stay as aliases holding the same values.

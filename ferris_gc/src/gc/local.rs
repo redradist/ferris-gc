@@ -476,9 +476,9 @@ where
 /// A garbage-collected mutable cell for thread-local use.
 ///
 /// Provides interior mutability (`borrow()` / `borrow_mut()`) for GC-managed
-/// objects. `borrow_mut()` triggers the **write barrier**, which records
-/// cross-generation references so that young-generation collections can
-/// discover pointers from old objects to young objects.
+/// objects. No write barrier is needed: a young-generation collection treats
+/// every young object an older one points at as a root (see
+/// `CASCADE_PENDING`).
 ///
 /// Thread-local only — for a cross-thread variant, use [`sync::GcCell<T>`].
 /// `GcCell<T>` is 8 bytes: packed `NonZeroUsize` (bit 0 = `is_root`,
@@ -648,19 +648,10 @@ where
         LocalGarbageCollector::allocate(move |gc| unsafe { gc.try_create_gc_cell(t, region.0) })
     }
 
-    /// Mutable borrow with write barrier.
-    /// Triggers the write barrier so that if this object is in an older generation,
-    /// its card is marked dirty in the card table for young-generation collections.
+    /// Mutable borrow of the value.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcPtr<T>> {
-        let refcell_ptr = self.refcell_ptr();
-        let object_id = self.object_id();
-        LOCAL_GC.with(|gc| {
-            gc.borrow()
-                .core
-                .write_barrier(object_id, refcell_ptr as *const dyn Trace);
-        });
         // SAFETY: packed pointer (with bit 0 masked off) is valid for the lifetime of this GcCell.
-        unsafe { (*refcell_ptr).borrow_mut() }
+        unsafe { (*self.refcell_ptr()).borrow_mut() }
     }
 }
 
