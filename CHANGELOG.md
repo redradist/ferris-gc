@@ -19,6 +19,7 @@
 - `CollectionStats::tracers_collected` → `handles_collected`, and `GcStats::live_tracers` → `live_handles`. The old fields stay as aliases holding the same values.
 
 ### Fixed
+- **Panic when a thread-local collection met a mutably borrowed `GcCell`.** An allocation inside a `borrow_mut` scope (e.g. `cell.borrow_mut().push(Gc::new(x))`) could trigger a collection that traced the cell and panicked with "already mutably borrowed". The collector now skips the borrowed value, and that collection frees nothing, as `sync::GcCell` already did.
 - **Use-after-free in incremental and concurrent marking.**
   - Incremental marking followed the live object graph, so an object stayed unmarked when its only in-graph handle was moved or cloned away mid-mark, and it was freed. This affected the thread-local background/G1 strategies.
   - A partial (Gen0/Gen1) incremental or concurrent mark freed young objects held only by older ones.
