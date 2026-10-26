@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::gc::LocalGarbageCollector;
 use crate::gc::sync::GlobalGarbageCollector;
+use crate::gc::{LocalGarbageCollector, TriggerPolicy};
 use crate::generation::Generation;
 
 /// Configuration for the G1 (Garbage First) GC strategy.
@@ -80,12 +80,11 @@ pub fn g1_local_strategy(
         // bounded step (LocalGarbageCollector::maybe_collect). No collector
         // thread is spawned; parallel background collection lives on the global
         // thread-safe GC (g1_global_strategy).
-        gc.core
-            .alloc_threshold
-            .store(config.young_gen_threshold, Ordering::Relaxed);
-        gc.core
-            .local_incremental_budget
-            .store(config.concurrent_mark_budget.max(1), Ordering::Relaxed);
+        gc.configure_trigger(
+            config.young_gen_threshold,
+            config.concurrent_mark_budget.max(1),
+            TriggerPolicy::default(),
+        );
         None
     }
 }

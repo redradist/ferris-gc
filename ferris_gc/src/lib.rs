@@ -60,7 +60,6 @@ pub use background_strategy::{
 #[cfg(feature = "std")]
 pub use basic_strategy::{
     ApplicationCleanup, BASIC_POLL_INTERVAL_MS, BASIC_STRATEGY_DISABLED, BASIC_STRATEGY_GLOBAL_GC,
-    BASIC_STRATEGY_LOCAL_GCS,
 };
 #[cfg(feature = "std")]
 #[allow(unused_imports)]
