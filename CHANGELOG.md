@@ -8,11 +8,19 @@
 - **`ObjectEntry` is 64 bytes** (was 88) in both collectors.
 - **Thread-local collections that cannot free anything are skipped.** Garbage that only a collection frees (a cycle) appears only when a handle is dropped while its object keeps others; until then the allocation trigger skips the collection. `tree_bench` is ~2.5× faster, and its build phase no longer pauses.
 - Thread-local background/G1 strategies collect incrementally on the owning thread.
+- **Thread-local threshold/adaptive strategies collect on the owning thread**, from the allocation trigger, instead of a background thread. Their `poll_interval` now applies to the global strategies only.
+- The thread-local allocation trigger widens every 5th collection to Gen1 and every 5th of those to Gen2 by default (the threshold/adaptive strategies' `gen0_collections_per_gen1` / `gen1_collections_per_gen2`).
+
+### Removed
+- `BASIC_STRATEGY_LOCAL_GCS`: the basic strategy's thread no longer collects thread-local collectors; doing so raced their owning thread.
+- `LocalGarbageCollector` is no longer `Send`/`Sync`, so a thread-local collector cannot be handed to another thread.
 
 ### Deprecated
 - `CollectionStats::tracers_collected` → `handles_collected`, and `GcStats::live_tracers` → `live_handles`. The old fields stay as aliases holding the same values.
 
 ### Fixed
+- **Data race:** the thread-local threshold/adaptive strategies (and collectors registered in `BASIC_STRATEGY_LOCAL_GCS`) were collected from another thread while their owning thread mutated them.
+- **Memory leak:** in thread-local collectors, a dead cycle that had been promoted to Gen1/Gen2 was never freed, because the allocation trigger only ran Gen0 collections. The GOGC threshold also doubled without bound after each low-yield collection; it now follows the live set.
 - **Use-after-free in partial collections.** A Gen0/Gen1 collection could free a young object that only an older, untraced object pointed at (for example an edge made before the older object was promoted). This affected the thread-local allocation trigger and sync Gen1 collections.
 - Sync Gen0 collections now see the objects allocated since the last wider collection.
 - Data race between `sync::GcCell` mutation and a concurrent collection scan.

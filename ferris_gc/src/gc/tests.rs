@@ -133,26 +133,6 @@ fn ptr_to_object_cleaned_on_collect() {
     });
 }
 
-#[test]
-fn collect_from_another_thread() {
-    clean_gc_state();
-    let baseline = LOCAL_GC.with(|gc| gc.borrow().core.lock_gc_maps().total_handles());
-    let _one = Gc::new(42);
-    LOCAL_GC.with(|gc| {
-        let gc_ptr = gc.as_ptr();
-        let gc_ref = unsafe { &*gc_ptr };
-        std::thread::scope(|s| {
-            s.spawn(|| unsafe {
-                gc_ref.collect();
-            });
-        });
-        assert_eq!(
-            gc.borrow().core.lock_gc_maps().total_handles() - baseline,
-            1
-        );
-    });
-}
-
 static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct DropCounter {
@@ -2339,8 +2319,17 @@ fn incremental_trigger_skips_collection_without_garbage() {
         "no mark cycle without garbage"
     );
 
-    // A dropped cycle starts a mark cycle at the next trigger, which frees it.
-    drop(self_cycle());
+    // A dropped cycle starts a mark cycle at the next trigger, which frees
+    // it. (Skipped triggers raise the threshold to the GOGC floor; bring
+    // the next trigger back within reach once the cycle exists.)
+    let cycle = self_cycle();
+    LOCAL_GC.with(|gc| {
+        gc.borrow()
+            .core
+            .alloc_threshold
+            .store(16, Ordering::Relaxed)
+    });
+    drop(cycle);
     for i in 0..200 {
         drop(Gc::new(i));
     }
@@ -2512,4 +2501,190 @@ fn partial_collection_keeps_young_object_reached_only_from_promoted_one() {
     assert_eq!(stats.objects_collected, 1, "only the dead cycle is freed");
     assert_eq!(x.borrow().children.len(), 1);
     assert!(x.borrow().children[0].borrow().children.is_empty());
+}
+
+// --- The allocation trigger reaches every generation, on the owning thread ---
+
+/// This thread's collector, for calling a local strategy's closure directly
+/// (as `LocalStrategy::start` does).
+fn this_thread_gc() -> &'static super::LocalGarbageCollector {
+    // SAFETY: the thread-local outlives the test body, which only uses it on
+    // this thread.
+    LOCAL_GC.with(|gc| unsafe { &*gc.as_ptr() })
+}
+
+/// Promote a live self-cycle by `gen0` Gen0 then `gen1` Gen1 collections.
+fn promoted_cycle(gen0: usize, gen1: usize) -> Gc<CyclicNode> {
+    use crate::generation::Generation;
+    let a = self_cycle();
+    for (scope, n) in [(Generation::Gen0, gen0), (Generation::Gen1, gen1)] {
+        for _ in 0..n {
+            LOCAL_GC.with(|gc| unsafe { gc.borrow().core.collect_generation(scope) });
+        }
+    }
+    a
+}
+
+#[test]
+fn allocation_trigger_frees_promoted_dead_cycles() {
+    // Regression: the trigger only ever ran Gen0 collections, so a dead
+    // cycle that had been promoted was never freed. Now every
+    // gen0_per_gen1-th triggered collection covers Gen1 and every
+    // gen1_per_gen2-th of those Gen2 (a fixed small threshold keeps the
+    // test short; the default schedule is 5/5).
+    use super::{ThresholdRule, TriggerPolicy};
+    clean_gc_state();
+    let live_before = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+    // Gen0 promotes after 3 survivals and Gen1 after 5 more.
+    let in_gen2 = promoted_cycle(3, 5);
+    let in_gen1 = promoted_cycle(3, 0);
+    let stats = LOCAL_GC.with(|gc| gc.borrow().stats());
+    assert_eq!((stats.gen1_objects, stats.gen2_objects), (1, 1));
+    this_thread_gc().configure_trigger(
+        16,
+        0,
+        TriggerPolicy {
+            gen0_per_gen1: 2,
+            gen1_per_gen2: 2,
+            threshold: ThresholdRule::Fixed,
+        },
+    );
+    drop(in_gen1);
+    drop(in_gen2);
+    // Gen1 is covered on the 2nd trigger and Gen2 on the 4th.
+    for i in 0..16 * 5 {
+        drop(Gc::new(i));
+    }
+    let live = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+    assert_eq!(live, live_before, "both promoted dead cycles were freed");
+}
+
+#[test]
+fn gogc_threshold_follows_the_live_set() {
+    // Regression: after a collection that freed next to nothing the
+    // threshold doubled without bound, so the trigger's schedule never
+    // reached older generations again. It now waits for as many
+    // allocations as there are live objects (at least the floor).
+    clean_gc_state();
+    let kept: Vec<_> = (0..100).map(Gc::new).collect();
+    let floor = super::LOCAL_GC_ALLOC_THRESHOLD;
+    for _ in 0..3 {
+        // A handle dropped while its object keeps others: garbage is
+        // possible, so the next trigger collects (and frees nothing).
+        drop(kept[0].clone());
+        let before = LOCAL_GC.with(|gc| gc.borrow().stats().total_collections);
+        for i in 0..floor + 1 {
+            drop(Gc::new(i));
+        }
+        LOCAL_GC.with(|gc| {
+            let g = gc.borrow();
+            assert!(
+                g.stats().total_collections > before,
+                "the trigger collected"
+            );
+            let live = g.stats().live_objects;
+            assert_eq!(
+                g.core.alloc_threshold.load(Ordering::Relaxed),
+                live.max(floor)
+            );
+        });
+    }
+    drop(kept);
+}
+
+#[test]
+fn threshold_and_adaptive_local_strategies_collect_on_the_owning_thread() {
+    // They used to spawn a thread that collected this thread's collector
+    // while this thread mutated it - a data race. Now they only configure
+    // the allocation trigger. (The collector reference a strategy gets is
+    // used right away, as `LocalStrategy::start` does: an allocation's
+    // `borrow_mut` invalidates it.)
+    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    clean_gc_state();
+    let threshold = || LOCAL_GC.with(|gc| gc.borrow().core.alloc_threshold.load(Ordering::Relaxed));
+    let live_before = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+
+    let mut strategy = crate::threshold_local_strategy(crate::ThresholdConfig {
+        gen0_threshold: 32,
+        ..Default::default()
+    });
+    assert!(
+        strategy(this_thread_gc(), &ACTIVE).is_none(),
+        "no collector thread"
+    );
+    assert_eq!(threshold(), 32);
+    drop(self_cycle());
+    for i in 0..32 {
+        drop(Gc::new(i));
+    }
+    let live = LOCAL_GC.with(|gc| gc.borrow().stats().live_objects);
+    assert_eq!(live, live_before, "the dead cycle was freed on this thread");
+    assert_eq!(
+        threshold(),
+        32,
+        "the threshold strategy keeps its threshold"
+    );
+
+    let config = crate::AdaptiveConfig {
+        initial_gen0_threshold: 64,
+        min_threshold: 50,
+        max_threshold: 80,
+        ..Default::default()
+    };
+    let mut strategy = crate::adaptive_local_strategy(config);
+    assert!(
+        strategy(this_thread_gc(), &ACTIVE).is_none(),
+        "no collector thread"
+    );
+    assert_eq!(threshold(), 64);
+    // A collection that frees next to nothing raises the threshold, up to
+    // the configured maximum.
+    let kept = Gc::new(0);
+    drop(kept.clone());
+    for i in 0..64 {
+        drop(Gc::new(i));
+    }
+    assert_eq!(threshold(), 80);
+    drop(kept);
+}
+
+#[test]
+fn skipped_trigger_trims_gen0_ids_after_a_large_free() {
+    // After a large free the object map keeps more slots than the next
+    // triggers' ids are worth rebuilding from: the trim filters the list
+    // instead. Either way only the live Gen0 objects stay listed.
+    clean_gc_state();
+    let keep = Gc::new(0);
+    drop((0..5000).map(Gc::new).collect::<Vec<_>>());
+    let run_to_next_trigger = || {
+        let threshold =
+            LOCAL_GC.with(|gc| gc.borrow().core.alloc_threshold.load(Ordering::Relaxed));
+        for i in 0..threshold {
+            drop(Gc::new(i));
+        }
+    };
+    // The first trigger rebuilds the list (fewer slots than ids); the
+    // second, soon after, filters it (more slots than ids).
+    run_to_next_trigger();
+    LOCAL_GC.with(|gc| {
+        gc.borrow()
+            .core
+            .alloc_threshold
+            .store(100, Ordering::Relaxed)
+    });
+    run_to_next_trigger();
+    LOCAL_GC.with(|gc| {
+        let g = gc.borrow();
+        let since_trigger = g.core.allocation_count.load(Ordering::Relaxed);
+        // SAFETY: thread-local collector, no collection in progress.
+        let maps = unsafe { g.core.gc_maps_unsync() };
+        assert!(maps.objects.slot_count() >= 5000);
+        assert!(
+            maps.gen0_ids.len() <= 2 * maps.objects.len() + since_trigger,
+            "gen0_ids kept {} ids for {} objects",
+            maps.gen0_ids.len(),
+            maps.objects.len()
+        );
+    });
+    drop(keep);
 }

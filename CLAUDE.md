@@ -82,8 +82,11 @@ Raw allocations use TLAB bump allocation (thread-local arena blocks) with system
 - **Sync pool (`pool.rs`):** `sync::Gc::new` allocates `[object | ObjectEntry]` as one block from a per-thread size-class pool. That is 96 bytes for a small `T`, with the 64-byte `ObjectEntry`. It serves blocks of at most 1 KiB with alignment of at most 16; larger or more-aligned layouts use the system allocator. All of these allocations are recorded as `GcObjMem::Mem`, and `free_sync_mem` tells pool blocks from system ones by layout alone. 64 KiB pages are carved from 2 MiB segments. Frees on the owning thread are plain stores; frees from other threads go through a per-page CAS stack. Heaps outlive their threads and are adopted by new ones.
 - **SlotMap:** Custom generation-counted slot map (`slot_map.rs`) stores `ObjectEntryRef` pointers. O(1) insert/remove with cache-friendly iteration. Keys are `ObjectId` (u64: upper 32 = generation, lower 32 = index).
 - **RC-hybrid deallocation:** Objects freed immediately when their last handle is dropped (no waiting for GC cycle). GC only handles cyclic references.
-- **Skipping futile collections (thread-local):** Unreachable objects that still have handles can only appear when a handle is dropped while its object keeps others. `GcMaps::garbage_possible` has one bit per collection scope. Such a drop sets every bit, and a collection clears its scope's bits when it starts. The allocation triggers skip a collection whose bit is clear, grow the threshold as if it had freed nothing, and trim `gen0_ids`.
-- **Generational collection:** Gen0/Gen1/Gen2 with adaptive threshold scaling (GOGC-style: threshold proportional to live set size when <5% garbage collected).
+- **Thread-local allocation trigger:** a thread-local collector is only collected on its own thread (`LocalGarbageCollector` is neither `Send` nor `Sync`). Every local strategy acts through `configure_trigger`: a threshold, an incremental Gen2 budget (background/g1), and a `TriggerPolicy`:
+  - the schedule: every `gen0_per_gen1`-th triggered collection covers Gen1 and every `gen1_per_gen2`-th of those Gen2 (5/5 by default), so promoted dead cycles are freed;
+  - the threshold rule: `Gogc` (default: after a low-yield collection, as many allocations as live objects, at least 1000), `Fixed` (threshold strategy) or `Adaptive` (adaptive strategy).
+- **Skipping futile collections (thread-local):** Unreachable objects that still have handles can only appear when a handle is dropped while its object keeps others. `GcMaps::garbage_possible` has one bit per collection scope. Such a drop sets every bit, and a collection clears its scope's bits when it starts. The allocation triggers skip a collection whose bit is clear (skips still advance the schedule) and trim `gen0_ids`. When no collection could free anything, the threshold grows (`Gogc`: it doubles, up to 8× the live set); while only older generations may hold garbage, it stays.
+- **Generational collection:** Gen0/Gen1/Gen2. The thread-local trigger widens collections on its schedule; the sync collector's strategies schedule them on their threads.
 - **Root discovery in partial collections:** phase 1 marks the objects in scope with `CASCADE_PENDING`, and the cascade walks only those. Handles inside older objects therefore stay counted, and every young object an older one points at is a root. Cards are not needed for correctness here, so the write barrier only saves marking work.
 - **gen0_ids:** Fast Vec of Gen0 ObjectIds for O(Gen0) partial collections, with heuristic fallback to full iteration when stale entries exceed live objects. Thread-local only: a sync allocation holds just its shard's lock and cannot append to it, so a sync Gen0 collection iterates every object, as Gen1 does.
 
@@ -95,7 +98,7 @@ Raw allocations use TLAB bump allocation (thread-local arena blocks) with system
 
 ### Collection Strategy (`basic_strategy.rs`)
 
-Background thread wakes every 500ms to call `collect()` on registered GCs. `ApplicationCleanup` (RAII) signals shutdown via `APPLICATION_ACTIVE` atomic flag and joins background threads.
+Background thread wakes every `BASIC_POLL_INTERVAL_MS` (50ms) to `collect()` the global GC; thread-local collectors are never collected from it. `ApplicationCleanup` (RAII) signals shutdown via `APPLICATION_ACTIVE` atomic flag and joins background threads.
 
 ### Default Trace Implementations (`default_trace.rs`)
 

@@ -101,6 +101,11 @@ impl<K: SlotKey, V> SlotMap<K, V> {
         self.len
     }
 
+    /// Number of slots, occupied or vacant: the cost of a pass over them.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Returns `true` if there are no occupied slots.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
