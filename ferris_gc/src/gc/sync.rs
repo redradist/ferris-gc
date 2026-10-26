@@ -1066,7 +1066,7 @@ impl GlobalGarbageCollector {
         // before freeing, under that lock. So seeing `alive` under it means
         // the object is still there.
         let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-        self.core.with_shard_of(weak.object_id, |_shard| {
+        let gc = self.core.with_shard_of(weak.object_id, |_shard| {
             if !weak.alive.load(Ordering::Acquire) {
                 return None;
             }
@@ -1089,7 +1089,9 @@ impl GlobalGarbageCollector {
                     Err(current) => n = current,
                 }
             }
-        })
+        })?;
+        self.core.note_handle_during_marking(weak.object_id);
+        Some(gc)
     }
 
     /// # Safety
@@ -2696,6 +2698,60 @@ mod tests {
         unsafe { (*GLOBAL_GC).collect() };
         assert!(!weak.is_alive());
         assert_eq!(***cell.borrow().as_ref().unwrap(), 7);
+    }
+
+    #[test]
+    fn partial_incremental_mark_keeps_young_objects_held_by_old_ones() {
+        // Regression: a partial incremental mark discovered roots over the
+        // whole heap, so the young object an old cell holds was no root, and
+        // nothing in scope reached it: it was freed while the cell held it.
+        use crate::generation::Generation;
+        let (_guard, _baseline) = setup();
+        let holder = GcCell::new(None::<Gc<u64>>);
+        // Gen0 promotes after 3 survivals.
+        for _ in 0..3 {
+            unsafe { GLOBAL_GC.core.collect_generation(Generation::Gen0) };
+        }
+        *holder.borrow_mut() = Some(Gc::new(7));
+        let stats = unsafe { GLOBAL_GC.core.collect_incremental(Generation::Gen0, 1) };
+        assert_eq!(
+            stats.objects_collected, 0,
+            "a young object an old one holds was freed"
+        );
+        assert_eq!(***holder.borrow().as_ref().unwrap(), 7);
+    }
+
+    #[test]
+    fn weak_upgrade_during_incremental_mark_keeps_what_it_reaches() {
+        // A weak upgrade can reach a dead cycle that is not swept yet: the
+        // mark that began before it must keep the cycle.
+        use crate::generation::Generation;
+        let (_guard, _baseline) = setup();
+        let a = Gc::new(SyncCyclicNode {
+            next: GcCell::new(None),
+        });
+        let b = Gc::new(SyncCyclicNode {
+            next: GcCell::new(Some(a.clone())),
+        });
+        *a.next.borrow_mut() = Some(b.clone());
+        let weak = Gc::downgrade(&a);
+        drop(a);
+        drop(b);
+        unsafe { GLOBAL_GC.core.begin_collection(Generation::Gen2) };
+        let upgraded = weak.upgrade();
+        while !GLOBAL_GC.core.concurrent_mark_step(1) {}
+        let stats = unsafe { GLOBAL_GC.core.finish_collection() };
+        // The background strategy may have freed the cycle before the mark.
+        let Some(a) = upgraded else {
+            return;
+        };
+        assert_eq!(stats.objects_collected, 0, "a resurrected object was freed");
+        let b = a.next.borrow().clone().unwrap();
+        assert!(b.next.borrow().is_some());
+        drop(b);
+        drop(a);
+        unsafe { (*GLOBAL_GC).collect() };
+        assert!(!weak.is_alive(), "the dead cycle is freed later");
     }
 
     #[test]

@@ -19,6 +19,11 @@
 - `CollectionStats::tracers_collected` → `handles_collected`, and `GcStats::live_tracers` → `live_handles`. The old fields stay as aliases holding the same values.
 
 ### Fixed
+- **Use-after-free in incremental and concurrent marking.**
+  - Incremental marking followed the live object graph, so an object stayed unmarked when its only in-graph handle was moved or cloned away mid-mark, and it was freed. This affected the thread-local background/G1 strategies.
+  - A partial (Gen0/Gen1) incremental or concurrent mark freed young objects held only by older ones.
+  - A weak upgrade mid-mark could revive a dead cycle that the mark then freed.
+  - Marking now follows the object graph as it was when the mark began, plus the objects born since. Partial marks find their roots as partial collections do. A weak upgrade greys its object.
 - **Data race:** the thread-local threshold/adaptive strategies (and collectors registered in `BASIC_STRATEGY_LOCAL_GCS`) were collected from another thread while their owning thread mutated them.
 - **Memory leak:** in thread-local collectors, a dead cycle that had been promoted to Gen1/Gen2 was never freed, because the allocation trigger only ran Gen0 collections. The GOGC threshold also doubled without bound after each low-yield collection; it now follows the live set.
 - **Use-after-free in partial collections.** A Gen0/Gen1 collection could free a young object that only an older, untraced object pointed at (for example an edge made before the older object was promoted). This affected the thread-local allocation trigger and sync Gen1 collections.

@@ -2,7 +2,7 @@
 //!
 //! The GC hot paths key several maps by `usize` (raw thin pointers) and
 //! `ObjectId` (a `u64` newtype): `ptr_to_object`, `weak_alive_map`, the
-//! incremental `colors`/`edges` maps, the card table, and the dying-address
+//! incremental `marks` map, the card table, and the dying-address
 //! registry. The standard-library default hasher is SipHash, which is
 //! DoS-resistant but comparatively slow for small integer keys — it is pure
 //! overhead here since these keys are never attacker-controlled hash inputs.

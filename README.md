@@ -347,7 +347,7 @@ Best for large heaps where predictable pause times are critical.
 
 ### Generational Collection Without a Remembered Set
 
-A partial (Gen0/Gen1) collection treats every young object an older object points at as a root: root discovery counts the handles inside older objects instead of subtracting them, so no remembered set is needed for correctness. `GcCell::borrow_mut` on an older object still marks its card dirty in a sparse card table (512-byte cards), and partial collections trace dirty objects; the same write barrier keeps incremental marking's tri-color invariant.
+A partial (Gen0/Gen1) collection treats every young object an older object points at as a root: root discovery counts the handles inside older objects instead of subtracting them, so no remembered set is needed for correctness. `GcCell::borrow_mut` on an older object still marks its card dirty in a sparse card table (512-byte cards), and partial collections trace dirty objects. Incremental and concurrent marking need no barrier: they follow a snapshot of the object graph taken when the mark begins, and keep every object born since.
 
 ### Thread-Local Allocation Buffers (TLAB)
 

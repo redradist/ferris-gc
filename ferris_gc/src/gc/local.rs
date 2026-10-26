@@ -1170,8 +1170,9 @@ impl LocalGarbageCollector {
     /// advance a Gen2 mark by one bounded step per allocation instead of a
     /// full STW collect. Runs on the owning thread, so the lockless mutator is
     /// never raced; pauses stay short because each step marks <= `budget`
-    /// objects. Correctness of interleaving with allocation relies on
-    /// grey-at-birth (note_new_object_during_marking) + the write barrier.
+    /// objects. The mark follows the snapshot taken when it began, so
+    /// mutation between the steps cannot hide an object from it (see
+    /// `IncrementalState`).
     #[inline(never)]
     unsafe fn step_incremental(&self, budget: usize) {
         match self.core.incremental_phase() {
@@ -1401,7 +1402,7 @@ impl LocalGarbageCollector {
             (*gc_ptr).object_id = obj_id;
 
             // If an incremental mark cycle is in progress, grey this object so
-            // the colors-based sweep in finish_collection keeps it.
+            // the marks-based sweep in finish_collection keeps it.
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = Gc::from_parts(gc_ptr, true);
@@ -1490,7 +1491,7 @@ impl LocalGarbageCollector {
             (*(*gc_ptr).as_ptr()).object_id = obj_id;
 
             // If an incremental mark cycle is in progress, grey this object so
-            // the colors-based sweep in finish_collection keeps it.
+            // the marks-based sweep in finish_collection keeps it.
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell::from_parts(gc_ptr, true);
@@ -1580,7 +1581,7 @@ impl LocalGarbageCollector {
             (*gc_ptr).object_id = obj_id;
 
             // If an incremental mark cycle is in progress, grey this object so
-            // the colors-based sweep in finish_collection keeps it.
+            // the marks-based sweep in finish_collection keeps it.
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = Gc::from_parts(gc_ptr, true);
@@ -1654,7 +1655,7 @@ impl LocalGarbageCollector {
             (*(*gc_ptr).as_ptr()).object_id = obj_id;
 
             // If an incremental mark cycle is in progress, grey this object so
-            // the colors-based sweep in finish_collection keeps it.
+            // the marks-based sweep in finish_collection keeps it.
             self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell::from_parts(gc_ptr, true);
@@ -1683,6 +1684,7 @@ impl LocalGarbageCollector {
             CASCADE_MODE.set(CascadeMode::Allocation);
             (*weak.ptr).reset_root();
             CASCADE_MODE.set(CascadeMode::Off);
+            self.core.note_handle_during_marking(object_id);
             gc
         }
     }
