@@ -2810,3 +2810,41 @@ fn incremental_mark_begun_under_borrow_mut_frees_nothing() {
     assert!(!weak.is_alive());
     assert_eq!(***(**cell.borrow()).as_ref().unwrap(), 7);
 }
+
+#[test]
+fn collections_after_a_large_free_skip_its_vacant_slots_and_stay_correct() {
+    // 20k objects freed leave 20k vacant slots; a collection parks them, so
+    // its passes skip them, and new objects reuse the lowest slots.
+    use crate::generation::Generation;
+    clean_gc_state();
+    let big: Vec<Gc<u64>> = (0..20_000u64).map(Gc::new).collect();
+    drop(big);
+    let full =
+        || LOCAL_GC.with(|gc| unsafe { gc.borrow().core.collect_generation(Generation::Gen2) });
+    full();
+    let live: Vec<Gc<u64>> = (0..10u64).map(Gc::new).collect();
+    let cycles: Vec<_> = (0..5).map(|_| self_cycle()).collect();
+    drop(cycles);
+    let stats = full();
+    assert_eq!(stats.objects_collected, 5, "the dead cycles are freed");
+    assert!(
+        stats.objects_scanned < 100,
+        "scanned {} objects",
+        stats.objects_scanned
+    );
+    assert_eq!(live.iter().map(|g| ***g).sum::<u64>(), 45);
+    LOCAL_GC.with(|gc| {
+        let gc = gc.borrow();
+        let maps = gc.core.lock_gc_maps();
+        let max_index = maps
+            .objects
+            .iter()
+            .map(|(k, _)| crate::slot_map::SlotKey::index(k))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_index < 1000,
+            "new objects reuse the lowest slots (highest: {max_index})"
+        );
+    });
+}

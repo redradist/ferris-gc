@@ -26,6 +26,8 @@ pub(crate) trait ObjectMap: Sized {
     fn iter_mut(&mut self) -> impl Iterator<Item = (ObjectId, &mut ObjectEntryRef)>;
     fn values(&self) -> impl Iterator<Item = &ObjectEntryRef>;
     fn drain(&mut self) -> Vec<(ObjectId, ObjectEntryRef)>;
+    /// See `SlotMap::park_vacant_runs`.
+    fn park_vacant_runs(&mut self);
 }
 
 /// Object map of the thread-local collector.
@@ -77,6 +79,10 @@ macro_rules! forward_object_map {
             #[inline(always)]
             fn drain(&mut self) -> Vec<(ObjectId, ObjectEntryRef)> {
                 <$ty>::drain(self)
+            }
+            #[inline(always)]
+            fn park_vacant_runs(&mut self) {
+                <$ty>::park_vacant_runs(self)
             }
         }
     };
@@ -135,10 +141,12 @@ impl<O: ObjectMap> GcMaps<O> {
     }
 
     /// A collection of generations `0..=max_gen` starts: it frees all the
-    /// garbage that scope holds now.
+    /// garbage that scope holds now. Its passes over the object map skip
+    /// the long runs of vacant slots a large free left behind.
     #[inline]
     pub(crate) fn start_collecting(&mut self, max_gen: Generation) {
         self.garbage_possible &= !((2u8 << max_gen as u8) - 1);
+        self.objects.park_vacant_runs();
     }
 
     /// Whether a collection of generations `0..=max_gen` could free anything.
