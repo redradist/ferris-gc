@@ -2680,3 +2680,133 @@ fn weak_upgrade_during_incremental_mark_keeps_what_it_reaches() {
     clean_gc_state();
     assert!(!weak.is_alive(), "the dead cycle is freed later");
 }
+
+#[test]
+fn allocation_inside_borrow_mut_scope_does_not_panic() {
+    // Regression: the allocation trigger collected while the cell was
+    // mutably borrowed, and tracing the cell panicked with "already mutably
+    // borrowed". A promoted cell is traced by the trigger's Gen1/Gen2
+    // collections, a young one by every collection.
+    use crate::generation::Generation;
+    clean_gc_state();
+    LOCAL_GC.with(|gc| gc.borrow().core.alloc_threshold.store(8, Ordering::Relaxed));
+    let old: GcCell<Vec<Gc<i32>>> = GcCell::new(Vec::new());
+    // Gen0 promotes after 3 survivals.
+    for _ in 0..3 {
+        LOCAL_GC.with(|gc| unsafe { gc.borrow().core.collect_generation(Generation::Gen0) });
+    }
+    for i in 0..500 {
+        let young: GcCell<Vec<Gc<i32>>> = GcCell::new(Vec::new());
+        // A dropped handle whose object keeps another: garbage is possible,
+        // so the trigger does not skip its collections.
+        let x = Gc::new(i);
+        drop(x.clone());
+        old.borrow_mut().push(Gc::new(i));
+        young.borrow_mut().push(Gc::new(i));
+    }
+    assert_eq!(old.borrow().len(), 500);
+    assert_eq!(**old.borrow()[499], 499);
+    LOCAL_GC.with(|gc| {
+        gc.borrow()
+            .core
+            .alloc_threshold
+            .store(super::LOCAL_GC_ALLOC_THRESHOLD, Ordering::Relaxed)
+    });
+}
+
+/// A dead two-node cycle, and a weak reference to it.
+fn dead_cycle() -> crate::GcWeak<CyclicNode> {
+    let a = Gc::new(CyclicNode {
+        next: std::cell::RefCell::new(None),
+    });
+    let b = Gc::new(CyclicNode {
+        next: std::cell::RefCell::new(Some(a.clone())),
+    });
+    *a.next.borrow_mut() = Some(b);
+    Gc::downgrade(&a)
+}
+
+/// Holds a `GcCell`, so the cell is also reached through a handle in an
+/// object, not only as a root.
+struct CellHolder {
+    cell: GcCell<Option<Gc<i32>>>,
+}
+
+impl Trace for CellHolder {
+    fn is_root(&self) -> bool {
+        false
+    }
+    fn reset_root(&self) {
+        self.cell.reset_root();
+    }
+    fn trace(&self) {
+        self.cell.trace();
+    }
+    fn reset(&self) {
+        self.cell.reset();
+    }
+    fn is_traceable(&self) -> bool {
+        false
+    }
+    fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
+        self.cell.trace_children(children);
+    }
+}
+
+impl Finalize for CellHolder {
+    fn finalize(&self) {}
+}
+
+#[test]
+fn collection_under_borrow_mut_frees_nothing_until_the_borrow_ends() {
+    // While a cell is mutably borrowed the collector cannot see what it
+    // holds, so that collection frees nothing (as sync::GcCell does); the
+    // next one frees the garbage.
+    use crate::generation::Generation;
+    clean_gc_state();
+    let cell: GcCell<Option<Gc<i32>>> = GcCell::new(Some(Gc::new(7)));
+    let holder = Gc::new(CellHolder { cell: cell.clone() });
+    let weak = dead_cycle();
+    let mut guard = cell.borrow_mut();
+    let stats =
+        LOCAL_GC.with(|gc| unsafe { gc.borrow().core.collect_generation(Generation::Gen2) });
+    assert_eq!(
+        stats.objects_collected, 0,
+        "a collection with a blocked scan freed objects"
+    );
+    assert!(weak.is_alive());
+    // The borrow stays usable across the collection.
+    **guard = Some(Gc::new(8));
+    drop(guard);
+    let stats =
+        LOCAL_GC.with(|gc| unsafe { gc.borrow().core.collect_generation(Generation::Gen2) });
+    assert_eq!(stats.objects_collected, 2);
+    assert!(!weak.is_alive());
+    assert_eq!(***(**holder.cell.borrow()).as_ref().unwrap(), 8);
+}
+
+#[test]
+fn incremental_mark_begun_under_borrow_mut_frees_nothing() {
+    // The snapshot cannot read a mutably borrowed cell, so the cycle that
+    // began then frees nothing.
+    clean_gc_state();
+    let cell: GcCell<Option<Gc<i32>>> = GcCell::new(Some(Gc::new(7)));
+    let weak = dead_cycle();
+    let guard = cell.borrow_mut();
+    LOCAL_GC.with(|gc| unsafe {
+        gc.borrow()
+            .core
+            .begin_collection(crate::generation::Generation::Gen2)
+    });
+    drop(guard);
+    let stats = LOCAL_GC.with(|gc| unsafe {
+        let gc = gc.borrow();
+        while !gc.core.mark_step(1) {}
+        gc.core.finish_collection()
+    });
+    assert_eq!(stats.objects_collected, 0);
+    assert!(weak.is_alive());
+    clean_gc_state();
+    assert!(!weak.is_alive());
+    assert_eq!(***(**cell.borrow()).as_ref().unwrap(), 7);
+}

@@ -73,6 +73,7 @@ Internal type hierarchy differs per GC:
 
   Root discovery starts each root count at the handle count, and the cascade subtracts the handles found inside scanned objects. It does this only while `SYNC_CASCADE` is set, i.e. during the global collector's own discovery. `sync::Gc`/`GcCell`/`GcWeak` need `T: Send + Sync` (like `Arc`), because the collector thread reaches every value.
 - **`sync::GcCell<T>`** → `GcCellBox<T>` (`SyncGcInfo` header + `RwLock<()>` + `UnsafeCell<T>`), with reader-writer semantics. `borrow`/`borrow_mut` block, and the `try_` variants return `None`. The collector never blocks on a cell: it only uses `try_read`. If a scan is blocked by a held `borrow_mut`, `blocked_scans` is bumped, and every sweep path calls `keep_all_if_blocked_since`, so that collection frees nothing.
+- **Thread-local `GcCell<T>`** → `RefCell<GcPtr<T>>`. An allocation can collect while the user holds a `borrow_mut`, so the collector never borrows the cell either: it reads the header through the cell's raw pointer (`cell_info`) and the value under `try_borrow` (`scan_cell_value`). A blocked scan bumps `blocked_scans`, as in sync.
 
 Raw allocations use TLAB bump allocation (thread-local arena blocks) with system allocator fallback. During a sweep, destructors of all dead objects run before any memory is freed (two-phase dealloc) and a dying-address registry makes interior handle drops no-ops — required for Miri/Stacked Borrows soundness of the tagged-pointer handles.
 

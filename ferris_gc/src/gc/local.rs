@@ -128,6 +128,39 @@ where
     }
 }
 
+// A `GcCell`'s object: the cell holds the whole `GcPtr`, header included.
+// The collector must not borrow the cell, since a user may hold a
+// `borrow_mut` while an allocation collects (`cell.borrow_mut().push(Gc::new(..))`).
+// It reads the header through the cell's raw pointer, as `ObjectEntry` does
+// (a `RefMut` reaches only the value: `info` is private), and the value
+// under `try_borrow`. A value it cannot read leaves the collection's mark
+// incomplete, so that collection frees nothing, as with `sync::GcCell`.
+
+/// The header of a `GcCell`'s object, read without borrowing the cell.
+#[inline]
+fn cell_info<T: Sized + Trace>(cell: &RefCell<GcPtr<T>>) -> &LocalGcInfo {
+    // SAFETY: only the header is referenced, which no borrow of the value
+    // reaches; its counters are `Cell`s.
+    unsafe { &(*cell.as_ptr()).info }
+}
+
+/// Run `f` on a `GcCell`'s value for marking, unless a `borrow_mut` holds it;
+/// then count the scan as blocked (see `GarbageCollector::blocked_scans`).
+#[inline]
+fn scan_cell_value<T: Sized + Trace>(cell: &RefCell<GcPtr<T>>, f: impl FnOnce(&T)) {
+    match cell.try_borrow() {
+        Ok(this) => f(&this.t),
+        Err(_) => {
+            let _ = LOCAL_GC.try_with(|gc| {
+                // SAFETY: only an atomic counter is touched; the collector is
+                // reached through shared references (see Gc::drop).
+                let local = unsafe { &*gc.as_ptr() };
+                local.core.blocked_scans.fetch_add(1, Ordering::AcqRel);
+            });
+        }
+    }
+}
+
 impl<T> Trace for RefCell<GcPtr<T>>
 where
     T: Sized + Trace,
@@ -147,31 +180,31 @@ where
     }
 
     fn trace(&self) {
-        let prev = self.borrow().info.root_ref_count.get();
-        self.borrow().info.root_ref_count.set(prev + 1);
+        let prev = cell_info(self).root_ref_count.get();
+        cell_info(self).root_ref_count.set(prev + 1);
         if prev == 0 {
-            self.borrow().t.trace();
+            scan_cell_value(self, |t| t.trace());
         }
     }
 
     fn reset(&self) {
-        let prev = self.borrow().info.root_ref_count.get();
-        self.borrow().info.root_ref_count.set(prev - 1);
+        let prev = cell_info(self).root_ref_count.get();
+        cell_info(self).root_ref_count.set(prev - 1);
         if prev == 1 {
-            self.borrow().t.reset();
+            scan_cell_value(self, |t| t.reset());
         }
     }
 
     fn is_traceable(&self) -> bool {
-        self.borrow().info.root_ref_count.get() > 0
+        cell_info(self).root_ref_count.get() > 0
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
-        self.borrow().t.trace_children(children);
+        scan_cell_value(self, |t| t.trace_children(children));
     }
 
     fn clear_trace(&self) {
-        self.borrow().info.root_ref_count.set(0);
+        cell_info(self).root_ref_count.set(0);
     }
 }
 
@@ -708,19 +741,18 @@ where
     }
 
     fn trace(&self) {
-        unsafe {
-            (*self.refcell_ptr()).borrow().trace();
-        }
+        // SAFETY: the object is alive while this handle exists.
+        unsafe { (*self.refcell_ptr()).trace() }
     }
 
     fn reset(&self) {
-        unsafe {
-            (*self.refcell_ptr()).borrow().reset();
-        }
+        // SAFETY: the object is alive while this handle exists.
+        unsafe { (*self.refcell_ptr()).reset() }
     }
 
     fn is_traceable(&self) -> bool {
-        unsafe { (*self.refcell_ptr()).borrow().is_traceable() }
+        // SAFETY: the object is alive while this handle exists.
+        unsafe { (*self.refcell_ptr()).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {

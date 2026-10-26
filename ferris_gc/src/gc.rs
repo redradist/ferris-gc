@@ -102,8 +102,8 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     /// insert, re-synced on the slow drop path); a stale non-zero costs a slower
     /// path, never correctness.
     pub(crate) weak_alive_len: AtomicUsize,
-    /// Number of times marking could not scan a value because a
-    /// `sync::GcCell` was mutably borrowed. A collection reads it when its
+    /// Number of times marking could not scan a value because a `GcCell`
+    /// (thread-local or sync) was mutably borrowed. A collection reads it when its
     /// marking starts; if it moved by the sweep, the marks are incomplete and
     /// the sweep frees nothing (see [`Self::keep_all_if_blocked_since`]). A
     /// counter rather than a flag, so an incremental cycle cannot lose a
@@ -699,11 +699,10 @@ impl<O: ObjectMap> GarbageCollector<O> {
         self.blocked_scans.load(Ordering::Acquire)
     }
 
-    /// If marking since `epoch` could not scan a mutably borrowed
-    /// `sync::GcCell`, the marks are incomplete: mark every object live so
-    /// this collection's sweep frees nothing; a later collection retries
-    /// (so garbage stays possible). The thread-local collector never blocks
-    /// a scan.
+    /// If marking since `epoch` could not scan a mutably borrowed `GcCell`
+    /// (thread-local or sync), the marks are incomplete: mark every object
+    /// live so this collection's sweep frees nothing; a later collection
+    /// retries (so garbage stays possible).
     #[inline]
     fn keep_all_if_blocked_since(&self, gc_maps: &mut GcMaps<O>, epoch: usize) {
         if self.blocked_scans.load(Ordering::Acquire) != epoch {
@@ -971,7 +970,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                // A mutably borrowed sync::GcCell left the mark incomplete.
+                // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 // Combined pass: sweep + count + clear_trace + promotion in a single
@@ -1175,7 +1174,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                // A mutably borrowed sync::GcCell left the mark incomplete.
+                // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 // Count in-scope objects directly (no HashSet allocation)
@@ -1318,7 +1317,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     (&*stp.0).trace();
                 });
 
-                // A mutably borrowed sync::GcCell left the mark incomplete.
+                // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 // Count in-scope objects directly
@@ -1498,7 +1497,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                // A mutably borrowed sync::GcCell left the mark incomplete.
+                // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, incr.scan_epoch);
 
                 let mut stats = CollectionStats::new(max_gen);
@@ -1715,7 +1714,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                // A mutably borrowed sync::GcCell left the mark incomplete.
+                // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 // Combined pass: sweep + count + clear_trace in a single iteration.
@@ -1822,7 +1821,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
-                // A mutably borrowed sync::GcCell left the mark incomplete.
+                // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
 
                 stats.objects_scanned = gc_maps.objects.len();
