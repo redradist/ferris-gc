@@ -468,6 +468,14 @@ impl<K: SlotKey, V> ShardedSlotMap<K, V> {
         }
     }
 
+    /// `SlotMap::park_vacant_runs` on every shard.
+    pub(crate) fn park_vacant_runs(&mut self) {
+        self.first.get_mut().park_vacant_runs();
+        for s in self.rest.iter_mut() {
+            s.0.get_mut().park_vacant_runs();
+        }
+    }
+
     pub(crate) fn drain(&mut self) -> Vec<(K, V)> {
         let mut out = self.first.get_mut().drain();
         for (i, s) in self.rest.iter_mut().enumerate() {
