@@ -19,6 +19,7 @@
 - `CollectionStats::tracers_collected` → `handles_collected`, and `GcStats::live_tracers` → `live_handles`. The old fields stay as aliases holding the same values.
 
 ### Fixed
+- **Deadlock in `sync::GcWeak::upgrade`.** It read-locked the stop-the-world lock and then read-locked it again in the collector. A collection that started waiting between the two blocked the second read (std's `RwLock` lets a waiting writer go first), and both threads hung. It is now taken once.
 - **Use-after-free in incremental and concurrent marking.**
   - Incremental marking followed the live object graph, so an object stayed unmarked when its only in-graph handle was moved or cloned away mid-mark, and it was freed. This affected the thread-local background/G1 strategies.
   - A partial (Gen0/Gen1) incremental or concurrent mark freed young objects held only by older ones.
