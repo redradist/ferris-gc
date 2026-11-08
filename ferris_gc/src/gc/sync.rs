@@ -974,11 +974,13 @@ impl GlobalGarbageCollector {
                 let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
                 // Before the shard unlocks: from then on the collector sees it.
                 (&raw mut (*info).object_id).write(obj_id);
+                // The counters' slot for this shard is written only under its
+                // lock (see `Counter`).
+                self.core.track_alloc(shard, block_layout.size());
+                self.core.allocation_count.add(shard, 1);
                 obj_id
             });
-            self.core.track_alloc(block_layout.size());
             self.core.note_new_object_during_marking(obj_id);
-            self.core.allocation_count.add(1);
             Some(obj_ptr)
         }
     }
@@ -1043,7 +1045,7 @@ impl GlobalGarbageCollector {
         // before freeing, under that lock. So seeing `alive` under it means
         // the object is still there.
         let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
-        let gc = self.core.with_shard_of(weak.object_id, |_shard| {
+        let gc = self.core.with_shard_of(weak.object_id, |_shard, _| {
             if !weak.alive.load(Ordering::Acquire) {
                 return None;
             }

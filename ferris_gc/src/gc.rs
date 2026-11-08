@@ -343,22 +343,27 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
-    /// Track heap growth after an allocation.
+    /// Track heap growth after an allocation; the caller holds `slot`'s
+    /// writers off (see [`Counter`]).
     #[inline]
-    fn track_alloc(&self, size: usize) {
-        let shard_now = self.current_heap_size.add(size);
+    fn track_alloc(&self, slot: usize, size: usize) {
+        let shard_now = self.current_heap_size.add(slot, size);
         if <O::Counter as Counter>::SINGLE {
-            // One shard: its value is the exact total, so the peak is exact.
+            // One slot: its value is the exact total, so the peak is exact.
             // A SingleCounter wraps a usize and is never negative, so the cast
-            // needs no clamp.
-            self.peak_heap_size
-                .fetch_max(shard_now as usize, Ordering::Relaxed);
+            // needs no clamp. Its only writer is the collector's own thread
+            // (see `Counter`), so a load and a store replace `fetch_max`.
+            if shard_now as usize > self.peak_heap_size.load(Ordering::Relaxed) {
+                self.peak_heap_size
+                    .store(shard_now as usize, Ordering::Relaxed);
+            }
         } else if (shard_now - size as isize) >> PEAK_SAMPLE_SHIFT != shard_now >> PEAK_SAMPLE_SHIFT
         {
             // Sharded: an exact peak of the *sum* would need a shared write per
             // allocation - the contention this avoids. Sample it whenever this
-            // thread's shard crosses a 64 KiB boundary, so the recorded peak is
-            // within ~64 KiB per thread of the true one.
+            // shard's slot crosses a 64 KiB boundary, so the recorded peak is
+            // within ~64 KiB per shard of the true one. Other shards sample
+            // under their own locks, hence `fetch_max`.
             self.peak_heap_size.fetch_max(
                 self.current_heap_size.load(Ordering::Relaxed),
                 Ordering::Relaxed,
@@ -368,10 +373,27 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
     /// Track heap shrinkage after a deallocation.
     #[inline]
-    fn track_dealloc(&self, size: usize) {
+    fn track_dealloc(&self, slot: usize, size: usize) {
         // Saturating for the single-shard (thread-local) counter; see
         // ShardedCounter::sub.
-        self.current_heap_size.sub(size);
+        self.current_heap_size.sub(slot, size);
+    }
+
+    /// Account a collection's frees: take `bytes_freed` off the heap size
+    /// and, when the collection covered Gen0, restart the allocation count.
+    /// The guard is the proof that every shard is held, so the counters can
+    /// be written (see [`Counter`]); slot 0 takes the bytes, since only the
+    /// sum is meaningful.
+    fn account_collection(
+        &self,
+        _all_shards: &GcMapsGuard<'_, O>,
+        bytes_freed: usize,
+        reset_allocation_count: bool,
+    ) {
+        if reset_allocation_count {
+            self.allocation_count.store(0, Ordering::Relaxed);
+        }
+        self.track_dealloc(0, bytes_freed);
     }
 
     /// Finalize and drop a collected object in place. The object's memory is
@@ -604,10 +626,14 @@ impl<O: ObjectMap> GarbageCollector<O> {
     pub(crate) unsafe fn drop_handle(&self, object_id: ObjectId, is_root: bool) {
         let object_dealloc = {
             let mut gc_maps = self.lock_gc_maps();
-            Self::drop_handle_inner(&mut gc_maps, object_id, is_root)
+            let r = Self::drop_handle_inner(&mut gc_maps, object_id, is_root);
+            if let Some(obj_entry) = &r {
+                // Any slot: the guard holds every shard.
+                self.track_dealloc(0, obj_entry.layout.size());
+            }
+            r
         };
         if let Some(obj_entry) = object_dealloc {
-            self.track_dealloc(obj_entry.layout.size());
             unsafe { Self::dealloc_object_entry(obj_entry) };
         }
     }
@@ -617,7 +643,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
         let gc_maps = unsafe { self.gc_maps_unsync() };
         let object_dealloc = Self::drop_handle_inner(gc_maps, object_id, is_root);
         if let Some(obj_entry) = object_dealloc {
-            self.track_dealloc(obj_entry.layout.size());
+            // Unsynchronized: the thread-local collector's own thread.
+            self.track_dealloc(0, obj_entry.layout.size());
             unsafe { Self::dealloc_object_entry(obj_entry) };
         }
     }
@@ -1087,21 +1114,14 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
+                self.account_collection(&gc_maps, stats.bytes_freed, max_gen >= Generation::Gen0);
                 object_deallocs
             };
-
-            // Reset allocation counter after gen0 collection
-            if max_gen >= Generation::Gen0 {
-                self.allocation_count.store(0, Ordering::Relaxed);
-            }
 
             // Dealloc phase: all locks released. Two-phase: drop every dead
             // object first (dying registry active), then free the memory.
             // SAFETY: Objects have been removed from gc_maps and are unreachable.
             self.dealloc_collected(object_deallocs);
-
-            // Track heap shrinkage
-            self.track_dealloc(stats.bytes_freed);
 
             // Record diagnostics
             stats.finish(start.elapsed());
@@ -1132,9 +1152,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
                 let object_deallocs: Vec<_> =
                     obj_entries.into_iter().map(|(_, entry)| entry).collect();
+                self.account_collection(&gc_maps, 0, true);
                 object_deallocs
             };
-            self.allocation_count.store(0, Ordering::Relaxed);
             // SAFETY: Objects have been removed from gc_maps and are unreachable.
             self.dealloc_collected(object_deallocs);
         }
@@ -1230,13 +1250,9 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
+                self.account_collection(&gc_maps, stats.bytes_freed, max_gen >= Generation::Gen0);
                 object_deallocs
             };
-
-            // Reset allocation counter after gen0 collection
-            if max_gen >= Generation::Gen0 {
-                self.allocation_count.store(0, Ordering::Relaxed);
-            }
 
             // Dealloc phase runs entirely on the collecting thread. Destructors
             // must be sequential (interior Gc/GcCell handle drops need THIS
@@ -1249,9 +1265,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
             // path leaked.
             // SAFETY: Objects have been removed from gc_maps and are unreachable.
             self.dealloc_collected(object_deallocs);
-
-            // Track heap shrinkage
-            self.track_dealloc(stats.bytes_freed);
 
             // Record diagnostics
             stats.finish(start.elapsed());
@@ -1424,21 +1437,14 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 incr.phase = CollectionPhase::Idle;
                 incr.clear();
 
+                self.account_collection(&gc_maps, stats.bytes_freed, max_gen >= Generation::Gen0);
                 (object_deallocs, stats)
             };
-
-            // Reset allocation counter
-            if max_gen >= Generation::Gen0 {
-                self.allocation_count.store(0, Ordering::Relaxed);
-            }
 
             // Dealloc phase: all locks released. Two-phase: drop every dead
             // object first (dying registry active), then free the memory.
             // SAFETY: Objects have been removed from gc_maps and are unreachable.
             self.dealloc_collected(object_deallocs);
-
-            // Track heap shrinkage
-            self.track_dealloc(stats.bytes_freed);
 
             // Record diagnostics
             stats.finish(start.elapsed());
@@ -1575,6 +1581,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     }
                 }
 
+                self.account_collection(&gc_maps, stats.bytes_freed, false);
                 object_deallocs
             };
 
@@ -1582,9 +1589,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
             // object first (dying registry active), then free the memory.
             // SAFETY: Objects have been removed from gc_maps and are unreachable.
             self.dealloc_collected(object_deallocs);
-
-            // Track heap shrinkage
-            self.track_dealloc(stats.bytes_freed);
 
             stats.finish(start.elapsed());
             self.total_collections.fetch_add(1, Ordering::Relaxed);
@@ -1718,6 +1722,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                     entry.root_ref_count().set(0);
                 }
 
+                self.account_collection(&gc_maps, stats.bytes_freed, false);
                 object_deallocs
             };
 
@@ -1725,9 +1730,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
             // object first (dying registry active), then free the memory.
             // SAFETY: Objects have been removed from gc_maps and are unreachable.
             self.dealloc_collected(object_deallocs);
-
-            // Track heap shrinkage
-            self.track_dealloc(stats.bytes_freed);
 
             stats.finish(start.elapsed());
             self.total_collections.fetch_add(1, Ordering::Relaxed);
@@ -1940,24 +1942,25 @@ impl GarbageCollector<SyncObjects> {
     #[inline]
     pub(crate) fn with_own_shard<R>(&self, f: impl FnOnce(&mut LocalObjects, usize) -> R) -> R {
         let shard = crate::sharded_map::current_thread_shard(self.shard_locks.len());
-        self.with_shard(shard, |m| f(m, shard))
+        self.with_shard(shard, f)
     }
 
     /// Run `f` with exclusive access to **only the shard owning `id`**, for the
     /// per-object hot paths (handle clone, RC-hybrid drop). `f` receives that
-    /// shard's `SlotMap`, which is keyed by `id.strip_shard()`.
+    /// shard's `SlotMap`, which is keyed by `id.strip_shard()`, and the shard
+    /// index.
     #[inline]
     pub(crate) fn with_shard_of<R>(
         &self,
         id: ObjectId,
-        f: impl FnOnce(&mut LocalObjects) -> R,
+        f: impl FnOnce(&mut LocalObjects, usize) -> R,
     ) -> R {
         use crate::slot_map::SlotKey;
         self.with_shard(id.shard(), f)
     }
 
     #[inline]
-    fn with_shard<R>(&self, shard: usize, f: impl FnOnce(&mut LocalObjects) -> R) -> R {
+    fn with_shard<R>(&self, shard: usize, f: impl FnOnce(&mut LocalObjects, usize) -> R) -> R {
         let shard = shard.min(self.shard_locks.len() - 1);
         let _g = self.shard_locks[shard]
             .lock()
@@ -1968,7 +1971,7 @@ impl GarbageCollector<SyncObjects> {
         // for the global collector) and every other user of this shard, so the
         // `&mut` to this shard's SlotMap is unique.
         let map = unsafe { &mut *(*self.gc_maps.get()).objects.shard_ptr(shard) };
-        f(map)
+        f(map, shard)
     }
 
     /// Free an object whose last handle was just dropped (the header's
@@ -1987,7 +1990,7 @@ impl GarbageCollector<SyncObjects> {
     /// one, so the count is left as it is - the object is freed.
     pub(crate) unsafe fn release_object(&self, object_id: ObjectId, unique: Option<&AtomicU32>) {
         use crate::slot_map::SlotKey;
-        let fast = self.with_shard_of(object_id, |shard| {
+        let fast = self.with_shard_of(object_id, |shard, slot| {
             // Re-check the weak hint *under* the shard lock: a weak ref is
             // created under the full lock, which holds this shard's lock, so
             // this read is ordered after any such creation. With weak refs
@@ -2001,7 +2004,9 @@ impl GarbageCollector<SyncObjects> {
                 return Some(None);
             }
             // SAFETY: `key` was just found occupied in this shard.
-            Some(Some(unsafe { shard.remove_unchecked(key) }))
+            let entry = unsafe { shard.remove_unchecked(key) };
+            self.track_dealloc(slot, entry.layout.size());
+            Some(Some(entry))
         });
         let released = match fast {
             Some(r) => r,
@@ -2018,6 +2023,10 @@ impl GarbageCollector<SyncObjects> {
                     }
                 }
                 let r = Self::release_object_inner(&mut gc_maps, object_id);
+                if let Some(entry) = &r {
+                    // Any slot: the guard holds every shard.
+                    self.track_dealloc(0, entry.layout.size());
+                }
                 // Re-sync the hint while every shard is held, so a program that
                 // used weak refs only briefly returns to the fast path.
                 self.weak_alive_len
@@ -2026,7 +2035,6 @@ impl GarbageCollector<SyncObjects> {
             }
         };
         if let Some(entry) = released {
-            self.track_dealloc(entry.layout.size());
             unsafe { Self::dealloc_object_entry(entry) };
         }
     }
