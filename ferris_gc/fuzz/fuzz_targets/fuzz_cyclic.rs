@@ -57,7 +57,7 @@ fuzz_target!(|data: &[u8]| {
             4 => {
                 // Collect
                 ferris_gc::LOCAL_GC.with(|gc| unsafe {
-                    gc.borrow_mut().collect();
+                    gc.borrow()._collect();
                 });
             }
             _ => unreachable!(),
@@ -65,6 +65,6 @@ fuzz_target!(|data: &[u8]| {
     }
     drop(nodes);
     ferris_gc::LOCAL_GC.with(|gc| unsafe {
-        gc.borrow_mut().collect();
+        gc.borrow()._collect();
     });
 });

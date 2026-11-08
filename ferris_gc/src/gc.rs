@@ -1140,15 +1140,15 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
-    /// Parallel collection: mark phase is serial, sweep/dealloc phase uses rayon for
-    /// parallel finalization and deallocation. Collects objects in generations 0..=max_gen.
+    /// Collection of generations 0..=max_gen for the `parallel` feature. Both
+    /// phases run on the calling thread: the dealloc phase must (see below),
+    /// and a parallel mark would race on the thread-local collector's
+    /// non-atomic counts.
     ///
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     #[cfg(feature = "parallel")]
     pub unsafe fn collect_parallel(&self, max_gen: Generation) -> CollectionStats {
-        use rayon::prelude::*;
-
         unsafe {
             let start = std::time::Instant::now();
             let mut stats = CollectionStats::new(max_gen);
@@ -1266,140 +1266,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
-    /// Collection with parallel mark AND parallel sweep.
-    ///
-    /// Uses rayon to parallelize the mark phase (root tracing) and the sweep phase
-    /// (deallocation). The mark phase partitions roots across worker threads;
-    /// each worker traces its assigned roots independently. This works because
-    /// `LocalGcInfo::root_ref_count` uses `Cell<usize>` for the thread-local GC.
-    /// Parallel mark requires reverting to AtomicUsize or using UnsafeCell.
-    ///
-    /// Best for large heaps with many root objects. For small heaps, the serial
-    /// `collect_generation()` is faster due to lower overhead.
-    ///
-    /// # Safety
-    /// Caller must ensure no references to GC-managed objects are being
-    /// actively dereferenced. STW write lock is acquired internally.
-    #[cfg(feature = "parallel")]
-    pub unsafe fn collect_parallel_mark(&self, max_gen: Generation) -> CollectionStats {
-        use rayon::prelude::*;
-
-        unsafe {
-            let start = std::time::Instant::now();
-            let mut stats = CollectionStats::new(max_gen);
-
-            let object_deallocs = {
-                let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-                let mut gc_maps = self.lock_gc_maps();
-
-                let gc_maps_raw = &mut *gc_maps as *mut GcMaps<O>;
-                let scope = if max_gen >= Generation::Gen2 {
-                    None
-                } else {
-                    Some(max_gen)
-                };
-                let scan_epoch = self.scan_epoch();
-                Self::discover_roots(gc_maps_raw, scope, false);
-
-                // Parallel mark phase: collect root objects, then trace in parallel.
-                struct SendTracePtr(*const dyn Trace);
-                unsafe impl Send for SendTracePtr {}
-                unsafe impl Sync for SendTracePtr {}
-
-                let root_objects: Vec<SendTracePtr> = gc_maps
-                    .objects
-                    .values()
-                    .filter(|e| e.root_count > 0)
-                    .map(|e| SendTracePtr(e.ptr))
-                    .collect();
-
-                root_objects.par_iter().for_each(|stp| {
-                    (&*stp.0).trace();
-                });
-
-                // A mutably borrowed GcCell left the mark incomplete.
-                self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
-
-                // Count in-scope objects directly
-                stats.objects_scanned = gc_maps
-                    .objects
-                    .iter()
-                    .filter(|(_, e)| e.generation() <= max_gen)
-                    .count();
-
-                // Sweep objects: collect unreachable in-scope objects
-                let collected_objects: Vec<ObjectId> = gc_maps
-                    .objects
-                    .iter()
-                    .filter(|(_, e)| e.generation() <= max_gen && !(&*e.ptr).is_traceable())
-                    .map(|(id, _)| id)
-                    .collect();
-                stats.objects_collected = collected_objects.len();
-
-                // Clear marks
-                for entry in gc_maps.objects.values() {
-                    (&*entry.ptr).clear_trace();
-                }
-
-                // Remove collected objects
-                let mut object_deallocs = Vec::new();
-                for &obj_id in &collected_objects {
-                    if let Some(entry) = gc_maps.objects.remove(obj_id) {
-                        let thin = entry.ptr.get_thin_ptr();
-                        gc_maps.ptr_to_object.remove(&thin);
-                        stats.bytes_freed += entry.layout.size();
-                        stats.handles_collected += Self::handles_held(&entry);
-                        if let Some(alive) = gc_maps.weak_alive_map.remove(&obj_id) {
-                            alive.store(false, Ordering::Release);
-                        }
-                        object_deallocs.push(entry);
-                    }
-                }
-
-                // Promotion: surviving in-scope objects
-                let promo_cfg = self.promotion_config();
-                for (_, entry) in gc_maps.objects.iter_mut() {
-                    if entry.generation() > max_gen {
-                        continue;
-                    }
-                    let cur_gen = entry.generation();
-                    entry.increment_survive_count();
-                    if entry.survive_count() >= promo_cfg.threshold_for(cur_gen) {
-                        entry.set_survive_count(0);
-                        if let Some(next_gen) = cur_gen.next() {
-                            entry.set_generation(next_gen);
-                            stats.objects_promoted += 1;
-                        }
-                    }
-                }
-
-                object_deallocs
-            };
-
-            if max_gen >= Generation::Gen0 {
-                self.allocation_count.store(0, Ordering::Relaxed);
-            }
-
-            // Dealloc phase: fully sequential — see collect_parallel for why
-            // neither destructors nor frees may run on rayon workers
-            // (dying registry / thread-local collector; non-atomic
-            // TlabBlock::ref_count).
-            // SAFETY: Objects have been removed from gc_maps and are unreachable.
-            self.dealloc_collected(object_deallocs);
-
-            self.track_dealloc(stats.bytes_freed);
-            stats.finish(start.elapsed());
-            self.total_collections.fetch_add(1, Ordering::Relaxed);
-            *self
-                .last_collection
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(stats);
-            self.fire_on_collection(&stats);
-
-            stats
-        }
-    }
-
     /// Begin an incremental collection cycle (see [`IncrementalState`] for
     /// the snapshot-at-the-beginning mark).
     /// Short STW: discovers the roots, records every in-scope object White
@@ -1458,10 +1324,20 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
-    /// Process up to `budget` grey objects from the worklist. Returns `true`
-    /// when marking is complete. The same step as `concurrent_mark_step`.
-    pub unsafe fn mark_step(&self, budget: usize) -> bool {
-        self.concurrent_mark_step(budget)
+    /// Process up to `budget` grey objects from the worklist. Reads only the
+    /// snapshot, so it needs no STW and may run on another thread while the
+    /// mutators run (the background/g1 strategies do).
+    /// Returns `true` when marking is complete (gray stack empty).
+    // Out of line: inlined into the allocation trigger's incremental step,
+    // it made the common no-step path pay a larger prologue.
+    #[inline(never)]
+    pub fn mark_step(&self, budget: usize) -> bool {
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+        let mut processed = 0;
+        incr.mark(|| {
+            processed += 1;
+            processed <= budget
+        })
     }
 
     /// Finish an incremental collection: blacken the remaining grey objects,
@@ -1598,11 +1474,13 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
-    /// Time-budgeted incremental mark step: processes grey objects until
-    /// `max_duration` elapses or none is left. Returns `true` when marking is
-    /// complete. The same step as `concurrent_mark_step_timed`.
-    pub unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
-        self.concurrent_mark_step_timed(max_duration)
+    /// Time-budgeted mark step: processes grey objects until `max_duration`
+    /// elapses or none is left. Like `mark_step`, it needs no STW.
+    /// Returns `true` when marking is complete.
+    pub fn mark_step_timed(&self, max_duration: Duration) -> bool {
+        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now() + max_duration;
+        incr.mark(|| Instant::now() < deadline)
     }
 
     /// Run a complete incremental collection with time-budgeted mark steps.
@@ -1624,58 +1502,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
             }
             self.finish_collection()
         }
-    }
-
-    // ---- Concurrent marking (Strategy 21) ----
-
-    /// Begin a concurrent collection cycle: the same snapshot as
-    /// `begin_collection`, which lets the mark steps run without STW.
-    pub unsafe fn begin_concurrent_collection(&self, max_gen: Generation) {
-        unsafe { self.begin_collection(max_gen) }
-    }
-
-    /// Process up to `budget` grey objects using the edge snapshot. NO STW
-    /// lock required: the snapshot is all it reads.
-    /// Returns `true` when marking is complete (gray stack empty).
-    // Out of line: inlined into the allocation trigger's incremental step,
-    // it made the common no-step path pay a larger prologue.
-    #[inline(never)]
-    pub fn concurrent_mark_step(&self, budget: usize) -> bool {
-        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let mut processed = 0;
-        incr.mark(|| {
-            processed += 1;
-            processed <= budget
-        })
-    }
-
-    /// Convenience: run a complete concurrent collection, the same cycle as
-    /// `collect_incremental`.
-    pub unsafe fn collect_concurrent(
-        &self,
-        max_gen: Generation,
-        step_budget: usize,
-    ) -> CollectionStats {
-        unsafe { self.collect_incremental(max_gen, step_budget) }
-    }
-
-    /// Time-budgeted concurrent mark step. NO STW lock required.
-    /// Processes gray objects from the edge snapshot until `max_duration` elapses
-    /// or the gray stack is empty. Returns `true` when marking is complete.
-    pub fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
-        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        let deadline = Instant::now() + max_duration;
-        incr.mark(|| Instant::now() < deadline)
-    }
-
-    /// Run a complete concurrent collection with time-budgeted mark steps,
-    /// the same cycle as `collect_incremental_timed`.
-    pub unsafe fn collect_concurrent_timed(
-        &self,
-        max_gen: Generation,
-        max_step_duration: Duration,
-    ) -> CollectionStats {
-        unsafe { self.collect_incremental_timed(max_gen, max_step_duration) }
     }
 
     // ---- Region-based collection (Strategy 22) ----

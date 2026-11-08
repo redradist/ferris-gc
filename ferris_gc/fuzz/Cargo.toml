@@ -14,6 +14,8 @@ libfuzzer-sys = "0.4"
 
 [dependencies.ferris-gc]
 path = ".."
+# The collection entry points are crate-private; `_internal` exposes them.
+features = ["_internal"]
 
 [[bin]]
 name = "fuzz_alloc_drop"

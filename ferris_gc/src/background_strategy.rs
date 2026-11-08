@@ -14,6 +14,10 @@ use crate::generation::Generation;
 /// while Gen2 collection runs **concurrently** in a dedicated background thread
 /// using the snapshot-based concurrent marking infrastructure. This dramatically
 /// reduces pause times for large heaps.
+///
+/// That is the global collector. A thread-local collector is collected only on
+/// its own thread, so [`background_local_strategy`] spawns no thread and uses
+/// only `gen0_threshold` and `gen2_mark_step_budget`.
 pub struct BackgroundConfig {
     /// Number of allocations before triggering a Gen0 collection (foreground).
     pub gen0_threshold: usize,
@@ -43,15 +47,12 @@ impl Default for BackgroundConfig {
     }
 }
 
-/// Creates a strategy closure for a local background collector.
+/// Creates a strategy closure for a thread-local background collector.
 ///
-/// The returned closure spawns **two** threads:
-/// - **Foreground thread**: polls `allocation_count` and triggers Gen0/Gen1 STW collections.
-/// - **Background Gen2 thread**: monitors heap occupancy and runs concurrent Gen2 collection
-///   (`begin_concurrent_collection` → `concurrent_mark_step` loop → `finish_collection`).
-///
-/// Both threads share the same `is_active` flag and exit when it becomes `false`.
-/// The foreground thread joins the background thread on exit.
+/// A thread-local collector is only collected on its own thread, so no thread
+/// is spawned: the closure configures the allocation trigger to mark Gen2
+/// incrementally, `gen2_mark_step_budget` objects per allocation past
+/// `gen0_threshold` (see `LocalGarbageCollector::configure_trigger`).
 #[allow(clippy::type_complexity)]
 pub fn background_local_strategy(
     config: BackgroundConfig,
@@ -79,10 +80,16 @@ pub fn background_local_strategy(
     }
 }
 
-/// Creates a strategy closure for a global background collector.
+/// Creates a strategy closure for the global (thread-safe) collector.
 ///
-/// Same two-thread architecture as the local variant, but operates on the
-/// global (thread-safe) `GlobalGarbageCollector`.
+/// The returned closure spawns **two** threads:
+/// - **Foreground thread**: polls `allocation_count` and triggers Gen0/Gen1 STW collections.
+/// - **Background Gen2 thread**: monitors heap occupancy and runs Gen2 collections whose
+///   mark steps run concurrently with the mutators
+///   (`begin_collection` → `mark_step` loop → `finish_collection`).
+///
+/// Both threads share the same `is_active` flag and exit when it becomes `false`.
+/// The foreground thread joins the background thread on exit.
 #[allow(clippy::type_complexity)]
 pub fn background_global_strategy(
     config: BackgroundConfig,
@@ -110,16 +117,14 @@ pub fn background_global_strategy(
 
                 if peak > 0 && current as f64 > peak as f64 * config_bg.gen2_occupancy_trigger {
                     unsafe {
-                        gc.core.begin_concurrent_collection(Generation::Gen2);
+                        gc.core.begin_collection(Generation::Gen2);
                     }
 
                     loop {
                         if !is_active.load(Ordering::Acquire) {
                             break;
                         }
-                        let done = gc
-                            .core
-                            .concurrent_mark_step(config_bg.gen2_mark_step_budget);
+                        let done = gc.core.mark_step(config_bg.gen2_mark_step_budget);
                         if done {
                             break;
                         }
@@ -134,12 +139,9 @@ pub fn background_global_strategy(
 
             // Final concurrent Gen2 collection on shutdown
             unsafe {
-                gc.core.begin_concurrent_collection(Generation::Gen2);
+                gc.core.begin_collection(Generation::Gen2);
             }
-            while !gc
-                .core
-                .concurrent_mark_step(config_bg.gen2_mark_step_budget)
-            {}
+            while !gc.core.mark_step(config_bg.gen2_mark_step_budget) {}
             unsafe {
                 gc.core.finish_collection();
             }

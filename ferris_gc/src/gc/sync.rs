@@ -1102,18 +1102,6 @@ impl GlobalGarbageCollector {
         unsafe { self.core.collect_parallel(max_gen) }
     }
 
-    /// Collection with parallel mark AND parallel sweep using rayon.
-    ///
-    /// # Safety
-    /// Must not be called while any GC references are being dereferenced.
-    #[cfg(feature = "parallel")]
-    pub(crate) unsafe fn collect_parallel_mark(
-        &self,
-        max_gen: crate::generation::Generation,
-    ) -> crate::generation::CollectionStats {
-        unsafe { self.core.collect_parallel_mark(max_gen) }
-    }
-
     /// # Safety
     /// The caller must ensure no references to GC-managed objects are used during collection.
     pub(crate) unsafe fn begin_collection(&self, max_gen: crate::generation::Generation) {
@@ -1123,11 +1111,10 @@ impl GlobalGarbageCollector {
         }
     }
 
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn mark_step(&self, budget: usize) -> bool {
-        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
-        unsafe { self.core.mark_step(budget) }
+    /// Process up to `budget` grey objects. Returns true when marking is
+    /// complete. Needs no STW (see `GarbageCollector::mark_step`).
+    pub(crate) fn mark_step(&self, budget: usize) -> bool {
+        self.core.mark_step(budget)
     }
 
     /// # Safety
@@ -1148,45 +1135,9 @@ impl GlobalGarbageCollector {
         unsafe { self.core.collect_incremental(max_gen, step_budget) }
     }
 
-    /// Begin concurrent collection: short STW to snapshot roots + edges.
-    ///
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn begin_concurrent_collection(
-        &self,
-        max_gen: crate::generation::Generation,
-    ) {
-        unsafe {
-            // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
-            self.core.begin_concurrent_collection(max_gen);
-        }
-    }
-
-    /// Process gray objects using edge snapshot. NO STW lock — safe for concurrent use.
-    pub(crate) fn concurrent_mark_step(&self, budget: usize) -> bool {
-        self.core.concurrent_mark_step(budget)
-    }
-
-    /// Run a complete concurrent collection.
-    ///
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn collect_concurrent(
-        &self,
-        max_gen: crate::generation::Generation,
-        step_budget: usize,
-    ) -> crate::generation::CollectionStats {
-        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
-        unsafe { self.core.collect_concurrent(max_gen, step_budget) }
-    }
-
-    /// Time-budgeted incremental mark step. See `GarbageCollector::mark_step_timed`.
-    ///
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn mark_step_timed(&self, max_duration: Duration) -> bool {
-        // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
-        unsafe { self.core.mark_step_timed(max_duration) }
+    /// Time-budgeted mark step. See `GarbageCollector::mark_step_timed`.
+    pub(crate) fn mark_step_timed(&self, max_duration: Duration) -> bool {
+        self.core.mark_step_timed(max_duration)
     }
 
     /// Run a complete incremental collection with time-budgeted steps.
@@ -1202,27 +1153,6 @@ impl GlobalGarbageCollector {
             // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
             self.core
                 .collect_incremental_timed(max_gen, max_step_duration)
-        }
-    }
-
-    /// Time-budgeted concurrent mark step. NO STW lock — safe for concurrent use.
-    pub(crate) fn concurrent_mark_step_timed(&self, max_duration: Duration) -> bool {
-        self.core.concurrent_mark_step_timed(max_duration)
-    }
-
-    /// Run a complete concurrent collection with time-budgeted steps.
-    ///
-    /// # Safety
-    /// The caller must ensure no references to GC-managed objects are used during collection.
-    pub(crate) unsafe fn collect_concurrent_timed(
-        &self,
-        max_gen: crate::generation::Generation,
-        max_step_duration: Duration,
-    ) -> crate::generation::CollectionStats {
-        unsafe {
-            // SAFETY: Caller upholds the safety contract that no GC-managed references are in use.
-            self.core
-                .collect_concurrent_timed(max_gen, max_step_duration)
         }
     }
 
@@ -1330,12 +1260,13 @@ impl GlobalGarbageCollector {
     ) -> crate::generation::CollectionStats {
         unsafe { self.collect_incremental_timed(max_gen, max_step_duration) }
     }
+    #[deprecated(note = "the same cycle as `_collect_incremental_timed`")]
     pub unsafe fn _collect_concurrent_timed(
         &self,
         max_gen: crate::generation::Generation,
         max_step_duration: Duration,
     ) -> crate::generation::CollectionStats {
-        unsafe { self.collect_concurrent_timed(max_gen, max_step_duration) }
+        unsafe { self.collect_incremental_timed(max_gen, max_step_duration) }
     }
     pub unsafe fn _collect_region(
         &self,
@@ -2150,7 +2081,7 @@ mod tests {
         let _live = Gc::new(42);
         let stats =
             // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
-            unsafe { (*GLOBAL_GC).collect_concurrent(crate::generation::Generation::Gen2, 10) };
+            unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 10) };
         assert_eq!(
             stats.objects_collected, 0,
             "concurrent must not collect live objects"
@@ -2174,8 +2105,8 @@ mod tests {
         let _live = Gc::new(99);
         // SAFETY: GLOBAL_GC is initialized once via lazy_static and remains valid for 'static.
         unsafe {
-            (*GLOBAL_GC).begin_concurrent_collection(crate::generation::Generation::Gen2);
-            while !(*GLOBAL_GC).concurrent_mark_step(1) {}
+            (*GLOBAL_GC).begin_collection(crate::generation::Generation::Gen2);
+            while !(*GLOBAL_GC).mark_step(1) {}
             let stats = (*GLOBAL_GC).finish_collection();
             assert_eq!(stats.objects_collected, 0, "live objects must survive");
         }
@@ -2184,7 +2115,7 @@ mod tests {
     #[test]
     fn sync_concurrent_preserves_live_graph() {
         // The sync concurrent collector marks via an edge snapshot built with
-        // trace_children (begin_concurrent_collection). A live *graph* (not just
+        // trace_children (begin_collection). A live *graph* (not just
         // leaf objects) must survive a full begin -> mark_step* -> finish cycle.
         // Regression: a type with GC children but no trace_children would have
         // its children swept (see Trace::trace_children docs).
@@ -2233,7 +2164,7 @@ mod tests {
         // Full concurrent cycle with a tiny step budget (many mark steps).
         let stats =
             // SAFETY: GLOBAL_GC is initialized once via lazy_static, valid for 'static.
-            unsafe { (*GLOBAL_GC).collect_concurrent(crate::generation::Generation::Gen2, 4) };
+            unsafe { (*GLOBAL_GC).collect_incremental(crate::generation::Generation::Gen2, 4) };
         assert_eq!(
             stats.objects_collected, 0,
             "concurrent collection must not free the live chain"
@@ -2716,7 +2647,7 @@ mod tests {
         drop(b);
         unsafe { GLOBAL_GC.core.begin_collection(Generation::Gen2) };
         let upgraded = weak.upgrade();
-        while !GLOBAL_GC.core.concurrent_mark_step(1) {}
+        while !GLOBAL_GC.core.mark_step(1) {}
         let stats = unsafe { GLOBAL_GC.core.finish_collection() };
         // The background strategy may have freed the cycle before the mark.
         let Some(a) = upgraded else {

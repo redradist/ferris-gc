@@ -26,6 +26,10 @@ use crate::generation::Generation;
 ///   exceeds `initiating_heap_occupancy_percent`. After the mark cycle completes,
 ///   the foreground's next `collect_garbage_first()` benefits from fresh mark
 ///   data for region prioritization.
+///
+/// That is the global collector. A thread-local collector is collected only on
+/// its own thread, so [`g1_local_strategy`] spawns no thread and uses only
+/// `young_gen_threshold` and `concurrent_mark_budget`.
 pub struct G1Config {
     /// Target maximum pause time for collections.
     pub pause_target: Duration,
@@ -51,18 +55,12 @@ impl Default for G1Config {
     }
 }
 
-/// Creates a strategy closure for a local G1 collector.
+/// Creates a strategy closure for a thread-local G1 collector.
 ///
-/// The returned closure spawns **two** threads:
-/// - **Foreground thread**: polls `allocation_count` and triggers
-///   `collect_garbage_first(pause_target)` — a mixed collection that sweeps
-///   the dirtiest regions within the time budget.
-/// - **Background Gen2 thread**: monitors heap occupancy and runs concurrent
-///   Gen2 collection (`begin_concurrent_collection` -> `concurrent_mark_step`
-///   loop -> `finish_collection`).
-///
-/// Both threads share the same `is_active` flag and exit when it becomes `false`.
-/// The foreground thread joins the background thread on exit.
+/// A thread-local collector is only collected on its own thread, so no thread
+/// is spawned: the closure configures the allocation trigger to mark Gen2
+/// incrementally, `concurrent_mark_budget` objects per allocation past
+/// `young_gen_threshold` (see `LocalGarbageCollector::configure_trigger`).
 #[allow(clippy::type_complexity)]
 pub fn g1_local_strategy(
     config: G1Config,
@@ -89,10 +87,18 @@ pub fn g1_local_strategy(
     }
 }
 
-/// Creates a strategy closure for a global G1 collector.
+/// Creates a strategy closure for the global (thread-safe) G1 collector.
 ///
-/// Same two-thread architecture as the local variant, but operates on the
-/// global (thread-safe) `GlobalGarbageCollector`.
+/// The returned closure spawns **two** threads:
+/// - **Foreground thread**: polls `allocation_count` and triggers
+///   `collect_garbage_first(pause_target)` — a mixed collection that sweeps
+///   the dirtiest regions within the time budget.
+/// - **Background Gen2 thread**: monitors heap occupancy and runs Gen2
+///   collections whose mark steps run concurrently with the mutators
+///   (`begin_collection` -> `mark_step` loop -> `finish_collection`).
+///
+/// Both threads share the same `is_active` flag and exit when it becomes `false`.
+/// The foreground thread joins the background thread on exit.
 #[allow(clippy::type_complexity)]
 pub fn g1_global_strategy(
     config: G1Config,
@@ -120,16 +126,14 @@ pub fn g1_global_strategy(
                     && current as f64 > peak as f64 * config_bg.initiating_heap_occupancy_percent
                 {
                     unsafe {
-                        gc.core.begin_concurrent_collection(Generation::Gen2);
+                        gc.core.begin_collection(Generation::Gen2);
                     }
 
                     loop {
                         if !is_active.load(Ordering::Acquire) {
                             break;
                         }
-                        let done = gc
-                            .core
-                            .concurrent_mark_step(config_bg.concurrent_mark_budget);
+                        let done = gc.core.mark_step(config_bg.concurrent_mark_budget);
                         if done {
                             break;
                         }
@@ -143,12 +147,9 @@ pub fn g1_global_strategy(
             }
 
             unsafe {
-                gc.core.begin_concurrent_collection(Generation::Gen2);
+                gc.core.begin_collection(Generation::Gen2);
             }
-            while !gc
-                .core
-                .concurrent_mark_step(config_bg.concurrent_mark_budget)
-            {}
+            while !gc.core.mark_step(config_bg.concurrent_mark_budget) {}
             unsafe {
                 gc.core.finish_collection();
             }

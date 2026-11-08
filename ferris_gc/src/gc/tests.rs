@@ -730,7 +730,7 @@ fn incremental_phase_tracking() {
             crate::generation::CollectionPhase::Marking
         );
 
-        while unsafe { !gc_ref.core.mark_step(1) } {}
+        while !gc_ref.core.mark_step(1) {}
         // Still marking until finish_collection
         assert_eq!(
             gc_ref
@@ -1196,7 +1196,7 @@ fn concurrent_collects_dead_objects_via_cycle() {
         let _stats = unsafe {
             gc_ref
                 .core
-                .collect_concurrent(crate::generation::Generation::Gen2, 10)
+                .collect_incremental(crate::generation::Generation::Gen2, 10)
         };
         let objs_after = gc_ref.core.lock_gc_maps().objects.len();
         assert!(
@@ -1216,7 +1216,7 @@ fn concurrent_preserves_live_objects() {
         let stats = unsafe {
             gc_ref
                 .core
-                .collect_concurrent(crate::generation::Generation::Gen2, 10)
+                .collect_incremental(crate::generation::Generation::Gen2, 10)
         };
         assert_eq!(
             stats.objects_collected, 0,
@@ -1236,10 +1236,10 @@ fn concurrent_step_by_step() {
         unsafe {
             gc_ref
                 .core
-                .begin_concurrent_collection(crate::generation::Generation::Gen2);
+                .begin_collection(crate::generation::Generation::Gen2);
         }
-        // concurrent_mark_step does NOT require STW
-        while !gc_ref.core.concurrent_mark_step(1) {}
+        // mark_step does NOT require STW
+        while !gc_ref.core.mark_step(1) {}
         let stats = unsafe { gc_ref.core.finish_collection() };
         assert_eq!(
             stats.objects_collected, 0,
@@ -1566,7 +1566,7 @@ fn timed_concurrent_collection_works() {
         let gc_ref = gc.borrow();
         let objs_before = gc_ref.core.lock_gc_maps().objects.len();
         unsafe {
-            let stats = gc_ref.core.collect_concurrent_timed(
+            let stats = gc_ref.core.collect_incremental_timed(
                 crate::generation::Generation::Gen2,
                 Duration::from_secs(1),
             );

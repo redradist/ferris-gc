@@ -78,7 +78,7 @@ fuzz_target!(|data: &[u8]| {
             6 => {
                 // Collect and cleanup the table
                 ferris_gc::LOCAL_GC.with(|gc| unsafe {
-                    gc.borrow_mut().collect();
+                    gc.borrow()._collect();
                 });
                 table.cleanup();
                 // After cleanup, the len should only count live entries
@@ -105,7 +105,7 @@ fuzz_target!(|data: &[u8]| {
     // Final cleanup: drop all keys, collect, cleanup table, verify empty
     keys.clear();
     ferris_gc::LOCAL_GC.with(|gc| unsafe {
-        gc.borrow_mut().collect();
+        gc.borrow()._collect();
     });
     table.cleanup();
     assert_eq!(
@@ -115,6 +115,6 @@ fuzz_target!(|data: &[u8]| {
     );
     assert!(table.is_empty());
     ferris_gc::LOCAL_GC.with(|gc| unsafe {
-        gc.borrow_mut().collect();
+        gc.borrow()._collect();
     });
 });

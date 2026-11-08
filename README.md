@@ -7,8 +7,7 @@ A production-grade garbage collection library for Rust with both thread-local an
 ## Features
 
 - **Generational collection** (Gen0/Gen1/Gen2) with configurable promotion thresholds
-- **Incremental marking** with object-count or time-budgeted steps for predictable pause times
-- **Concurrent marking** (snapshot-based, no STW during mark phase)
+- **Incremental marking** with object-count or time-budgeted steps for predictable pause times. The mark follows a snapshot taken when it begins, so its steps need no STW and can run on a background thread, concurrently with the mutators
 - **Region-based collection** for scoped memory management
 - **Cycle detection** via tri-color mark-sweep
 - **RC hybrid** — immediate deallocation for non-cyclic objects
@@ -351,16 +350,7 @@ A partial (Gen0/Gen1) collection treats every young object an older object point
 
 ### Thread-Local Allocation Buffers (TLAB)
 
-The thread-local collector uses bump-pointer allocation within 64KB TLAB blocks. New allocations simply increment a pointer — no system allocator call or lock needed. When a block fills up, a new one is allocated. TLAB blocks are freed automatically when all objects within them are collected (via `Arc<TlabBlock>` reference counting).
-
-### Parallel Sweep (requires `parallel` feature)
-
-With the `parallel` feature enabled, the deallocation phase is parallelized using [rayon](https://crates.io/crates/rayon). The mark phase remains serial (single-threaded graph traversal is typically faster due to pointer-chasing), but dead objects are deallocated in parallel across CPU cores.
-
-```toml
-[dependencies]
-ferris-gc = { version = "0.2.0", features = ["parallel"] }
-```
+The thread-local collector uses bump-pointer allocation within 64KB TLAB blocks. New allocations simply increment a pointer — no system allocator call or lock needed. When a block fills up, a new one is allocated. A TLAB block is freed when all objects within it are freed (a non-atomic per-block reference count: the thread-local collector is only ever collected on its own thread).
 
 ## Feature Flags
 
@@ -368,7 +358,7 @@ ferris-gc = { version = "0.2.0", features = ["parallel"] }
 |---------|---------|-------------|
 | `std` | yes | Full GC runtime (collectors, strategies, threading) |
 | `proc-macro` | no | `#[derive(Trace, Finalize)]` and `#[ferris_gc_main]` |
-| `parallel` | no | Parallel sweep via rayon |
+| `parallel` | no | Reserved: no collection path is parallel at the moment (the sweep must run its destructors and frees on the collecting thread) |
 
 With `--no-default-features`, only core traits (`Trace`, `Finalize`) and generation types are exported (`no_std` compatible).
 
@@ -408,7 +398,7 @@ stays under ordinary Rust ownership with zero GC overhead.
 | Heap model | Per-thread heaps (`Gc<T>`) plus an optional shared heap (`sync::Gc<T>`) | One global shared heap |
 | Reclamation | RC-hybrid: an object is freed **immediately** when its last handle drops; tracing runs only to break cycles | Pure tracing: nothing is freed until a GC cycle runs |
 | Generations | Gen0/Gen1/Gen2 with configurable promotion | Non-generational |
-| Marking | Stop-the-world by default, with incremental, concurrent and parallel modes | Concurrent and parallel by design |
+| Marking | Stop-the-world by default, with incremental marking whose steps can run concurrently | Concurrent and parallel by design |
 | Pause scope | A thread-local collection pauses **only the owning thread** | Short global STW phases stop the whole process |
 | Trigger | Allocation-count threshold with GOGC-style adaptive scaling; pluggable strategies (basic / threshold / adaptive / background / G1) | Heap-growth pacer (`GOGC`) |
 | Compaction | Not yet (currently disabled) | Non-moving as well |

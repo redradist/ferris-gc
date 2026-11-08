@@ -26,8 +26,8 @@ const TLAB_DEFAULT_SIZE: usize = 64 * 1024;
 pub(crate) struct TlabBlock {
     buffer: *mut u8,
     layout: Layout,
-    /// Non-atomic reference count. Safe because TLAB is thread-local and
-    /// all cross-thread access (background GC) is under a Mutex.
+    /// Non-atomic reference count. Safe because TLAB is thread-local, and a
+    /// thread-local collector is only ever collected on its own thread.
     ref_count: usize,
 }
 
