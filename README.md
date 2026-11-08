@@ -414,23 +414,23 @@ lower is better:
 
 | Benchmark | Go | FerrisGC | FerrisGC / Go | Go max pause | FerrisGC max pause |
 |---|---:|---:|---:|---:|---:|
-| alloc | 2.73 ms | 9.18 ms | 3.4× | 0.080 ms | 0.001 ms |
-| churn | 1.18 ms | 4.51 ms | 3.8× | 0.068 ms | 0.002 ms |
-| tree (2^18 nodes) | 20.71 ms | 61.52 ms | 3.0× | 0.171 ms | 3.290 ms |
-| generational | 1.41 ms | 4.50 ms | 3.2× | 0.078 ms | 0.001 ms |
-| concurrent | 0.60 ms | 4.88 ms | 8.2× | 0.059 ms | 0.008 ms |
+| alloc | 2.90 ms | 7.68 ms | 2.6× | 0.073 ms | 0.002 ms |
+| churn | 2.02 ms | 2.59 ms | 1.3× | 0.087 ms | 0.004 ms |
+| tree (2^18 nodes) | 25.64 ms | 60.61 ms | 2.4× | 0.212 ms | 3.819 ms |
+| generational | 1.51 ms | 2.69 ms | 1.8× | 0.266 ms | 0.002 ms |
+| concurrent | 0.81 ms | 5.11 ms | 6.3× | 0.102 ms | 0.005 ms |
 
 ```mermaid
 xychart-beta
     title "FerrisGC wall time as a multiple of Go (lower is better, 1 = parity)"
     x-axis [alloc, churn, tree, generational, concurrent]
     y-axis "x slower than Go" 0 --> 10
-    bar [3.4, 3.8, 3.0, 3.2, 8.2]
+    bar [2.6, 1.3, 2.4, 1.8, 6.3]
 ```
 
 **How to read this honestly:**
 
-- On thread-local workloads FerrisGC runs within **3–4× of Go** — a
+- On thread-local workloads FerrisGC runs within **1.3–2.6× of Go** — a
   runtime-integrated, concurrent collector with a decade of tuning — while
   giving you immediate reclamation and per-thread pause isolation that Go
   cannot: a collecting thread never stops the rest of the process.

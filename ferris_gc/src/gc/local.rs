@@ -1419,7 +1419,7 @@ impl LocalGarbageCollector {
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             gc_maps.gen0_ids.push(obj_id);
-            self.core.track_alloc(obj_layout.size());
+            self.core.track_alloc(0, obj_layout.size());
 
             // Store object_id in GcPtr so Gc<T> can retrieve it via pointer deref.
             (*gc_ptr).object_id = obj_id;
@@ -1433,7 +1433,7 @@ impl LocalGarbageCollector {
             CASCADE_MODE.set(CascadeMode::Allocation);
             (*gc_ptr).reset_root();
             CASCADE_MODE.set(CascadeMode::Off);
-            self.core.allocation_count.add(1);
+            self.core.allocation_count.add(0, 1);
             gc
         }
     }
@@ -1508,7 +1508,7 @@ impl LocalGarbageCollector {
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             gc_maps.gen0_ids.push(obj_id);
-            self.core.track_alloc(obj_layout.size());
+            self.core.track_alloc(0, obj_layout.size());
 
             // Store object_id in GcPtr so GcCell<T> can retrieve it via pointer deref.
             (*(*gc_ptr).as_ptr()).object_id = obj_id;
@@ -1522,7 +1522,7 @@ impl LocalGarbageCollector {
             CASCADE_MODE.set(CascadeMode::Allocation);
             (*gc_ptr).reset_root();
             CASCADE_MODE.set(CascadeMode::Off);
-            self.core.allocation_count.add(1);
+            self.core.allocation_count.add(0, 1);
             gc
         }
     }
@@ -1598,7 +1598,7 @@ impl LocalGarbageCollector {
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             gc_maps.gen0_ids.push(obj_id);
-            self.core.track_alloc(obj_layout.size());
+            self.core.track_alloc(0, obj_layout.size());
 
             // Store object_id in GcPtr so Gc<T> can retrieve it via pointer deref.
             (*gc_ptr).object_id = obj_id;
@@ -1612,7 +1612,7 @@ impl LocalGarbageCollector {
             CASCADE_MODE.set(CascadeMode::Allocation);
             (*gc_ptr).reset_root();
             CASCADE_MODE.set(CascadeMode::Off);
-            self.core.allocation_count.add(1);
+            self.core.allocation_count.add(0, 1);
             Ok(gc)
         }
     }
@@ -1672,7 +1672,7 @@ impl LocalGarbageCollector {
             let gc_maps = self.core.gc_maps_unsync();
             let obj_id = gc_maps.objects.insert(ObjectEntryRef(oe_ptr));
             gc_maps.gen0_ids.push(obj_id);
-            self.core.track_alloc(obj_layout.size());
+            self.core.track_alloc(0, obj_layout.size());
 
             // Store object_id in GcPtr so GcCell<T> can retrieve it via pointer deref.
             (*(*gc_ptr).as_ptr()).object_id = obj_id;
@@ -1686,7 +1686,7 @@ impl LocalGarbageCollector {
             CASCADE_MODE.set(CascadeMode::Allocation);
             (*gc_ptr).reset_root();
             CASCADE_MODE.set(CascadeMode::Off);
-            self.core.allocation_count.add(1);
+            self.core.allocation_count.add(0, 1);
             Ok(gc)
         }
     }
