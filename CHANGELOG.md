@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Changed
+- **Allocation and drop no longer update statistics with atomic read-modify-writes.** The allocation count, heap size and (thread-local) peak heap size are written with a plain load and store: the thread-local collector writes them only on its own thread, and the sync collector writes a shard's slot only under that shard's lock, which allocation and drop already hold. On the benchmarks: thread-local `churn`/`generational` ~2× faster, `alloc` −32%, `tree` −21%; `concurrent` (1M objects, 4 threads) −20%.
 - **Collections after a large free no longer walk the freed slots.** The object map parks long runs of vacant slots, and its passes jump over them; new objects reuse the lowest slots. After a million objects were allocated and dropped, each later full collection took 2–7 ms; it now takes microseconds (one pass of ~5 ms parks the runs).
 - **`sync::Gc<T>` / `sync::GcCell<T>` are one pointer wide.** Handles are counted in the object header, so a clone is one atomic increment. Sync objects are allocated as one block from a per-thread size-class pool, and objects are sharded by allocating thread. Concurrent allocation is ~10× faster than 0.2.0 overall.
 - **`sync::GcCell<T>` is a reader-writer cell.** `borrow`/`borrow_mut` block like `RwLock`, and `try_borrow`/`try_borrow_mut` return `None` instead of blocking. The collector never blocks on a cell.
