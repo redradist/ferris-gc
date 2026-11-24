@@ -1879,14 +1879,9 @@ impl LocalGarbageCollector {
         self.core.clear_on_collection();
     }
 
-    /// Compact the heap by copying all live objects into a contiguous buffer.
-    /// Runs a full collection first, then relocates surviving objects for
-    /// improved cache locality and reduced fragmentation.
-    ///
-    /// Returns the number of objects compacted.
-    ///
-    /// **Currently disabled**: always returns 0 without moving any objects
-    /// (see `GarbageCollector::compact` for what re-enabling requires).
+    /// Compact the heap. **Currently disabled**: always returns 0 without
+    /// moving any objects (see `GarbageCollector::compact` for what
+    /// re-enabling requires).
     ///
     /// # Safety
     /// Must not be called while any GC references are being dereferenced.

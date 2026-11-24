@@ -1,6 +1,6 @@
 //! Per-object bookkeeping shared by both collectors: where an object's
 //! memory came from (`GcObjMem`), its `ObjectEntry`, the sync object header
-//! (`SyncGcInfo`), and compacted blocks.
+//! (`SyncGcInfo`).
 use super::*;
 
 /// Tracks the origin of a GC allocation so it can be correctly freed.
@@ -15,9 +15,6 @@ pub(crate) enum GcObjMem {
     /// TLAB sub-allocation. The `*mut TlabBlock` holds a ref_count reference
     /// to the backing block. Call `TlabBlock::release` to decrement.
     Tlab(*mut crate::tlab::TlabBlock),
-    /// Compacted memory sub-allocation. The `Arc<CompactBlock>` keeps the
-    /// contiguous buffer alive until all compacted objects are collected.
-    Compact(Arc<CompactBlock>),
     /// Part of a combined allocation (e.g. an `ObjectEntry` co-allocated with
     /// the object). No separate deallocation needed — freed with the object.
     Inline,
@@ -40,10 +37,6 @@ impl GcObjMem {
                 // SAFETY: block pointer is valid; decrement ref_count.
                 // When ref_count reaches 0, the block buffer is freed.
                 unsafe { crate::tlab::TlabBlock::release(block) };
-            }
-            GcObjMem::Compact(_block) => {
-                // Dropping the Arc<CompactBlock>. When all Arcs for this block
-                // are dropped, the CompactBlock::drop frees the entire buffer.
             }
             GcObjMem::Inline => {
                 // No-op: inline allocations are freed with their parent object.
@@ -281,34 +274,6 @@ impl ObjectEntry {
                 - std::mem::offset_of!(LocalGcInfo, root_ref_count)
                 + std::mem::offset_of!(LocalGcInfo, root_count);
             &*((self.ptr.get_thin_ptr() + offset) as *const Cell<u32>)
-        }
-    }
-}
-
-/// RAII guard for a compacted memory block.
-/// Frees the contiguous buffer when all objects in it have been collected.
-pub(crate) struct CompactBlock {
-    ptr: *mut u8,
-    layout: Layout,
-}
-
-// SAFETY: The block is only freed when all Arc references are dropped (during sweep),
-// and the GC ensures no references exist at that point.
-unsafe impl Send for CompactBlock {}
-unsafe impl Sync for CompactBlock {}
-
-impl CompactBlock {
-    /// Own the buffer at `ptr`, allocated with `layout`.
-    pub(crate) fn new(ptr: *mut u8, layout: Layout) -> CompactBlock {
-        CompactBlock { ptr, layout }
-    }
-}
-
-impl Drop for CompactBlock {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() && self.layout.size() > 0 {
-            // SAFETY: ptr was allocated with this layout via alloc().
-            unsafe { dealloc(self.ptr, self.layout) };
         }
     }
 }

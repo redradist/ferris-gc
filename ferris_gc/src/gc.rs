@@ -1742,185 +1742,23 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
-    /// Compact the heap by copying all live objects into a contiguous buffer.
+    /// Compact the heap: move live objects together for locality.
     ///
-    /// Performs a full collection first (to free dead objects), then:
-    /// 1. Allocates a single contiguous buffer for all live objects.
-    /// 2. Copies each live object (GcPtr) into the buffer at aligned offsets.
-    /// 3. Updates handle pointers via `Trace::relocate()`.
-    /// 4. Updates ObjectEntry metadata.
-    /// 5. Frees old individual allocations.
+    /// **Currently disabled**: returns 0 without moving any object (asserted
+    /// by `compact_is_disabled_returns_zero`).
     ///
-    /// Returns the number of objects compacted.
+    /// Handles are direct pointers, so moving an object means patching every
+    /// handle to it, and nothing can find the ones on the stack. Re-enabling
+    /// requires:
+    ///   (a) a `relocate()` cascade through all `Trace` impls (derive macro +
+    ///       default_trace) to patch interior `Gc`/`GcCell` handles, and
+    ///   (b) pinning rooted objects - objects with `root_count > 0` must not
+    ///       move.
     ///
     /// # Safety
     /// Must not be called while any GC references are being dereferenced.
-    /// For thread-local GC this is trivially safe (single-threaded).
-    /// For global GC, STW write lock is acquired internally.
     pub unsafe fn compact(&self) -> usize {
-        // COMPACTION IS CURRENTLY DISABLED — this intentionally returns 0
-        // without doing any work (asserted by compact_is_disabled_returns_zero).
-        //
-        // The GcInternal elimination made handles direct tagged pointers, so
-        // the tracer registry that used to make EVERY handle reachable for
-        // relocation is gone. Re-enabling requires:
-        //   (a) a relocate() cascade through all Trace impls (derive macro +
-        //       default_trace) to patch interior Gc/GcCell handles, and
-        //   (b) pinning rooted objects — stack handles cannot be discovered,
-        //       so objects with root_count > 0 must not move.
-        // Until then, callers of _compact() get 0 and no objects are moved;
-        // all objects stay valid.
-        return 0;
-        #[allow(unreachable_code)]
-        unsafe {
-            // Full collection first to free dead objects
-            self.collect();
-
-            let _stw = self.stw_lock.write().unwrap_or_else(|e| e.into_inner());
-            let mut gc_maps = self.lock_gc_maps();
-
-            let num_objects = gc_maps.objects.len();
-            if num_objects == 0 {
-                return 0;
-            }
-
-            // Calculate total size needed with proper alignment
-            let mut total_size: usize = 0;
-            let mut obj_layouts: Vec<(ObjectId, Layout)> = Vec::with_capacity(num_objects);
-            for (id, entry) in gc_maps.objects.iter() {
-                let layout = entry.layout.to_layout();
-                // Align up
-                let align_offset = total_size % layout.align();
-                if align_offset != 0 {
-                    total_size += layout.align() - align_offset;
-                }
-                obj_layouts.push((id, layout));
-                total_size += layout.size();
-            }
-
-            if total_size == 0 {
-                return 0;
-            }
-
-            // Allocate contiguous buffer with max alignment
-            let max_align = obj_layouts
-                .iter()
-                .map(|(_, l)| l.align())
-                .max()
-                .unwrap_or(1);
-            let compact_layout = match Layout::from_size_align(total_size, max_align) {
-                Ok(l) => l,
-                Err(_) => return 0,
-            };
-            // SAFETY: compact_layout has non-zero size and valid alignment.
-            let compact_buf = alloc(compact_layout);
-            if compact_buf.is_null() {
-                return 0; // allocation failed, skip compaction
-            }
-
-            // Copy each object into the contiguous buffer
-            let mut offset: usize = 0;
-            let mut relocations: Vec<(ObjectId, *const u8, *mut u8, Layout)> =
-                Vec::with_capacity(num_objects);
-
-            for (id, layout) in &obj_layouts {
-                // Align offset
-                let align_offset = offset % layout.align();
-                if align_offset != 0 {
-                    offset += layout.align() - align_offset;
-                }
-
-                let entry = gc_maps
-                    .objects
-                    .get(*id)
-                    .expect("compact: object entry not found for id in obj_layouts");
-                let old_ptr = entry.ptr.get_thin_ptr() as *mut u8;
-                // SAFETY: offset is within compact_buf bounds (calculated from accumulated layout sizes).
-                let new_ptr = compact_buf.add(offset);
-
-                // SAFETY: old_ptr and new_ptr point to valid, non-overlapping memory of at least layout.size() bytes.
-                std::ptr::copy_nonoverlapping(old_ptr, new_ptr, layout.size());
-
-                relocations.push((*id, old_ptr as *const u8, new_ptr, *layout));
-
-                offset += layout.size();
-            }
-
-            // Update ObjectEntry pointers and create new GcObjMem for each object.
-            // All objects now live in the compact buffer. We use Mem variant pointing
-            // into the buffer. Only the LAST object "owns" the buffer for dealloc;
-            // others use a Tlab-like scheme. For simplicity, we track the buffer
-            // separately and never dealloc individual objects from it.
-            // Instead, we store a shared Arc that owns the compact buffer.
-            let compact_block = Arc::new(CompactBlock::new(compact_buf, compact_layout));
-
-            let mut old_mems: Vec<(*mut u8, GcObjMem, Layout)> = Vec::with_capacity(num_objects);
-
-            for (id, _old_raw, new_raw, layout) in &relocations {
-                // Two-phase update: first update ObjectEntry (needs &mut objects),
-                // then update ptr_to_object (needs &mut ptr_to_object).
-                // We collect the old/new thin ptrs to avoid overlapping borrows.
-                let (old_thin, new_thin) = {
-                    let entry = match gc_maps.objects.get_mut(*id) {
-                        Some(e) => e,
-                        None => continue,
-                    };
-                    let old_thin = entry.ptr.get_thin_ptr();
-
-                    // Reconstruct fat pointer: preserve vtable, update data pointer.
-                    // SAFETY: new_raw points to a valid copy of the original object
-                    // within the compact buffer. The object was fully copied above.
-                    let mut fat_ptr_bytes = [0u8; std::mem::size_of::<*const dyn Trace>()];
-                    std::ptr::copy_nonoverlapping(
-                        &entry.ptr as *const *const dyn Trace as *const u8,
-                        fat_ptr_bytes.as_mut_ptr(),
-                        fat_ptr_bytes.len(),
-                    );
-                    // Overwrite data pointer (first pointer-sized field)
-                    std::ptr::copy_nonoverlapping(
-                        &(*new_raw as *const u8) as *const *const u8 as *const u8,
-                        fat_ptr_bytes.as_mut_ptr(),
-                        std::mem::size_of::<*const u8>(),
-                    );
-                    // SAFETY: read_unaligned because fat_ptr_bytes is a [u8] (align 1)
-                    // but *const dyn Trace requires pointer alignment.
-                    let new_fat_ptr: *const dyn Trace =
-                        std::ptr::read_unaligned(fat_ptr_bytes.as_ptr() as *const *const dyn Trace);
-                    entry.ptr = new_fat_ptr;
-                    let new_thin = entry.ptr.get_thin_ptr();
-
-                    // root_ref_count_offset is relative — no update needed after relocation.
-
-                    // Replace memory tracking with compact block reference.
-                    // Use std::mem::replace to properly move the old GcObjMem out,
-                    // avoiding double-drop of Arc refs in Compact/Tlab variants.
-                    let old_mem =
-                        std::mem::replace(&mut entry.mem, GcObjMem::Compact(compact_block.clone()));
-                    old_mems.push((old_thin as *mut u8, old_mem, *layout));
-                    entry.layout = CompactLayout::from_layout(*layout);
-
-                    (old_thin, new_thin)
-                };
-
-                // Update ptr_to_object mapping (borrows gc_maps, not gc_maps.objects)
-                gc_maps.ptr_to_object.remove(&old_thin);
-                gc_maps.ptr_to_object.insert(new_thin, *id);
-            }
-
-            // TODO: Relocate Gc/GcCell handle pointers after compaction.
-            // Old approach used tracers.for_each_tracer to call relocate() on each GcInternal.
-            // New approach: iterate object graph and update Gc::ptr / GcCell::ptr cells.
-            // For now, compact() returns 0 early so this code is unreachable.
-
-            drop(gc_maps);
-
-            for (ptr, mem, layout) in old_mems {
-                // SAFETY: Old allocation is no longer in use; objects have been relocated to the compact buffer.
-                Self::dealloc_gc_mem(ptr, mem, layout);
-            }
-
-            num_objects
-        }
+        0
     }
 }
 
