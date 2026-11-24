@@ -1498,10 +1498,9 @@ fn on_thread_incremental_preserves_live_linked_structure() {
 
 #[test]
 fn object_allocated_during_incremental_mark_survives() {
-    // Regression: the marks-based sweep in finish_collection reclaims any
-    // object not marked Black. An object allocated *after* begin_collection
-    // is absent from the initial `marks` snapshot, so without grey-at-birth
-    // (note_new_object_during_marking) it would be swept while still live.
+    // Regression: an object allocated *after* begin_collection is absent
+    // from the snapshot's `marks`. The sweep in finish_collection must keep
+    // it: it frees only what the snapshot left White.
     clean_gc_state();
     let _root: Vec<Gc<i32>> = (0..10).map(|i| Gc::new(i)).collect();
 
@@ -1512,7 +1511,7 @@ fn object_allocated_during_incremental_mark_survives() {
             .begin_collection(crate::generation::Generation::Gen2);
     });
 
-    // Allocate DURING the mark cycle. Must be greyed at birth and survive.
+    // Allocate DURING the mark cycle. It has no mark and must survive.
     let born_mid_mark = Gc::new(999i32);
 
     // Drain + marks-based sweep.

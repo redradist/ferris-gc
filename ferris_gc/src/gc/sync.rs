@@ -957,6 +957,13 @@ impl GlobalGarbageCollector {
     /// and register it in this thread's shard. Its header already counts the
     /// one handle the caller is about to create. `None` if allocation failed
     /// (`make` is not called).
+    ///
+    /// Only the shard lock is taken, not the STW lock: every collection holds
+    /// every shard while it looks at the objects, so it sees this one either
+    /// fully registered or not at all. Until it is registered, the handles
+    /// `make` moved into it count as roots, as they did on the stack. An
+    /// incremental cycle that began before keeps it: the object has no mark,
+    /// and `finish_collection` frees only what the snapshot left White.
     #[inline(always)]
     unsafe fn register_object<A: SyncObject>(
         &self,
@@ -964,7 +971,6 @@ impl GlobalGarbageCollector {
         region: crate::generation::RegionId,
     ) -> Option<*const A> {
         unsafe {
-            let _stw = self.core.stw_lock.read().unwrap_or_else(|e| e.into_inner());
             let (obj_ptr, oe_ptr, block_layout) = alloc_object_block::<A>()?;
             std::ptr::write(obj_ptr, make());
             let info = A::info_ptr(obj_ptr);
@@ -988,7 +994,7 @@ impl GlobalGarbageCollector {
             // concurrent allocation does not serialize on one global lock.
             // ptr_to_object and region stats are populated lazily (during
             // marking), not on the allocation hot path.
-            let obj_id = self.core.with_own_shard(|shard_map, shard| {
+            self.core.with_own_shard(|shard_map, shard| {
                 let obj_id = SyncObjects::tag_key(shard_map.insert(ObjectEntryRef(oe_ptr)), shard);
                 // Before the shard unlocks: from then on the collector sees it.
                 (&raw mut (*info).object_id).write(obj_id);
@@ -996,9 +1002,7 @@ impl GlobalGarbageCollector {
                 // lock (see `Counter`).
                 self.core.track_alloc(shard, block_layout.size());
                 self.core.allocation_count.add(shard, 1);
-                obj_id
             });
-            self.core.note_new_object_during_marking(obj_id);
             Some(obj_ptr)
         }
     }
@@ -1024,8 +1028,7 @@ impl GlobalGarbageCollector {
     }
 
     /// Fallible allocation: `GcAllocError` instead of aborting. No emergency
-    /// collection - the STW read lock is held while allocating, and a
-    /// collection takes the write lock, so a retry could only deadlock.
+    /// collection is attempted.
     unsafe fn try_create_gc<T>(
         &self,
         t: T,
@@ -1588,53 +1591,38 @@ mod tests {
     }
 
     #[test]
-    fn stw_blocks_allocation_during_collection() {
+    fn allocation_waits_for_a_collection_holding_the_object_map() {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         };
         let (_guard, _) = setup();
 
-        let allocated_during_stw = Arc::new(AtomicBool::new(false));
-        let collection_started = Arc::new(AtomicBool::new(false));
-        let collection_done = Arc::new(AtomicBool::new(false));
+        let allocated = Arc::new(AtomicBool::new(false));
 
-        // Hold the STW write lock to simulate an ongoing collection
-        let stw_guard = (*GLOBAL_GC)
-            .core
-            .stw_lock
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        collection_started.store(true, Ordering::Release);
+        // Hold every shard, as a collection does while it looks at the
+        // objects.
+        let maps = (*GLOBAL_GC).core.lock_gc_maps();
 
-        let alloc_flag = allocated_during_stw.clone();
-        let started = collection_started.clone();
-        let _done = collection_done.clone();
-
+        let flag = allocated.clone();
         let handle = std::thread::spawn(move || {
-            // Wait for collection to be in progress
-            while !started.load(Ordering::Acquire) {}
-            // Try to allocate — should block on STW read lock
+            // Blocks on its shard's lock.
             let _obj = Gc::new(42);
-            alloc_flag.store(true, Ordering::Release);
+            flag.store(true, Ordering::Release);
         });
 
         // Give the allocator thread time to block
         std::thread::sleep(std::time::Duration::from_millis(50));
-        // Allocation should NOT have completed while we hold the write lock
         assert!(
-            !allocated_during_stw.load(Ordering::Acquire),
-            "allocation must block while STW write lock is held"
+            !allocated.load(Ordering::Acquire),
+            "allocation must wait while a collection holds the object map"
         );
 
-        // Release the STW lock — simulates end of collection
-        drop(stw_guard);
-        collection_done.store(true, Ordering::Release);
-
+        drop(maps);
         handle.join().expect("allocator thread panicked");
         assert!(
-            allocated_during_stw.load(Ordering::Acquire),
-            "allocation should complete after STW lock is released"
+            allocated.load(Ordering::Acquire),
+            "allocation should complete once the map is released"
         );
     }
 
@@ -2193,6 +2181,140 @@ mod tests {
             1 + n.next.as_ref().map(len).unwrap_or(0)
         }
         assert_eq!(len(&head), 51, "live graph lost nodes under concurrent GC");
+    }
+
+    /// A chain link that checks itself: `value` is its depth in the chain.
+    struct Link {
+        value: usize,
+        next: Option<Gc<Link>>,
+    }
+    impl crate::gc::Trace for Link {
+        fn is_root(&self) -> bool {
+            false
+        }
+        fn reset_root(&self) {
+            if let Some(n) = &self.next {
+                n.reset_root();
+            }
+        }
+        fn trace(&self) {
+            if let Some(n) = &self.next {
+                n.trace();
+            }
+        }
+        fn reset(&self) {
+            if let Some(n) = &self.next {
+                n.reset();
+            }
+        }
+        fn is_traceable(&self) -> bool {
+            false
+        }
+        fn trace_children(&self, c: &mut Vec<*const dyn crate::gc::Trace>) {
+            if let Some(n) = &self.next {
+                n.trace_children(c);
+            }
+        }
+    }
+    impl crate::gc::Finalize for Link {
+        fn finalize(&self) {}
+    }
+
+    /// Push a link that takes over `head`'s handle.
+    fn push_link(head: Option<Gc<Link>>) -> Gc<Link> {
+        let value = head.as_ref().map_or(0, |h| h.value + 1);
+        Gc::new(Link { value, next: head })
+    }
+
+    /// Walk the chain and check every link's depth.
+    fn check_chain(head: &Gc<Link>) -> usize {
+        let mut len = 0;
+        let mut cur = Some(head.clone());
+        while let Some(link) = cur {
+            assert_eq!(link.value, head.value - len, "a link was freed or reused");
+            len += 1;
+            cur = link.next.clone();
+        }
+        len
+    }
+
+    #[test]
+    fn object_allocated_during_a_sync_incremental_mark_survives() {
+        let (_guard, _) = setup();
+        let old = push_link(Some(push_link(None)));
+        // SAFETY: test-only collection; the handles above stay valid.
+        unsafe { (*GLOBAL_GC).begin_collection(crate::generation::Generation::Gen2) };
+        // Born mid-mark on another thread, taking over the only handle of an
+        // object in the snapshot: it has no mark and must survive.
+        let young = std::thread::spawn(move || push_link(Some(old)))
+            .join()
+            .unwrap();
+        // SAFETY: as above.
+        let stats = unsafe {
+            while !(*GLOBAL_GC).mark_step(1) {}
+            (*GLOBAL_GC).finish_collection()
+        };
+        assert_eq!(stats.objects_collected, 0, "a live object was collected");
+        assert_eq!(check_chain(&young), 3);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn allocations_racing_collections_lose_no_object() {
+        // Allocation takes only its shard's lock. Threads grow chains (each
+        // new link takes over the previous head's handle) and drop them,
+        // while this thread runs full and incremental collections, so every
+        // step of an allocation meets every phase of a collection.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_guard, _) = setup();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut checked = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut head = push_link(None);
+                        for _ in 0..200 {
+                            head = push_link(Some(head));
+                        }
+                        checked += check_chain(&head);
+                    }
+                    checked
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut round = 0;
+        while std::time::Instant::now() < deadline {
+            // SAFETY: test-only collections; every handle is owned by a
+            // worker or this thread.
+            let stats = unsafe {
+                if round % 2 == 0 {
+                    (*GLOBAL_GC)
+                        .core
+                        .collect_generation(crate::generation::Generation::Gen2)
+                } else {
+                    (*GLOBAL_GC).begin_collection(crate::generation::Generation::Gen2);
+                    while !(*GLOBAL_GC).mark_step(1) {
+                        std::thread::yield_now();
+                    }
+                    (*GLOBAL_GC).finish_collection()
+                }
+            };
+            // No test builds a cycle while this one holds the test lock, and
+            // dropped chains are freed at their last drop: a collection that
+            // frees anything freed a live object.
+            assert_eq!(
+                stats.objects_collected, 0,
+                "round {round} freed a live object"
+            );
+            round += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            assert!(w.join().expect("a worker found a freed link") > 0);
+        }
     }
 
     // --- Region-based collection tests (Strategy 22) ---

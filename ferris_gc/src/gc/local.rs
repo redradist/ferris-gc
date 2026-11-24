@@ -1424,10 +1424,6 @@ impl LocalGarbageCollector {
             // Store object_id in GcPtr so Gc<T> can retrieve it via pointer deref.
             (*gc_ptr).object_id = obj_id;
 
-            // If an incremental mark cycle is in progress, grey this object so
-            // the marks-based sweep in finish_collection keeps it.
-            self.core.note_new_object_during_marking(obj_id);
-
             let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             CASCADE_MODE.set(CascadeMode::Allocation);
@@ -1512,10 +1508,6 @@ impl LocalGarbageCollector {
 
             // Store object_id in GcPtr so GcCell<T> can retrieve it via pointer deref.
             (*(*gc_ptr).as_ptr()).object_id = obj_id;
-
-            // If an incremental mark cycle is in progress, grey this object so
-            // the marks-based sweep in finish_collection keeps it.
-            self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
@@ -1603,10 +1595,6 @@ impl LocalGarbageCollector {
             // Store object_id in GcPtr so Gc<T> can retrieve it via pointer deref.
             (*gc_ptr).object_id = obj_id;
 
-            // If an incremental mark cycle is in progress, grey this object so
-            // the marks-based sweep in finish_collection keeps it.
-            self.core.note_new_object_during_marking(obj_id);
-
             let gc = Gc::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
             CASCADE_MODE.set(CascadeMode::Allocation);
@@ -1676,10 +1664,6 @@ impl LocalGarbageCollector {
 
             // Store object_id in GcPtr so GcCell<T> can retrieve it via pointer deref.
             (*(*gc_ptr).as_ptr()).object_id = obj_id;
-
-            // If an incremental mark cycle is in progress, grey this object so
-            // the marks-based sweep in finish_collection keeps it.
-            self.core.note_new_object_during_marking(obj_id);
 
             let gc = GcCell::from_parts(gc_ptr, true);
             // Set context for reset_root cascade to decrement child root_counts.
