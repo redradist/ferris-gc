@@ -118,11 +118,9 @@ pub(crate) struct GarbageCollector<O: ObjectMap = LocalObjects> {
     pub(crate) stw_lock: crate::sharded_map::StwLock,
     pub(crate) incremental: Mutex<IncrementalState>,
     /// Cheap gate: true between `begin_collection` and `finish_collection` so
-    /// the allocation hot path can skip locking `incremental` unless an
-    /// incremental mark cycle is actually in progress. When set, newly created
-    /// objects must be greyed (see `note_new_object_during_marking`) so the
-    /// marks-based sweep in `finish_collection` does not reclaim them, and
-    /// weak upgrades grey their object (`note_handle_during_marking`).
+    /// a weak upgrade can skip locking `incremental` unless a mark cycle is
+    /// in progress; when set, the upgrade greys its object
+    /// (`note_handle_during_marking`).
     pub(crate) marking: AtomicBool,
     /// When non-zero, the thread-local collector runs **on-thread incremental**
     /// Gen2 collection instead of a stop-the-world Gen0 collect: each allocation
@@ -592,24 +590,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .phase
-    }
-
-    /// Grey an object born while a mark cycle is in progress, so it is live.
-    /// Without this it is absent from `marks`, and the marks-based sweep in
-    /// `finish_collection` would reclaim it. It has no snapshot, so its mark
-    /// step just blackens it: the handles it holds point at objects the
-    /// snapshot reaches or that were born since. Cheap-gated on
-    /// `self.marking` so the allocation hot path pays nothing outside a mark
-    /// cycle.
-    #[inline]
-    pub(crate) fn note_new_object_during_marking(&self, obj_id: ObjectId) {
-        if !self.marking.load(Ordering::Acquire) {
-            return;
-        }
-        let mut incr = self.incremental.lock().unwrap_or_else(|e| e.into_inner());
-        if incr.phase == CollectionPhase::Marking {
-            incr.grey_born(obj_id);
-        }
     }
 
     /// Grey the object a weak upgrade just made a handle to, while a mark
@@ -1318,8 +1298,8 @@ impl<O: ObjectMap> GarbageCollector<O> {
         incr.max_gen = max_gen;
         incr.scan_epoch = self.scan_epoch();
         incr.clear();
-        // Gate for the allocation hot path: objects born from here until
-        // finish_collection are greyed (see note_new_object_during_marking).
+        // Weak upgrades from here until finish_collection grey their object
+        // (see note_handle_during_marking).
         self.marking.store(true, Ordering::Release);
 
         let scope = if max_gen >= Generation::Gen2 {
@@ -1386,21 +1366,23 @@ impl<O: ObjectMap> GarbageCollector<O> {
 
                 max_gen = incr.max_gen;
                 incr.phase = CollectionPhase::Sweeping;
-                // From here the snapshot is final under STW; stop greying new
-                // allocations (there won't be any while the world is stopped).
+                // From here the marks are final: no upgrade can run while every
+                // shard is held.
                 self.marking.store(false, Ordering::Release);
 
                 // Finish marking: blacken what is still grey.
                 incr.mark(|| true);
 
                 // Project the tri-color result onto root_ref_count, the mark bit
-                // the sweep below reads: Black => reachable, White => garbage.
-                // Every in-scope object is present in `marks` (begin_collection
-                // seeds all of them White, and mid-mark allocations are greyed),
-                // so absence can only mean out-of-scope, which the sweep skips.
+                // the sweep below reads: White => garbage, anything else live.
+                // begin_collection seeded every object then in scope White, so
+                // an in-scope object without a mark was born since: it is live.
+                // That is why an allocation needs neither the STW lock nor the
+                // incremental state - this pass holds its shard, so it sees the
+                // object either fully registered or not at all.
                 for (id, entry) in gc_maps.objects.iter() {
                     if entry.generation() <= max_gen {
-                        let live = incr.is_black(id);
+                        let live = !incr.is_unreached(id);
                         entry.root_ref_count().set(usize::from(live));
                     }
                 }

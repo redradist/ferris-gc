@@ -202,14 +202,16 @@ pub(crate) struct Mark {
 /// in-scope object's children as they are then, and the mark follows only
 /// that snapshot. Mutations made while the mark runs therefore cannot hide an
 /// object from it, so no write barrier is needed: every object reachable when
-/// marking began is marked, and an object born since is greyed, so it is
-/// live (`note_new_object_during_marking`). A handle a weak upgrade creates
-/// is the one way to reach an object that was not reachable then, so the
-/// upgrade greys it (`note_handle_during_marking`).
+/// marking began is marked. An object born since has no mark, and the sweep
+/// keeps every object without one, so an allocation never touches this state
+/// (nor needs the STW lock to keep `finish_collection` from slipping in before
+/// it could). A handle a weak upgrade creates is the one way to reach an
+/// object that was not reachable then, so the upgrade greys it
+/// (`note_handle_during_marking`).
 pub(crate) struct IncrementalState {
     pub(crate) phase: CollectionPhase,
     pub(crate) max_gen: Generation,
-    /// The mark of every in-scope object and every object born mid-mark.
+    /// The mark of every object in scope when the cycle began.
     pub(crate) marks: FxHashMap<ObjectId, Mark>,
     pub(crate) gray_stack: Vec<ObjectId>,
     /// The snapshot's children of all objects, one run per object (one
@@ -251,20 +253,6 @@ impl IncrementalState {
         self.marks.insert(id, mark);
     }
 
-    /// Grey an object born mid-mark. It has no snapshot, so its step only
-    /// blackens it. Out of line: inlined, it changed the code of the
-    /// allocation fast path that only checks the `marking` gate.
-    #[inline(never)]
-    pub(crate) fn grey_born(&mut self, id: ObjectId) {
-        let mark = Mark {
-            color: MarkColor::Gray,
-            first_child: 0,
-            child_count: 0,
-        };
-        self.marks.insert(id, mark);
-        self.gray_stack.push(id);
-    }
-
     /// Grey `id` if it is in scope and not yet reached.
     #[inline]
     pub(crate) fn grey(&mut self, id: ObjectId) {
@@ -276,10 +264,11 @@ impl IncrementalState {
         }
     }
 
-    /// Whether marking reached `id`.
+    /// Whether `id` was in the snapshot and marking did not reach it. An
+    /// object born since the cycle began has no mark, so it is not.
     #[inline]
-    pub(crate) fn is_black(&self, id: ObjectId) -> bool {
-        matches!(self.marks.get(&id), Some(mark) if mark.color == MarkColor::Black)
+    pub(crate) fn is_unreached(&self, id: ObjectId) -> bool {
+        matches!(self.marks.get(&id), Some(mark) if mark.color == MarkColor::White)
     }
 
     /// Blacken grey objects while `keep_going()` allows, greying their
