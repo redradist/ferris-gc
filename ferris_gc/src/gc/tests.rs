@@ -12,11 +12,12 @@ fn clean_gc_state() {
 
 #[test]
 fn object_entry_size() {
-    // Track ObjectEntry size to catch regressions: 64 bytes since the
-    // per-handle tracer list was removed (sync handles count themselves
-    // in the object header, thread-local ones in handle_count).
+    // Track ObjectEntry size to catch regressions: 48 bytes since an object
+    // and its entry are always one block, so one 8-byte `GcObjMem` frees
+    // both.
+    assert_eq!(std::mem::size_of::<super::GcObjMem>(), 8);
     let size = std::mem::size_of::<super::ObjectEntry>();
-    assert!(size <= 64, "ObjectEntry grew unexpectedly to {size}B");
+    assert!(size <= 48, "ObjectEntry grew unexpectedly to {size}B");
 }
 
 #[test]

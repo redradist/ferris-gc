@@ -412,7 +412,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
     }
 
     /// Free the memory of an already-dropped collected object and its
-    /// `ObjectEntry`.
+    /// `ObjectEntry`: one block (see [`GcObjMem`]).
     ///
     /// # Safety
     /// `drop_object_entry` must have run for this entry, and no further access
@@ -420,28 +420,18 @@ impl<O: ObjectMap> GarbageCollector<O> {
     // Forced for the same reason as create_gc: the RC-hybrid drop path.
     #[inline(always)]
     unsafe fn free_object_entry(entry_ref: ObjectEntryRef) {
-        // Read all fields from the TLAB-allocated ObjectEntry before releasing memory.
+        // The entry is inside the block: read it before freeing.
         let oe_ptr = entry_ref.0;
-        let fat_ptr = unsafe { (*oe_ptr).ptr };
+        let ptr = unsafe { (*oe_ptr).ptr }.get_thin_ptr() as *mut u8;
         let layout = unsafe { (*oe_ptr).layout.to_layout() };
-        let mem = unsafe { std::ptr::read(&(*oe_ptr).mem) };
-        let entry_block = unsafe { (*oe_ptr).entry_block };
-
-        let mem_ptr = fat_ptr.get_thin_ptr() as *mut u8;
-        // SAFETY: Memory was allocated with the same layout via alloc/alloc_mem or TLAB.
-        unsafe { Self::dealloc_gc_mem(mem_ptr, mem, layout) };
-        // Free the ObjectEntry memory itself.
-        // Only the sync (sharded) collector embeds entries; the constant gate
-        // compiles the check out of the thread-local drop path.
-        if O::SHARDED && entry_block == ENTRY_EMBEDDED {
-            // Lives inside the object's own block, which `dealloc_mem` above
-            // just freed; every field was read before that.
-        } else if !entry_block.is_null() {
-            // TLAB-allocated: release the block reference.
-            unsafe { crate::tlab::TlabBlock::release(entry_block) };
-        } else {
-            // Separately system-allocated (TLAB fallback): free via dealloc.
-            unsafe { dealloc(oe_ptr as *mut u8, Layout::new::<ObjectEntry>()) };
+        let mem = unsafe { (*oe_ptr).mem };
+        match mem {
+            // SAFETY: the block holds one reference per object in it.
+            GcObjMem::Tlab(block) => unsafe { crate::tlab::TlabBlock::release(block.as_ptr()) },
+            // Only the sync collector allocates `Mem`, and records the block's
+            // layout.
+            // SAFETY: allocated by alloc_sync_mem with this layout.
+            GcObjMem::Mem => unsafe { free_sync_mem(ptr, layout) },
         }
     }
 
@@ -508,57 +498,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
         for entry in object_deallocs {
             // SAFETY: Object was dropped above; only its memory is freed here.
             unsafe { Self::free_object_entry(entry) };
-        }
-    }
-
-    pub(crate) unsafe fn alloc_mem<T>(&self) -> (*mut T, (GcObjMem, Layout))
-    where
-        T: Sized,
-    {
-        let layout = Layout::new::<T>();
-        // SAFETY: Layout is non-zero-sized and properly aligned for T; alloc returns a valid pointer or null.
-        let mem = unsafe { alloc(layout) };
-        if mem.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        let type_ptr: *mut T = mem as *mut _;
-        (type_ptr, (GcObjMem::Mem, layout))
-    }
-
-    /// Fallible allocation. Returns `Err(GcAllocError)` instead of aborting on OOM.
-    pub(crate) unsafe fn try_alloc_mem<T>(
-        &self,
-    ) -> Result<(*mut T, (GcObjMem, Layout)), GcAllocError>
-    where
-        T: Sized,
-    {
-        let layout = Layout::new::<T>();
-        // SAFETY: Layout is non-zero-sized and properly aligned for T; alloc returns a valid pointer or null.
-        let mem = unsafe { alloc(layout) };
-        if mem.is_null() {
-            return Err(GcAllocError);
-        }
-        let type_ptr: *mut T = mem as *mut _;
-        Ok((type_ptr, (GcObjMem::Mem, layout)))
-    }
-
-    /// Fallible allocation with emergency GC collection on first failure.
-    /// If the initial allocation fails, runs a full GC cycle to free dead objects,
-    /// then retries once. Returns `Err(GcAllocError)` only if the retry also fails.
-    pub(crate) unsafe fn try_alloc_mem_with_gc<T>(
-        &self,
-    ) -> Result<(*mut T, (GcObjMem, Layout)), GcAllocError>
-    where
-        T: Sized,
-    {
-        // SAFETY: Delegates to try_alloc_mem and collect, both of which uphold their own safety invariants.
-        match unsafe { self.try_alloc_mem::<T>() } {
-            Ok(result) => Ok(result),
-            Err(_) => {
-                // Emergency collection: free dead objects and retry
-                unsafe { self.collect() };
-                unsafe { self.try_alloc_mem::<T>() }
-            }
         }
     }
 
@@ -698,18 +637,6 @@ impl<O: ObjectMap> GarbageCollector<O> {
             }
         }
         entry
-    }
-
-    /// Release object memory. The sync collector's `GcObjMem::Mem`
-    /// came from [`alloc_sync_mem`] (possibly its pool); the constant gate
-    /// keeps the thread-local paths exactly `dealloc_mem`.
-    #[inline(always)]
-    unsafe fn dealloc_gc_mem(ptr: *mut u8, mem: GcObjMem, layout: Layout) {
-        if O::SHARDED && matches!(mem, GcObjMem::Mem) {
-            unsafe { free_sync_mem(ptr, layout) };
-        } else {
-            unsafe { mem.dealloc_mem(ptr, layout) };
-        }
     }
 
     /// Full collection (all generations). Backwards-compatible with existing callers.

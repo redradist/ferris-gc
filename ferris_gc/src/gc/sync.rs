@@ -9,26 +9,16 @@ use std::time::Duration;
 use crate::basic_strategy::{BASIC_STRATEGY_GLOBAL_GC, basic_strategy_start};
 use crate::gc::{
     CompactLayout, Finalize, GarbageCollector, GcObjMem, ObjectEntry, ObjectEntryRef, SyncGcInfo,
-    SyncObjects, Trace,
+    SyncObjects, Trace, object_block_layout,
 };
 use crate::slot_map::ObjectId;
-
-/// Layout of one sync object's block `[A (object) | ObjectEntry]`, and the
-/// entry's offset in it.
-#[inline]
-fn object_block_layout<A>() -> (std::alloc::Layout, usize) {
-    let (ae, off_e) = std::alloc::Layout::new::<A>()
-        .extend(std::alloc::Layout::new::<ObjectEntry>())
-        .expect("sync object block layout");
-    (ae.pad_to_align(), off_e)
-}
 
 /// One allocation for a new sync object and its `ObjectEntry`.
 ///
 /// Handles count themselves in the object header, so no per-handle tracer is
 /// allocated (this used to be four mallocs per object: object, first
 /// handle's tracer, boxed `ObjectEntry`, boxed tracer-list node). The entry is
-/// marked `ENTRY_EMBEDDED` and freed together with the object. The block
+/// freed together with the object, as in the thread-local collector. The block
 /// comes from the per-thread pool (`crate::pool`) when it fits a size class,
 /// otherwise from the system allocator (see `alloc_sync_mem`).
 ///
@@ -963,7 +953,6 @@ impl GlobalGarbageCollector {
                     handle_count: 0,
                     root_count: 0,
                     root_ref_count_offset,
-                    entry_block: crate::gc::ENTRY_EMBEDDED,
                 },
             );
             // Shard-scoped registration: insert into this thread's own shard so
@@ -2415,7 +2404,8 @@ mod tests {
 
     #[test]
     fn pool_and_system_blocks_free_from_any_thread() {
-        use super::{GcCellBox, GcPtr, object_block_layout};
+        use super::{GcCellBox, GcPtr};
+        use crate::gc::object_block_layout;
         let (_guard, _baseline) = setup();
         let before = live_objects();
         // Small objects come from the allocating thread's pool, large and
@@ -2705,6 +2695,13 @@ mod tests {
                 .handle_count
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
+    }
+
+    #[test]
+    fn a_small_object_and_its_entry_take_80_bytes() {
+        // [SyncGcInfo + T | ObjectEntry]: the unit of the pool's size classes.
+        use crate::gc::object_block_layout;
+        assert_eq!(object_block_layout::<super::GcPtr<u64>>().0.size(), 80);
     }
 
     #[test]
