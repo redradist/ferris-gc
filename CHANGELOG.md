@@ -23,6 +23,7 @@
 - `CollectionStats::tracers_collected` → `handles_collected`, and `GcStats::live_tracers` → `live_handles`. The old fields stay as aliases holding the same values.
 
 ### Fixed
+- **Data race between a thread-local collection and a global one.** A thread-local collection that traced a local object holding a `sync::Gc` marked the sync object's header, without any of the global collector's locks, while a global collection on another thread could be writing it (Miri reports it). It also left the mark set. Sync handles now touch their object's header only while the global collector walks its objects on that thread.
 - **Deadlock in `sync::GcWeak::upgrade`.** It read-locked the stop-the-world lock and then read-locked it again in the collector. A collection that started waiting between the two blocked the second read (std's `RwLock` lets a waiting writer go first), and both threads hung. It is now taken once.
 - **Panic when a thread-local collection met a mutably borrowed `GcCell`.** An allocation inside a `borrow_mut` scope (e.g. `cell.borrow_mut().push(Gc::new(x))`) could trigger a collection that traced the cell and panicked with "already mutably borrowed". The collector now skips the borrowed value, and that collection frees nothing, as `sync::GcCell` already did.
 - **Use-after-free in incremental and concurrent marking.**
