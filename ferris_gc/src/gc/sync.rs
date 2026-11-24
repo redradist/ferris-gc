@@ -137,17 +137,25 @@ unsafe fn drop_handle(obj: *const u8, info: *const SyncGcInfo) {
     }
 }
 
+/// Whether the global collector is walking its objects on this thread
+/// ([`crate::gc::SYNC_WALK`]). A sync handle touches its object's header only
+/// then: anything else (allocation, or a thread-local collection reaching a
+/// sync handle stored in a local object) holds none of the global
+/// collector's locks.
+#[inline]
+fn walking() -> bool {
+    crate::gc::SYNC_WALK.get()
+}
+
 /// Root discovery's cascade for one handle inside a scanned object: this
 /// handle is not a root, so take it off the target's root count, and walk the
-/// target once. Only the global collector's root discovery sets the context;
-/// anything else (allocation, or a thread-local collection reaching a sync
-/// handle stored in a local object) is a no-op.
+/// target once. A no-op unless the global collector is [`walking`].
 ///
 /// # Safety
 /// `obj` must be a live sync object headed by `info`.
 #[inline]
 unsafe fn cascade_handle(obj: &dyn Trace, info: &SyncGcInfo) {
-    if !crate::gc::SYNC_CASCADE.get() {
+    if !walking() {
         return;
     }
     let rc = info.root_count.load(Ordering::Relaxed);
@@ -502,8 +510,10 @@ where
         unsafe { cascade_handle(&*self.ptr, &(*self.ptr).info) }
     }
 
+    // The header is touched only while the global collector is walking (see
+    // `walking`).
     fn trace(&self) {
-        if self.ptr.is_null() {
+        if self.ptr.is_null() || !walking() {
             return;
         }
         // SAFETY: Null check above ensures the pointer is valid.
@@ -511,7 +521,7 @@ where
     }
 
     fn reset(&self) {
-        if self.ptr.is_null() {
+        if self.ptr.is_null() || !walking() {
             return;
         }
         // SAFETY: Null check above ensures the pointer is valid.
@@ -519,7 +529,7 @@ where
     }
 
     fn is_traceable(&self) -> bool {
-        if self.ptr.is_null() {
+        if self.ptr.is_null() || !walking() {
             return false;
         }
         // SAFETY: Null check above ensures the pointer is valid.
@@ -779,7 +789,12 @@ where
         unsafe { cascade_handle(self.cell(), &self.cell().info) }
     }
 
+    // As for `Gc`: the header is touched only while the global collector is
+    // walking.
     fn trace(&self) {
+        if !walking() {
+            return;
+        }
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).trace();
@@ -787,6 +802,9 @@ where
     }
 
     fn reset(&self) {
+        if !walking() {
+            return;
+        }
         unsafe {
             // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
             (*self.ptr).reset();
@@ -795,7 +813,7 @@ where
 
     fn is_traceable(&self) -> bool {
         // SAFETY: Pointer is valid for the lifetime of this GcCell handle; the GC guarantees the allocation is not freed while any handle exists.
-        unsafe { (*self.ptr).is_traceable() }
+        walking() && unsafe { (*self.ptr).is_traceable() }
     }
 
     fn trace_children(&self, children: &mut Vec<*const dyn Trace>) {
@@ -2879,41 +2897,54 @@ mod tests {
         collector.join().unwrap();
     }
 
+    /// A thread-local object holding a sync handle.
+    struct Holder {
+        s: Gc<u64>,
+    }
+    impl crate::gc::Trace for Holder {
+        fn is_root(&self) -> bool {
+            false
+        }
+        fn reset_root(&self) {
+            self.s.reset_root();
+        }
+        fn trace(&self) {
+            self.s.trace();
+        }
+        fn reset(&self) {
+            self.s.reset();
+        }
+        fn is_traceable(&self) -> bool {
+            false
+        }
+        fn trace_children(&self, children: &mut Vec<*const dyn crate::gc::Trace>) {
+            self.s.trace_children(children);
+        }
+    }
+    impl crate::gc::Finalize for Holder {
+        fn finalize(&self) {}
+    }
+
     #[test]
     fn sync_handle_inside_a_local_object_is_a_root() {
         // A thread-local collection walks the local object's fields, which
         // include the sync handle; that must not discount it as an interior
         // handle of the sync object.
-        struct Holder {
-            s: Gc<u64>,
-        }
-        impl crate::gc::Trace for Holder {
-            fn is_root(&self) -> bool {
-                false
-            }
-            fn reset_root(&self) {
-                self.s.reset_root();
-            }
-            fn trace(&self) {
-                self.s.trace();
-            }
-            fn reset(&self) {
-                self.s.reset();
-            }
-            fn is_traceable(&self) -> bool {
-                false
-            }
-            fn trace_children(&self, children: &mut Vec<*const dyn crate::gc::Trace>) {
-                self.s.trace_children(children);
-            }
-        }
-        impl crate::gc::Finalize for Holder {
-            fn finalize(&self) {}
-        }
         let (_guard, _baseline) = setup();
+        let _paused = PauseBackgroundCollector::new();
         let local = crate::gc::Gc::new(Holder { s: Gc::new(41) });
         crate::gc::LOCAL_GC.with(|gc| unsafe { gc.borrow_mut().collect() });
-        let _paused = PauseBackgroundCollector::new();
+        // The thread-local collection traced the holder but left the sync
+        // object's mark alone: it holds none of the global collector's
+        // locks, so writing the header would race with a global collection.
+        // SAFETY: the object is alive while `local.s` is.
+        let mark = unsafe {
+            (*local.s.ptr)
+                .info
+                .root_ref_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert_eq!(mark, 0, "a thread-local collection marked a sync object");
         let stats = unsafe {
             (*GLOBAL_GC)
                 .core
@@ -2922,5 +2953,30 @@ mod tests {
         assert_eq!(stats.objects_collected, 0);
         assert_eq!(**local.s, 41);
         assert_eq!(header_handles(&local.s), 1);
+    }
+
+    #[test]
+    fn local_collections_beside_global_ones_leave_sync_headers_alone() {
+        // A thread-local collection used to write a sync object's mark bit
+        // while a global collection on another thread wrote it too: a data
+        // race Miri reports.
+        let (_guard, _baseline) = setup();
+        let _paused = PauseBackgroundCollector::new();
+        let rounds = if cfg!(miri) { 3 } else { 100 };
+        let shared = Gc::new(7u64);
+        let other = shared.clone();
+        let global = std::thread::spawn(move || {
+            for _ in 0..rounds {
+                // SAFETY: test-only collection; `other` keeps the object.
+                unsafe { (*GLOBAL_GC).collect() };
+            }
+            drop(other);
+        });
+        let local = crate::gc::Gc::new(Holder { s: shared });
+        for _ in 0..rounds {
+            crate::gc::LOCAL_GC.with(|gc| unsafe { gc.borrow_mut().collect() });
+        }
+        global.join().unwrap();
+        assert_eq!(**local.s, 7);
     }
 }

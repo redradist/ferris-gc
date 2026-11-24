@@ -47,11 +47,15 @@ thread_local! {
     /// The cascade the thread-local handles' `reset_root` runs, if any.
     pub(crate) static CASCADE_MODE: Cell<CascadeMode> = const { Cell::new(CascadeMode::Off) };
 
-    /// Whether the global collector is discovering roots on this thread.
-    /// Sync handles cascade only then (`sync::cascade_handle`), so a
-    /// thread-local collection that reaches a sync handle stored in a local
-    /// object leaves the sync object's counts alone.
-    pub(crate) static SYNC_CASCADE: Cell<bool> = const { Cell::new(false) };
+    /// Whether the global collector is walking its objects on this thread:
+    /// discovering roots or marking. Sync handles act on their object's
+    /// header only then (`sync::cascade_handle`, and their `trace`, `reset`
+    /// and `is_traceable`). A thread-local collection that reaches a sync
+    /// handle stored in a local object therefore leaves the sync object
+    /// alone: it holds none of the global collector's locks, so touching the
+    /// header would race with a global collection, and it never needs to
+    /// (a sync object cannot hold a thread-local handle).
+    pub(crate) static SYNC_WALK: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Cascade guard (`root_ref_count`) of an object in the collection's scope
@@ -779,6 +783,48 @@ impl<O: ObjectMap> GarbageCollector<O> {
         }
     }
 
+    /// Mark phase: trace from every in-scope root (`root_count > 0`), as
+    /// [`Self::discover_roots`] left them. `scope` and `use_gen0_ids` as
+    /// there. The global collector raises [`SYNC_WALK`] for it, so the
+    /// trace goes on through the sync handles it meets.
+    ///
+    /// # Safety
+    /// Every object in `gc_maps` must be live, and the caller must hold the
+    /// collector's maps (every shard, for the global collector).
+    unsafe fn mark_from_roots(gc_maps: &GcMaps<O>, scope: Option<Generation>, use_gen0_ids: bool) {
+        if O::SHARDED {
+            SYNC_WALK.set(true);
+        }
+        unsafe {
+            match scope {
+                None => {
+                    for obj_entry in gc_maps.objects.values() {
+                        if obj_entry.root_count > 0 {
+                            (&*obj_entry.ptr).trace();
+                        }
+                    }
+                }
+                Some(_) if use_gen0_ids => {
+                    for &obj_id in &gc_maps.gen0_ids {
+                        if let Some(obj_entry) = gc_maps.objects.get(obj_id) {
+                            if obj_entry.root_count > 0 {
+                                (&*obj_entry.ptr).trace();
+                            }
+                        }
+                    }
+                }
+                Some(max_gen) => {
+                    for (_id, obj_entry) in gc_maps.objects.iter() {
+                        if obj_entry.generation() <= max_gen && obj_entry.root_count > 0 {
+                            (&*obj_entry.ptr).trace();
+                        }
+                    }
+                }
+            }
+        }
+        SYNC_WALK.set(false);
+    }
+
     /// Root discovery, phase 3, for one object: take back the root count the
     /// cascade left in the header (handles minus those found inside scanned
     /// objects) and clear the cascade guard.
@@ -858,7 +904,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
             // rooted cycle) lost its stack-root status and was swept alive.
             CASCADE_MODE.set(CascadeMode::Collecting);
             if O::SHARDED {
-                SYNC_CASCADE.set(true);
+                SYNC_WALK.set(true);
             }
             match scope {
                 None => {
@@ -891,7 +937,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 }
             }
             CASCADE_MODE.set(CascadeMode::Off);
-            SYNC_CASCADE.set(false);
+            SYNC_WALK.set(false);
 
             // Phase 3: Sync root_count from LocalGcInfo back + re-count sync roots + clear cycle guards.
             // Combined into one pass to avoid 3 extra iterations.
@@ -973,29 +1019,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 };
                 let scan_epoch = self.scan_epoch();
                 Self::discover_roots(gc_maps_raw, scope, use_gen0_ids);
-
-                // Mark phase: trace from root objects (root_count > 0).
-                if max_gen >= Generation::Gen2 {
-                    for obj_entry in gc_maps.objects.values() {
-                        if obj_entry.root_count > 0 {
-                            (&*obj_entry.ptr).trace();
-                        }
-                    }
-                } else if use_gen0_ids {
-                    for &obj_id in &gc_maps.gen0_ids {
-                        if let Some(obj_entry) = gc_maps.objects.get(obj_id) {
-                            if obj_entry.root_count > 0 {
-                                (&*obj_entry.ptr).trace();
-                            }
-                        }
-                    }
-                } else {
-                    for (_id, obj_entry) in gc_maps.objects.iter() {
-                        if obj_entry.generation() <= max_gen && obj_entry.root_count > 0 {
-                            (&*obj_entry.ptr).trace();
-                        }
-                    }
-                }
+                Self::mark_from_roots(&gc_maps, scope, use_gen0_ids);
 
                 // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
@@ -1187,12 +1211,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 let scan_epoch = self.scan_epoch();
                 Self::discover_roots(gc_maps_raw, scope, false);
 
-                // Mark phase: trace from root objects (root_count > 0).
-                for obj_entry in gc_maps.objects.values() {
-                    if obj_entry.root_count > 0 {
-                        (&*obj_entry.ptr).trace();
-                    }
-                }
+                Self::mark_from_roots(&gc_maps, None, false);
 
                 // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
@@ -1539,12 +1558,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 let scan_epoch = self.scan_epoch();
                 Self::discover_roots(gc_maps_raw, None, false);
 
-                // Mark phase: trace from root objects (root_count > 0).
-                for obj_entry in gc_maps.objects.values() {
-                    if obj_entry.root_count > 0 {
-                        (&*obj_entry.ptr).trace();
-                    }
-                }
+                Self::mark_from_roots(&gc_maps, None, false);
 
                 // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
@@ -1644,12 +1658,7 @@ impl<O: ObjectMap> GarbageCollector<O> {
                 let scan_epoch = self.scan_epoch();
                 Self::discover_roots(gc_maps_raw, None, false);
 
-                // Mark from root objects (root_count > 0).
-                for obj_entry in gc_maps.objects.values() {
-                    if obj_entry.root_count > 0 {
-                        (&*obj_entry.ptr).trace();
-                    }
-                }
+                Self::mark_from_roots(&gc_maps, None, false);
 
                 // A mutably borrowed GcCell left the mark incomplete.
                 self.keep_all_if_blocked_since(&mut gc_maps, scan_epoch);
