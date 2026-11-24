@@ -3,46 +3,29 @@
 //! (`SyncGcInfo`).
 use super::*;
 
-/// Tracks the origin of a GC allocation so it can be correctly freed.
-///
-/// - `Mem` — allocated via `std::alloc::alloc`; freed with `std::alloc::dealloc`.
-/// - `Tlab` — sub-allocated from a TLAB block; freed by releasing the block's
-///   non-atomic ref_count, which frees the entire block once all refs are gone.
+/// Where an object's block came from, so it can be freed. Both collectors
+/// allocate an object and its `ObjectEntry` as one block
+/// ([`object_block_layout`]), so freeing the block frees both. Eight bytes:
+/// the `NonNull` leaves room for `Mem`.
+#[derive(Clone, Copy)]
 pub(crate) enum GcObjMem {
-    /// System-allocated memory. The raw pointer is derived from the owning
-    /// `ObjectEntry`'s fat `*const dyn Trace` thin pointer.
+    /// The sync collector's [`alloc_sync_mem`]: its pool or the system
+    /// allocator.
     Mem,
-    /// TLAB sub-allocation. The `*mut TlabBlock` holds a ref_count reference
-    /// to the backing block. Call `TlabBlock::release` to decrement.
-    Tlab(*mut crate::tlab::TlabBlock),
-    /// Part of a combined allocation (e.g. an `ObjectEntry` co-allocated with
-    /// the object). No separate deallocation needed — freed with the object.
-    Inline,
+    /// The thread-local collector's TLAB: releasing the block's non-atomic
+    /// ref count frees it once all its objects are gone. A TLAB grows a block
+    /// to fit any object, so it fails only when the system allocator does.
+    Tlab(std::ptr::NonNull<crate::tlab::TlabBlock>),
 }
 
-impl GcObjMem {
-    /// Deallocate this memory. For `Mem`, calls `std::alloc::dealloc`.
-    /// For `Tlab`, releases the block's ref_count (block freed when count hits 0).
-    ///
-    /// # Safety
-    /// For `Mem` variant, `ptr` must have been allocated with the given layout.
-    /// The memory must not have been previously deallocated.
-    pub(crate) unsafe fn dealloc_mem(self, ptr: *mut u8, layout: Layout) {
-        match self {
-            GcObjMem::Mem => {
-                // SAFETY: Caller guarantees ptr was allocated with this layout.
-                unsafe { dealloc(ptr, layout) };
-            }
-            GcObjMem::Tlab(block) => {
-                // SAFETY: block pointer is valid; decrement ref_count.
-                // When ref_count reaches 0, the block buffer is freed.
-                unsafe { crate::tlab::TlabBlock::release(block) };
-            }
-            GcObjMem::Inline => {
-                // No-op: inline allocations are freed with their parent object.
-            }
-        }
-    }
+/// Layout of one object's block `[A (object) | ObjectEntry]`, and the
+/// entry's offset in it.
+#[inline]
+pub(crate) fn object_block_layout<A>() -> (Layout, usize) {
+    let (block, off_e) = Layout::new::<A>()
+        .extend(Layout::new::<ObjectEntry>())
+        .expect("object block layout");
+    (block.pad_to_align(), off_e)
 }
 
 /// Allocate memory for the sync collector: a block of the per-thread pool
@@ -105,15 +88,13 @@ impl CompactLayout {
     }
 }
 
-/// `ObjectEntry::entry_block` value for an entry embedded in its object's own
-/// allocation, so that freeing the object frees the entry too. A dangling (but
-/// non-null, aligned) pointer that is only ever compared, never dereferenced.
-pub(crate) const ENTRY_EMBEDDED: *mut crate::tlab::TlabBlock = std::ptr::dangling_mut();
-
-/// Per-object metadata stored in a contiguous SlotMap.
+/// Per-object metadata stored in a contiguous SlotMap. It lives in its
+/// object's block (see [`GcObjMem`]).
 pub(crate) struct ObjectEntry {
     pub(crate) ptr: *const dyn Trace,
     pub(crate) mem: GcObjMem,
+    /// The thread-local collector records the object's layout, the sync
+    /// collector the block's, which its pool frees by.
     pub(crate) layout: CompactLayout,
     /// Packed generation (bits 31:30) + survive_count (bits 29:16, 14 bits) + region (bits 15:0).
     pub(crate) gen_survive_region: u32,
@@ -131,13 +112,6 @@ pub(crate) struct ObjectEntry {
     /// Allows inline mark-bit checks (is_traceable / clear_trace) without
     /// virtual dispatch through `*const dyn Trace`.
     pub(crate) root_ref_count_offset: u16,
-    /// TLAB block that holds this ObjectEntry allocation (null = system-allocated).
-    /// Released when the ObjectEntry is removed from the SlotMap and deallocated.
-    ///
-    /// [`ENTRY_EMBEDDED`] marks an entry that lives inside its own object's
-    /// allocation (the sync collector's single `[object | entry]`
-    /// block): it is freed together with the object, never on its own.
-    pub(crate) entry_block: *mut crate::tlab::TlabBlock,
 }
 
 /// Header at the start of every sync collector object (`sync::GcPtr<T>`,

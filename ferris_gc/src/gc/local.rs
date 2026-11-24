@@ -1021,127 +1021,33 @@ impl LocalGarbageCollector {
         self.gen1_since_gen2.set(0);
     }
 
-    /// Try to allocate A and B in a single TLAB bump (combined allocation).
-    /// Returns `Some((ptr_a, ptr_b, combined_mem, combined_layout))` on success,
-    /// or `None` if the TLAB cannot satisfy the combined layout.
+    /// Allocate one TLAB block for the object `A` and its `ObjectEntry`
+    /// ([`object_block_layout`]). `None` if the system allocator fails (the
+    /// TLAB grows a block to fit any object).
     ///
     /// # Safety
-    /// Both returned pointers must be initialized before use.
+    /// Both returned pointers are uninitialized and must be written before use.
     #[inline]
-    unsafe fn try_alloc_combined_tlab<A: Sized, B: Sized>(
+    unsafe fn alloc_object_block<A: Sized>(
         &mut self,
-    ) -> Option<(*mut A, *mut B, GcObjMem, Layout)> {
-        let layout_a = Layout::new::<A>();
-        let layout_b = Layout::new::<B>();
-        let (combined, offset_b) = layout_a.extend(layout_b).ok()?;
-        let combined = combined.pad_to_align();
-
-        let tlab_result = if let Some(ref mut tlab) = self.tlab {
-            tlab.alloc_or_grow(combined)
+    ) -> Option<(*mut A, *mut ObjectEntry, GcObjMem)> {
+        let (layout, off_e) = object_block_layout::<A>();
+        let (ptr, block) = if let Some(ref mut tlab) = self.tlab {
+            tlab.alloc_or_grow(layout)?
         } else {
             let mut tlab = crate::tlab::Tlab::new()?;
-            let r = tlab.alloc(combined);
+            let r = tlab.alloc_or_grow(layout);
             self.tlab = Some(tlab);
-            r
+            r?
         };
-        let (ptr, block) = tlab_result?;
-        let ptr_a = ptr as *mut A;
-        // SAFETY: offset_b is within the combined allocation.
-        let ptr_b = unsafe { ptr.add(offset_b) } as *mut B;
-        Some((ptr_a, ptr_b, GcObjMem::Tlab(block), combined))
-    }
-
-    /// Allocate an ObjectEntry in the TLAB. Returns a raw pointer to uninitialized
-    /// memory and the TlabBlock pointer for later release.
-    /// Falls back to system allocator if TLAB is unavailable.
-    ///
-    /// # Safety
-    /// The returned pointer must be initialized via ptr::write before use.
-    #[inline]
-    unsafe fn alloc_entry_tlab(&mut self) -> (*mut ObjectEntry, *mut crate::tlab::TlabBlock) {
-        let layout = Layout::new::<ObjectEntry>();
-
-        if let Some(ref mut tlab) = self.tlab {
-            if let Some((ptr, block)) = tlab.alloc_or_grow(layout) {
-                return (ptr as *mut ObjectEntry, block);
-            }
-        } else if let Some(mut tlab) = crate::tlab::Tlab::new() {
-            if let Some((ptr, block)) = tlab.alloc(layout) {
-                self.tlab = Some(tlab);
-                return (ptr as *mut ObjectEntry, block);
-            }
-            self.tlab = Some(tlab);
-        }
-
-        // Fall back to system allocator
-        let ptr = unsafe { alloc(layout) } as *mut ObjectEntry;
-        (ptr, std::ptr::null_mut())
-    }
-
-    /// Try to allocate memory from the TLAB. Falls back to system allocator if
-    /// the TLAB is exhausted or cannot be created.
-    ///
-    /// Returns `(typed_ptr, (GcObjMem, Layout))` like `GarbageCollector::alloc_mem`.
-    ///
-    /// # Safety
-    /// The returned pointer must be initialized before use.
-    #[inline]
-    unsafe fn alloc_mem_tlab<T: Sized>(&mut self) -> (*mut T, (GcObjMem, Layout)) {
-        let layout = Layout::new::<T>();
-
-        // Try TLAB allocation first
-        if let Some(ref mut tlab) = self.tlab {
-            if let Some((ptr, block)) = tlab.alloc_or_grow(layout) {
-                let type_ptr: *mut T = ptr as *mut T;
-                return (type_ptr, (GcObjMem::Tlab(block), layout));
-            }
-        } else {
-            // Lazily initialize TLAB
-            if let Some(mut tlab) = crate::tlab::Tlab::new() {
-                if let Some((ptr, block)) = tlab.alloc(layout) {
-                    let type_ptr: *mut T = ptr as *mut T;
-                    self.tlab = Some(tlab);
-                    return (type_ptr, (GcObjMem::Tlab(block), layout));
-                }
-                self.tlab = Some(tlab);
-            }
-        }
-
-        // Fall back to system allocator
-        // SAFETY: Delegates to alloc_mem which upholds its own safety invariants.
-        unsafe { self.core.alloc_mem::<T>() }
-    }
-
-    /// Fallible TLAB allocation with GC retry.
-    ///
-    /// # Safety
-    /// The returned pointer must be initialized before use.
-    unsafe fn try_alloc_mem_tlab<T: Sized>(
-        &mut self,
-    ) -> Result<(*mut T, (GcObjMem, Layout)), GcAllocError> {
-        let layout = Layout::new::<T>();
-
-        // Try TLAB allocation first
-        if let Some(ref mut tlab) = self.tlab {
-            if let Some((ptr, block)) = tlab.alloc_or_grow(layout) {
-                let type_ptr: *mut T = ptr as *mut T;
-                return Ok((type_ptr, (GcObjMem::Tlab(block), layout)));
-            }
-        } else {
-            // Lazily initialize TLAB
-            if let Some(mut tlab) = crate::tlab::Tlab::new() {
-                if let Some((ptr, block)) = tlab.alloc(layout) {
-                    let type_ptr: *mut T = ptr as *mut T;
-                    self.tlab = Some(tlab);
-                    return Ok((type_ptr, (GcObjMem::Tlab(block), layout)));
-                }
-                self.tlab = Some(tlab);
-            }
-        }
-
-        // Fall back to system allocator with GC retry
-        // SAFETY: Delegates to try_alloc_mem_with_gc which upholds its own safety invariants.
-        unsafe { self.core.try_alloc_mem_with_gc::<T>() }
+        // SAFETY: a TLAB allocation always comes with its block.
+        let mem = GcObjMem::Tlab(unsafe { std::ptr::NonNull::new_unchecked(block) });
+        // SAFETY: the offset lies inside the block, from Layout::extend.
+        Some((
+            ptr as *mut A,
+            unsafe { ptr.add(off_e) } as *mut ObjectEntry,
+            mem,
+        ))
     }
 
     /// Check allocation count and trigger a collection if the threshold is
@@ -1373,31 +1279,12 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            // Double allocation: [GcPtr<T> | ObjectEntry] in one TLAB bump.
-            // When combined, obj_mem is Inline (no separate dealloc for GcPtr),
-            // oe_block holds the TLAB block (releasing it frees both).
-            let (gc_ptr, oe_ptr, obj_mem, obj_layout, oe_block);
-            if let Some((a, b, mem, _combined_layout)) =
-                self.try_alloc_combined_tlab::<GcPtr<T>, ObjectEntry>()
-            {
-                gc_ptr = a;
-                oe_ptr = b;
-                // Extract the TLAB block from the combined mem for entry_block.
-                oe_block = match mem {
-                    GcObjMem::Tlab(block) => block,
-                    _ => std::ptr::null_mut(),
-                };
-                obj_mem = GcObjMem::Inline;
-                obj_layout = Layout::new::<GcPtr<T>>();
-            } else {
-                let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<GcPtr<T>>();
-                gc_ptr = a;
-                obj_mem = mem_a;
-                obj_layout = layout_a;
-                let (c, block) = self.alloc_entry_tlab();
-                oe_ptr = c;
-                oe_block = block;
-            }
+            // [GcPtr<T> | ObjectEntry] as one block.
+            let (gc_ptr, oe_ptr, obj_mem) =
+                self.alloc_object_block::<GcPtr<T>>().unwrap_or_else(|| {
+                    std::alloc::handle_alloc_error(object_block_layout::<GcPtr<T>>().0)
+                });
+            let obj_layout = Layout::new::<GcPtr<T>>();
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize>
@@ -1413,7 +1300,6 @@ impl LocalGarbageCollector {
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
-                    entry_block: oe_block,
                 },
             );
             let gc_maps = self.core.gc_maps_unsync();
@@ -1463,30 +1349,13 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            // Double allocation: [RefCell<GcPtr<T>> | ObjectEntry] in one TLAB bump.
-            // When combined, obj_mem is Inline (no separate dealloc for RefCell<GcPtr>),
-            // oe_block holds the TLAB block (releasing it frees both).
-            let (gc_ptr, oe_ptr, obj_mem, obj_layout, oe_block);
-            if let Some((a, b, mem, _combined_layout)) =
-                self.try_alloc_combined_tlab::<RefCell<GcPtr<T>>, ObjectEntry>()
-            {
-                gc_ptr = a;
-                oe_ptr = b;
-                oe_block = match mem {
-                    GcObjMem::Tlab(block) => block,
-                    _ => std::ptr::null_mut(),
-                };
-                obj_mem = GcObjMem::Inline;
-                obj_layout = Layout::new::<RefCell<GcPtr<T>>>();
-            } else {
-                let (a, (mem_a, layout_a)) = self.alloc_mem_tlab::<RefCell<GcPtr<T>>>();
-                gc_ptr = a;
-                obj_mem = mem_a;
-                obj_layout = layout_a;
-                let (c, block) = self.alloc_entry_tlab();
-                oe_ptr = c;
-                oe_block = block;
-            }
+            // [RefCell<GcPtr<T>> | ObjectEntry] as one block.
+            let (gc_ptr, oe_ptr, obj_mem) = self
+                .alloc_object_block::<RefCell<GcPtr<T>>>()
+                .unwrap_or_else(|| {
+                    std::alloc::handle_alloc_error(object_block_layout::<RefCell<GcPtr<T>>>().0)
+                });
+            let obj_layout = Layout::new::<RefCell<GcPtr<T>>>();
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
@@ -1502,7 +1371,6 @@ impl LocalGarbageCollector {
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
-                    entry_block: oe_block,
                 },
             );
             let gc_maps = self.core.gc_maps_unsync();
@@ -1553,30 +1421,16 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            // Double allocation: [GcPtr<T> | ObjectEntry] in one TLAB bump.
-            // When combined, obj_mem is Inline (no separate dealloc for GcPtr),
-            // oe_block holds the TLAB block (releasing it frees both).
-            let (gc_ptr, oe_ptr, obj_mem, obj_layout, oe_block);
-            if let Some((a, b, mem, _combined_layout)) =
-                self.try_alloc_combined_tlab::<GcPtr<T>, ObjectEntry>()
-            {
-                gc_ptr = a;
-                oe_ptr = b;
-                oe_block = match mem {
-                    GcObjMem::Tlab(block) => block,
-                    _ => std::ptr::null_mut(),
-                };
-                obj_mem = GcObjMem::Inline;
-                obj_layout = Layout::new::<GcPtr<T>>();
-            } else {
-                let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<GcPtr<T>>()?;
-                gc_ptr = a;
-                obj_mem = mem_a;
-                obj_layout = layout_a;
-                let (c, block) = self.alloc_entry_tlab();
-                oe_ptr = c;
-                oe_block = block;
-            }
+            // [GcPtr<T> | ObjectEntry] as one block. On failure, collect once
+            // and retry.
+            let (gc_ptr, oe_ptr, obj_mem) = match self.alloc_object_block::<GcPtr<T>>() {
+                Some(block) => block,
+                None => {
+                    self.core.collect();
+                    self.alloc_object_block::<GcPtr<T>>().ok_or(GcAllocError)?
+                }
+            };
+            let obj_layout = Layout::new::<GcPtr<T>>();
             std::ptr::write(gc_ptr, GcPtr::new(t));
 
             let root_ref_count_offset = (&(*gc_ptr).info.root_ref_count as *const Cell<usize>
@@ -1592,7 +1446,6 @@ impl LocalGarbageCollector {
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
-                    entry_block: oe_block,
                 },
             );
             let gc_maps = self.core.gc_maps_unsync();
@@ -1627,30 +1480,17 @@ impl LocalGarbageCollector {
         T: Sized + Trace,
     {
         unsafe {
-            // Double allocation: [RefCell<GcPtr<T>> | ObjectEntry] in one TLAB bump.
-            // When combined, obj_mem is Inline (no separate dealloc for RefCell<GcPtr>),
-            // oe_block holds the TLAB block (releasing it frees both).
-            let (gc_ptr, oe_ptr, obj_mem, obj_layout, oe_block);
-            if let Some((a, b, mem, _combined_layout)) =
-                self.try_alloc_combined_tlab::<RefCell<GcPtr<T>>, ObjectEntry>()
-            {
-                gc_ptr = a;
-                oe_ptr = b;
-                oe_block = match mem {
-                    GcObjMem::Tlab(block) => block,
-                    _ => std::ptr::null_mut(),
-                };
-                obj_mem = GcObjMem::Inline;
-                obj_layout = Layout::new::<RefCell<GcPtr<T>>>();
-            } else {
-                let (a, (mem_a, layout_a)) = self.try_alloc_mem_tlab::<RefCell<GcPtr<T>>>()?;
-                gc_ptr = a;
-                obj_mem = mem_a;
-                obj_layout = layout_a;
-                let (c, block) = self.alloc_entry_tlab();
-                oe_ptr = c;
-                oe_block = block;
-            }
+            // [RefCell<GcPtr<T>> | ObjectEntry] as one block. On failure, collect once
+            // and retry.
+            let (gc_ptr, oe_ptr, obj_mem) = match self.alloc_object_block::<RefCell<GcPtr<T>>>() {
+                Some(block) => block,
+                None => {
+                    self.core.collect();
+                    self.alloc_object_block::<RefCell<GcPtr<T>>>()
+                        .ok_or(GcAllocError)?
+                }
+            };
+            let obj_layout = Layout::new::<RefCell<GcPtr<T>>>();
             std::ptr::write(gc_ptr, RefCell::new(GcPtr::new(t)));
 
             let root_ref_count_offset = (&(*(*gc_ptr).as_ptr()).info.root_ref_count
@@ -1666,7 +1506,6 @@ impl LocalGarbageCollector {
                     handle_count: 1,
                     root_count: 1,
                     root_ref_count_offset,
-                    entry_block: oe_block,
                 },
             );
             let gc_maps = self.core.gc_maps_unsync();
